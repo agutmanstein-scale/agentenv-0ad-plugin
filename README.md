@@ -1,5 +1,11 @@
 # agentenv-zeroad
 
+[![Sonnet 5.5's army surrounds Persia's civic centre, the last enemy building, at 75:01](docs/poster.jpg)](https://huggingface.co/datasets/agutmanstein-scale/ZeroADEnv-AgentEnv/resolve/main/assets/showcase.mp4)
+
+<sub>▶ 97 seconds of a four-model match played to conquest (Opus 5.5, Sonnet 5.5, GPT-6 Astra and GPT-6 Sol, as
+recorded): Sonnet 5.5 razed Rome and Carthage, then took Persia's civic centre and won at 75:05. Results, recordings
+and tasks are in the [ZeroADEnv-AgentEnv dataset](https://huggingface.co/datasets/agutmanstein-scale/ZeroADEnv-AgentEnv).</sub>
+
 0 A.D. Live Arena: LLM-driven empires play 0 A.D. (Release 28) in real time, packaged as an agentenv environment.
 See `docs/design.md`.
 
