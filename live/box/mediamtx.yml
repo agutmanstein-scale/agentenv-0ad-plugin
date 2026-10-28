@@ -1,0 +1,33 @@
+# The box's relay (zeroad-relay.service). The env's ffmpeg publishes rtmp://host.docker.internal:1935/zeroad from its
+# container (the docker shim sets ZEROAD_RTMP_URL); push.sh reads rtmp://127.0.0.1:1935/zeroad and forwards it to the
+# target. The zeroad path is always recorded, in one-hour fMP4 segments, push or not. It listens on every interface
+# because containers reach the host on the Docker bridge; the security group has no inbound rule, and only loopback
+# and Docker's networks (172.16.0.0/12) may publish or read.
+logLevel: info
+logDestinations: [stdout]
+api: yes
+apiAddress: 127.0.0.1:9997
+rtsp: no
+rtmp: yes
+rtmpAddress: :1935
+hls: no
+webrtc: no
+srt: no
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ['127.0.0.1/32', '172.16.0.0/12']
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+pathDefaults:
+  record: no
+  recordPath: /var/lib/zeroad-live/rec/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+  recordDeleteAfter: 0s
+paths:
+  zeroad:
+    record: yes

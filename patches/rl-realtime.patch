@@ -1,0 +1,86 @@
+SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
+
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -466,7 +466,7 @@
+ 
+ 	if (g_Game && g_Game->IsGameStarted() && needUpdate)
+ 	{
+-		if (!rlInterface)
++		if (!rlInterface || rlInterface->AdvancesInRealTime())
+ 			g_Game->Update(realTimeSinceLastFrame);
+ 
+ 		g_Game->GetView()->Update(float(realTimeSinceLastFrame));
+--- a/source/rlinterface/RLInterface.cpp
++++ b/source/rlinterface/RLInterface.cpp
+@@ -28,6 +28,7 @@
+ #include "ps/CStr.h"
+ #include "ps/Errors.h"
+ #include "ps/Game.h"
++#include "ps/GameSetup/CmdLineArgs.h"
+ #include "ps/GameSetup/GameSetup.h"
+ #include "ps/Loader.h"
+ #include "scriptinterface/JSON.h"
+@@ -59,6 +60,7 @@
+ 		"num_threads", "1",
+ 		nullptr
+ 	};
++	m_RealTime = g_CmdLineArgs.Has("rl-realtime");
+ 	m_Context = mg_start(MgCallback, this, options);
+ 	if (!m_Context)
+ 		throw SetupError{};
+@@ -170,8 +172,8 @@
+ 				scenario.saveReplay = qs.find("saveReplay") != std::string::npos;
+ 
+ 				scenario.playerID = 1;
+-				char playerID[1];
+-				const int len = mg_get_var(query_string, qs.length(), "playerID", playerID, 1);
++				char playerID[8];
++				const int len = mg_get_var(query_string, qs.length(), "playerID", playerID, sizeof(playerID));
+ 				if (len != -1)
+ 					scenario.playerID = std::stoi(playerID);
+ 			}
+@@ -351,6 +353,7 @@
+ 		{
+ 			if (isGameStarted)
+ 				EndGame();
++			m_Stepped = false;
+ 
+ 			g_Game = new CGame(m_ScenarioConfig.saveReplay);
+ 			ScriptInterface& scriptInterface = g_Game->GetSimulation2()->GetScriptInterface();
+@@ -412,8 +415,9 @@
+ 				const size_t maxTurns = static_cast<size_t>(g_Game->GetSimRate());
+ 				g_Game->GetTurnManager()->Update(deltaSimTime, maxTurns);
+ 			}
+-			else
++			else if (!m_RealTime)
+ 				g_Game->Update(deltaRealTime);
++			m_Stepped = true;
+ 
+ 			m_ReturnValue = GetGameState();
+ 			m_MsgApplied.notify_one();
+--- a/source/rlinterface/RLInterface.h
++++ b/source/rlinterface/RLInterface.h
+@@ -102,6 +102,13 @@
+ 	 */
+ 	void TryApplyMessage();
+ 
++	/**
++	 * With -rl-realtime in visual mode the engine advances the game from its own frame loop
++	 * (smooth, interpolated, real time) and /step only posts commands and returns the state.
++	 * A reset game stays at turn 0 until the first /step, so the caller decides when the match starts.
++	 */
++	bool AdvancesInRealTime() const { return m_RealTime && m_Stepped; }
++
+ private:
+ 	static void* MgCallback(mg_event event, struct mg_connection *conn, const struct mg_request_info *request_info);
+ 	static std::string GetRequestContent(struct mg_connection *conn);
+@@ -171,6 +178,8 @@
+ 	std::string m_Code;
+ 
+ 	mg_context* m_Context;
++	bool m_RealTime{false};
++	bool m_Stepped{false};
+ };
+ 
+ }

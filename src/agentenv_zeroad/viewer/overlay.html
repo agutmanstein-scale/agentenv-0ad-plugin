@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0 A.D. Live Arena</title>
+<style>
+  :root {
+    --bg: #0d0f14; --panel: #161a22; --line: #262c38; --text: #e8e6df; --dim: #8d93a1; --gold: #d8b45a;
+    --ok: #6fbf73; --bad: #e0625a;
+    font-family: "DejaVu Sans", "Noto Sans", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-size: 15px; }
+  main { padding: 16px; display: flex; flex-direction: column; gap: 12px; max-width: 520px; margin: 0 auto; }
+  body.stream main { width: 480px; height: 1080px; max-width: none; padding: 14px; overflow: hidden; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 17px; letter-spacing: .08em; text-transform: uppercase; margin: 0; color: var(--gold); }
+  .clock { font-variant-numeric: tabular-nums; font-size: 30px; font-weight: 700; }
+  .cap { color: var(--dim); font-size: 13px; }
+  .detail { color: var(--gold); font-size: 14px; min-height: 1em; }
+  .board { display: flex; flex-direction: column; gap: 4px; background: var(--panel); border: 1px solid var(--line);
+           border-radius: 8px; padding: 8px 10px; }
+  .board div { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+  .seat { background: var(--panel); border: 1px solid var(--line); border-left: 6px solid var(--c);
+          border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .seat.defeated { opacity: .5; }
+  .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .name { font-weight: 700; font-size: 17px; }
+  .civ { color: var(--dim); font-size: 13px; }
+  .think { font-size: 13px; color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .think.on { color: var(--gold); }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; font-variant-numeric: tabular-nums;
+           font-size: 14px; }
+  .stats span { color: var(--dim); font-size: 11px; display: block; text-transform: uppercase; }
+  .row { display: flex; gap: 14px; font-size: 13px; color: var(--dim); }
+  .row b { color: var(--text); font-weight: 600; }
+  .orders { font-size: 12.5px; color: var(--dim); display: flex; flex-direction: column; gap: 2px; }
+  .orders .rejected { color: var(--bad); }
+  .orders b { color: var(--gold); font-weight: 600; }
+  .say { font-style: italic; font-size: 14px; border-left: 2px solid var(--c); padding-left: 8px; }
+  .muted { color: var(--dim); }
+  body.stream #seats { flex: 1; min-height: 0; }
+  body.stream .seat { flex: 0 1 auto; min-height: 0; overflow: hidden; }
+  .top > div:first-child { min-width: 0; }
+  body.compact .seat { padding: 8px 10px; gap: 4px; }
+  body.compact .civ, body.compact .orders div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  body.compact .orders div:nth-child(n+3) { display: none; }
+  body.compact .say { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>0 A.D. Live Arena</h1><div><span class="clock" id="clock">--:--</span>
+    <span class="cap" id="cap"></span></div></header>
+  <div class="detail" id="detail"></div>
+  <div class="board" id="board"></div>
+  <div id="seats" style="display:flex;flex-direction:column;gap:10px"></div>
+</main>
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+if (params.has("stream")) document.body.classList.add("stream");
+const source = location.pathname.replace(/\/?$/, "/state.json") + "?token=" + encodeURIComponent(params.get("token") || "");
+let last = null, fetchedAt = 0;
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const clock = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0"); };
+const res = r => r ? ["food", "wood", "stone", "metal"].map(k => `<div><span>${k}</span>${r[k]}</div>`).join("") : "";
+
+function thinking(seat, elapsed) {
+  if (seat.kind !== "agent") return `<span class="think">${esc(seat.model)}</span>`;
+  if (seat.thinking_s != null && seat.thinking_s + elapsed >= 1)
+    return `<span class="think on">thinking… ${Math.floor(seat.thinking_s + elapsed)} s</span>`;
+  return `<span class="think">${seat.last_call_s != null ? "answered in " + seat.last_call_s + " s" : "ready"}</span>`;
+}
+
+function render() {
+  if (!last) return;
+  const elapsed = last.status === "playing" ? (performance.now() - fetchedAt) / 1000 : 0;
+  document.body.classList.toggle("compact", last.seats.length > 2);
+  document.getElementById("clock").textContent = clock(last.game_ms + elapsed * 1000);
+  document.getElementById("cap").textContent = last.cap ? "/ " + last.cap : "";
+  document.getElementById("detail").textContent = last.detail || (last.status === "starting" ? "Starting…" : "");
+  document.getElementById("board").innerHTML = last.scoreboard.map((s, i) =>
+    `<div><span><span class="swatch" style="background:${esc(s.color)}"></span>${i + 1}. ${esc(s.name)}</span><b>${s.score}</b></div>`).join("");
+  document.getElementById("seats").innerHTML = last.seats.map(seat => `
+    <section class="seat ${seat.state === "defeated" ? "defeated" : ""}" style="--c:${esc(seat.color)}">
+      <div class="top"><div><div class="name">${esc(seat.name)}</div>
+        <div class="civ">${esc(seat.civ_name)}${seat.kind === "agent" ? " · " + esc(seat.model) : ""}${seat.reflex ? " + Luna reflexes" : ""}</div></div>
+        ${thinking(seat, elapsed)}</div>
+      <div class="stats">${res(seat.resources)}</div>
+      <div class="row"><span>pop <b>${seat.pop ?? "-"}/${seat.pop_cap ?? "-"}</b></span><span>army <b>${seat.army ?? "-"}</b></span>
+        <span>${esc(seat.phase || "")}</span><span>${seat.posture ? "army: <b>" + esc(seat.posture) + "</b>" : ""}</span></div>
+      ${seat.recent.length ? `<div class="orders">${seat.recent.map(o => `<div class="${esc(o.status)}">${esc(o.at)} <b>${esc(o.who)}:</b> ${esc(o.line)}</div>`).join("")}</div>` : ""}
+      ${seat.say ? `<div class="say">“${esc(seat.say.text)}”</div>` : ""}
+    </section>`).join("");
+}
+
+async function poll() {
+  try {
+    const r = await fetch(source, {cache: "no-store"});
+    if (r.ok) { last = await r.json(); fetchedAt = performance.now(); }
+  } catch (e) { /* the env may be between matches; try again */ }
+  render();
+}
+poll();
+setInterval(poll, 1000);
+setInterval(render, 250);
+</script>
+</body>
+</html>

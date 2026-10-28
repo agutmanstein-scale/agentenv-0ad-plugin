@@ -1,0 +1,10 @@
+[Unit]
+Description=zeroad-live: record the box's running time every minute (budget.sh tick)
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=zeroad-live: the local RTMP relay, recording every match (mediamtx)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/opt/zeroad-live/bin/mediamtx /opt/zeroad-live/box/mediamtx.yml
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

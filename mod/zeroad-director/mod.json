@@ -1,0 +1,8 @@
+{
+	"name": "zeroad-director",
+	"version": "0.1.0",
+	"label": "0 A.D. Live Arena director",
+	"url": "",
+	"description": "Moves the observer's camera to the action for the live stream: the largest fight, else a slow tour of the bases.",
+	"dependencies": ["0ad=0.28.0"]
+}

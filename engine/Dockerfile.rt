@@ -1,0 +1,19 @@
+# The stream engine, zeroad-engine:0.28-rt: the PPA's 0 A.D. 0.28 rebuilt with patches/rl-realtime.patch and layered
+# onto zeroad-engine:0.28. The patch adds -rl-realtime (the frame loop advances the game in real time, so motion is
+# smooth; /step only posts commands) and makes /reset honour ?playerID=-1, so the rendered game is the observer's.
+# Build with `scripts/build-engine.sh rt` (context: patches/). The build stage's lines up to the COPY match the spike's
+# (spike/engine/Dockerfile), so its build-dep layer is reused from the docker cache; the package build takes ~15 min.
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common gpg-agent ca-certificates dpkg-dev devscripts \
+ && add-apt-repository -y -s ppa:wfg/0ad && apt-get update && apt-get build-dep -y 0ad && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN apt-get update && apt-get source 0ad && ls
+COPY rl-realtime.patch /src/
+RUN cd /src/0ad-0.28.0* && patch -p1 < /src/rl-realtime.patch \
+ && DEB_BUILD_OPTIONS="parallel=$(nproc) nocheck" dpkg-buildpackage -b -uc -us 2>&1 | tail -40 && ls -la /src/*.deb
+
+FROM zeroad-engine:0.28
+COPY --from=build /src/0ad_*_amd64.deb /tmp/
+RUN dpkg -i /tmp/0ad_*_amd64.deb && rm /tmp/*.deb \
+ && grep -qa rl-realtime /usr/games/pyrogenesis

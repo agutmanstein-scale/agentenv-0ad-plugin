@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentenv-zeroad"
+version = "0.1.0"
+description = "0 A.D. Live Arena: LLM empires play 0 A.D. in real time as an agentenv environment."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# The env image installs the server's dependencies, minus agentenv-framework (see Dockerfile).
+dependencies = [
+    "agentenv-framework>=0.9.1260",
+    "agentenv-framework-protocol>=0.1.275,<0.2",
+    "agentenv-game-env @ https://github.com/earakely-scale/agentenv-game-env/archive/81ef9f2bf724aca2ba3a94212c8d539eb171c189.tar.gz",
+    "httpx>=0.27,<1",
+    "mcp>=1.25,<2",
+    "pydantic>=2.7,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.16,<0.17", "agentenv-framework-protocol[agent]>=0.1.275,<0.2"]
+
+[project.entry-points."agent_env.bundles"]
+zeroad = "agentenv_zeroad.bundles"
+
+[project.entry-points."agent_env.cli_plugins"]
+zeroad = "agentenv_zeroad.cli:zeroad"
+
+[project.entry-points."agent_env.task_steps"]
+save_zeroad_results = "agentenv_zeroad.steps:SaveResultsTaskStep"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentenv_zeroad"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not engine and not live'"
+markers = [
+    "engine: needs the zeroad-engine:0.28 Docker image (scripts/build-engine.sh); run with -m engine",
+    "live: calls real model APIs and spends money; run with -m live",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["vendor", "build", "spike"]  # spike/ is throwaway
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]

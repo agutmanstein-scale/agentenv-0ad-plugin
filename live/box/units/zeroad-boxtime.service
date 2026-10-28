@@ -1,0 +1,6 @@
+[Unit]
+Description=zeroad-live: record this boot's running time for the budget guard
+
+[Service]
+Type=oneshot
+ExecStart=/opt/zeroad-live/box/budget.sh tick

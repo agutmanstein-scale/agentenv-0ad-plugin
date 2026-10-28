@@ -1,0 +1,6 @@
+[Unit]
+Description=zeroad-live: health check and repair (the half-hourly timer's job)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/zeroad-live/box/repair.sh --auto

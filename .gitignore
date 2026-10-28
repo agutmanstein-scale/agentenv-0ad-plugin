@@ -1,0 +1,11 @@
+.env
+*.env
+__pycache__/
+.venv/
+build/
+vendor/0ad/
+runs/
+build.log
+.pytest_cache/
+.ruff_cache/
+live/fetched/

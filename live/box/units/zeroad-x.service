@@ -1,0 +1,13 @@
+[Unit]
+Description=zeroad-live: Xorg on the NVIDIA L4 (display :0)
+After=network.target nvidia-persistenced.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/opt/zeroad-live/box/display.sh
+ExecStartPost=/opt/zeroad-live/box/display-ready.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

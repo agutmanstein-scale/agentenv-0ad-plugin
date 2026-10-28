@@ -1,0 +1,3 @@
+# shellcheck settings for live/: follow the sourced helper files next to each script.
+source-path=SCRIPTDIR
+external-sources=true

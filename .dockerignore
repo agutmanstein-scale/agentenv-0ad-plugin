@@ -1,0 +1,9 @@
+*
+!src
+!pyproject.toml
+!README.md
+!agents
+**/__pycache__
+**/*.pyc
+!mod
+!streamer

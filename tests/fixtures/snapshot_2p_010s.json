@@ -1,0 +1,209 @@
+{
+ "players": {
+  "1": {
+   "base": [
+    500,
+    628
+   ],
+   "buildings": [
+    {
+     "hp": 100,
+     "id": 150,
+     "kind": "CivCentre",
+     "pos": [
+      500,
+      628
+     ],
+     "queue": 1
+    },
+    {
+     "foundation": true,
+     "hp": 7,
+     "id": 1913,
+     "kind": "Storehouse",
+     "pos": [
+      553,
+      561
+     ]
+    },
+    {
+     "foundation": true,
+     "hp": 0,
+     "id": 1925,
+     "kind": "House",
+     "pos": [
+      438,
+      550
+     ]
+    }
+   ],
+   "civ": "rome",
+   "enemies": {},
+   "enemies_near_base": 0,
+   "gatherers": {
+    "food": 5,
+    "metal": 0,
+    "stone": 0,
+    "wood": 2
+   },
+   "idle_production": [],
+   "idle_units": {},
+   "idle_villagers": [],
+   "name": "Rome",
+   "nearby_resources": {
+    "food": {
+     "amount": 1741,
+     "sources": 16
+    },
+    "metal": {
+     "amount": 5000,
+     "sources": 1
+    },
+    "stone": {
+     "amount": 5000,
+     "sources": 1
+    },
+    "wood": {
+     "amount": 6393,
+     "sources": 30
+    }
+   },
+   "phase": "village",
+   "pop": 10,
+   "pop_cap": 20,
+   "pop_max": 300,
+   "researching": [],
+   "resources": {
+    "food": 270,
+    "metal": 300,
+    "stone": 300,
+    "wood": 50
+   },
+   "state": "active",
+   "stats": {
+    "buildings_constructed": 0,
+    "buildings_lost": 0,
+    "enemy_units_killed": 0,
+    "units_lost": 0,
+    "units_trained": 0
+   },
+   "techs": [
+    "civbonuses/rome_siege",
+    "phase_village",
+    "soldier_ranged_experience",
+    "unit_advanced",
+    "unit_elite",
+    "upgrade_rank_advanced_mercenary"
+   ],
+   "units": {
+    "cavalry": 1,
+    "infantry_melee": 2,
+    "infantry_ranged": 2,
+    "villager": 4
+   }
+  },
+  "2": {
+   "base": [
+    268,
+    140
+   ],
+   "buildings": [
+    {
+     "hp": 100,
+     "id": 182,
+     "kind": "CivCentre",
+     "pos": [
+      268,
+      140
+     ],
+     "queue": 1
+    },
+    {
+     "foundation": true,
+     "hp": 3,
+     "id": 1914,
+     "kind": "Storehouse",
+     "pos": [
+      321,
+      53
+     ]
+    },
+    {
+     "foundation": true,
+     "hp": 0,
+     "id": 1924,
+     "kind": "House",
+     "pos": [
+      361,
+      108
+     ]
+    }
+   ],
+   "civ": "pers",
+   "enemies": {},
+   "enemies_near_base": 0,
+   "gatherers": {
+    "food": 5,
+    "metal": 0,
+    "stone": 0,
+    "wood": 2
+   },
+   "idle_production": [],
+   "idle_units": {},
+   "idle_villagers": [],
+   "name": "Persia",
+   "nearby_resources": {
+    "food": {
+     "amount": 2558,
+     "sources": 18
+    },
+    "metal": {
+     "amount": 5000,
+     "sources": 1
+    },
+    "stone": {
+     "amount": 5000,
+     "sources": 1
+    },
+    "wood": {
+     "amount": 3193,
+     "sources": 14
+    }
+   },
+   "phase": "village",
+   "pop": 10,
+   "pop_cap": 20,
+   "pop_max": 330,
+   "researching": [],
+   "resources": {
+    "food": 270,
+    "metal": 300,
+    "stone": 300,
+    "wood": 50
+   },
+   "state": "active",
+   "stats": {
+    "buildings_constructed": 0,
+    "buildings_lost": 0,
+    "enemy_units_killed": 0,
+    "units_lost": 0,
+    "units_trained": 0
+   },
+   "techs": [
+    "civbonuses/pers_population",
+    "phase_village",
+    "soldier_ranged_experience",
+    "unit_advanced",
+    "unit_elite",
+    "upgrade_rank_advanced_mercenary"
+   ],
+   "units": {
+    "cavalry": 1,
+    "infantry_melee": 2,
+    "infantry_ranged": 2,
+    "villager": 4
+   }
+  }
+ },
+ "time_ms": 10000
+}

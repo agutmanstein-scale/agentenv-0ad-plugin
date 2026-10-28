@@ -1,0 +1,17 @@
+[Unit]
+Description=zeroad-live: the relay to the RTMP target (server and key from SSM)
+Wants=zeroad-relay.service
+After=zeroad-relay.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/opt/zeroad-live/box/push.sh run
+Restart=always
+RestartSec=3
+# push.sh forwards the stop to ffmpeg as SIGINT, so the FLV stream ends cleanly; only push.sh gets the signal.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
