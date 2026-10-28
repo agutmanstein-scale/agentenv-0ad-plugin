@@ -9,6 +9,7 @@
 - `defend`: gather at the point; every soldier to base when the snapshot reports enemies near it;
 - `retreat`: walk home, then back to `gather`;
 - `scout`: one cavalryman (else a soldier) walks to the target once.
+An attack, raid or scout on a player the engine has defeated turns to the nearest opponent still standing.
 Each unit is re-sent only when its target moved, its target classes changed (a new focus re-aims soldiers already
 walking or fighting) or a cooldown passed, so a standing posture doesn't flood the queue.
 """
@@ -57,6 +58,12 @@ class ArmyDriver:
         if posture.action == "gather" or not soldiers:
             return
         now = seat.time_ms
+        fallen = Army(action="attack", target=posture.target).target_player in ex.fallen
+        if fallen and posture.action in ("attack", "raid", "scout"):
+            bases = ex.enemy_bases(seat)
+            origin = seat.base or seat.center
+            if bases:
+                posture.target = f"player_{min(bases, key=lambda q: distance(bases[q], origin))}"
         point = self.point(ex, seat, posture.target)
         if posture.action in ("attack", "raid"):
             group = soldiers

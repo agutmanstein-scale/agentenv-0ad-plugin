@@ -43,6 +43,15 @@ def _buildings_text(me: PlayerSnapshot) -> list[str]:
     return lines
 
 
+def _opponents_line(snapshot: Snapshot, player: int, names: Mapping[int, str]) -> str:
+    rows = [
+        f"{names.get(q, f'player {q}')} (player {q}) {'defeated' if p.state == 'defeated' else 'standing'}"
+        for q, p in sorted(snapshot.players.items())
+        if q != player
+    ]
+    return f"Opponents: {', '.join(rows) or 'none'}."
+
+
 def _enemy_lines(me: PlayerSnapshot, names: Mapping[int, str]) -> list[str]:
     if not me.enemies:
         return ["Enemies in sight: none"]
@@ -98,7 +107,7 @@ def text_brief(
         )
     if me.enemies_near_base:
         lines.append(f"WARNING: {me.enemies_near_base} enemy soldiers within reach of your base.")
-    lines += _enemy_lines(me, names)
+    lines += [_opponents_line(snapshot, player, names), *_enemy_lines(me, names)]
     lines.append(_events_text(events))
     return _fit("\n".join(lines))
 

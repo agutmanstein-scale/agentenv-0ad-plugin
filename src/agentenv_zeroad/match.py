@@ -439,6 +439,10 @@ class LiveMatch:
                 continue
             self.states[slot] = str(row.get("state", "active"))
             self.scores[slot] = {k: float(row.get(k, 0)) for k in ("total", "economy", "military", "exploration")}
+        fallen = frozenset(s.plan.player for s in self.seats.values() if self.states.get(s.plan.slot) == "defeated")
+        for seat in self.seats.values():
+            if seat.executor is not None:
+                seat.executor.fallen = fallen
 
     def _check_end(self, time_ms: int) -> None:
         if self.over:

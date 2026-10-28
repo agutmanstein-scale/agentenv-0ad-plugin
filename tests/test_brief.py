@@ -97,6 +97,13 @@ def test_visible_enemy_appears_in_both_briefs():
     assert json_brief(snap, 1)["enemies"] == {"2": {"units": {"cavalry": 2}, "structures": 1, "dist": 95, "contact": 0}}
 
 
+def test_the_text_brief_says_which_opponents_still_stand():
+    data = copy.deepcopy(raw(120))
+    assert "Opponents: Persia (player 2) standing." in text_brief(Snapshot.from_json(data), 1)
+    data["players"]["2"]["state"] = "defeated"
+    assert "Opponents: Persia (player 2) defeated." in text_brief(Snapshot.from_json(data), 1)
+
+
 def test_briefs_report_finished_buildings_by_kind_and_combat_counts():
     r = raw(120)
     me = r["players"]["1"]

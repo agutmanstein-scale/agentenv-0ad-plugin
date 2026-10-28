@@ -207,6 +207,25 @@ def test_attack_targets_a_seen_enemy_structure_over_the_guess():
     assert (commands[0]["x"], commands[0]["z"]) == (300.0, 200.0)
 
 
+def test_an_attack_on_a_defeated_player_is_refused_naming_the_players_still_standing():
+    seat, _ = load(300)
+    executor, _, _ = make_executor(players=(1, 2, 3))
+    executor.last_seat = seat
+    executor.fallen = frozenset({2})
+    army = executor.submit(Army(action="attack", target="player_2"))
+    assert army.code == "defeated" and "player_3" in army.alternatives and "player_2" not in army.alternatives
+
+
+def test_an_attack_on_a_player_who_falls_turns_to_the_nearest_one_still_standing():
+    seat, snap = load(300)
+    executor, _, _ = make_executor(players=(1, 2, 3))
+    executor.submit(Army(action="attack", target="player_2"))
+    executor.fallen = frozenset({2})
+    commands = of_type(tick(executor, seat, snap.players[1]), "attack-walk")
+    assert executor.book.army.target == "player_3" and list(executor.enemy_bases(seat)) == [3]
+    assert (commands[0]["x"], commands[0]["z"]) == tuple(round(v, 1) for v in executor.enemy_bases(seat)[3])
+
+
 def test_retreat_walks_soldiers_home_and_scout_sends_one_cavalryman():
     seat, _ = load(300)
     away = replace(seat, units=tuple(replace(u, pos=(300.0, 300.0)) if u.soldier else u for u in seat.units))

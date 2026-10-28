@@ -163,6 +163,7 @@ class Executor:
         self.queue = queue
         self.placer = placer
         self.players = tuple(p for p in players if p != player)
+        self.fallen: frozenset[int] = frozenset()  # opponents the engine has defeated (the match keeps it current)
         self.book = book or OrderBook(player)
         self.autopilot = autopilot or Autopilot()
         self.last_seat: SeatView | None = None
@@ -276,6 +277,9 @@ class Executor:
         if target is not None and target not in self.players:
             options = [f"player_{p}" for p in self.players] + ["home", "center", "front"]
             return rejected("bad_target", f"Player {target} is not an opponent in this match.", options)
+        if target is not None and target in self.fallen:
+            options = [f"player_{p}" for p in self.standing] + ["home", "center", "front"]
+            return rejected("defeated", f"Player {target} is already defeated.", options)
         time_ms = self.last_seat.time_ms if self.last_seat else 0
         self.book.army.action, self.book.army.target, self.book.army.since_ms = order.action, order.target, time_ms
         self.book.army.seq += 1
@@ -357,10 +361,14 @@ class Executor:
             self.failures.append(Failure(now, self.player, key, what, reason, where))
             log.warning("player %d: gave up on %s: %s", self.player, what, reason)
 
+    @property
+    def standing(self) -> tuple[int, ...]:
+        return tuple(p for p in self.players if p not in self.fallen)
+
     def enemy_bases(self, seat: SeatView) -> dict[int, Pos]:
-        """Each opponent's base as this seat knows it: its seen structures' nearest, else a guess."""
+        """Each standing opponent's base as this seat knows it: its seen structures' nearest, else a guess."""
         out: dict[int, Pos] = {}
-        for q in self.players:
+        for q in self.standing:
             seen = list(self.enemy_structures.get(q, {}).values())
             if seen and seat.base is not None:
                 out[q] = min(seen, key=lambda p: distance(p, seat.base))

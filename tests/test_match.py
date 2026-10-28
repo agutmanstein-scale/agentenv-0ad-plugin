@@ -100,6 +100,18 @@ async def test_conquest_ends_the_match_when_the_engine_defeats_a_player(tmp_path
     assert match.detail().startswith("Petra 2 won by conquest")
 
 
+async def test_each_executor_learns_which_opponents_the_engine_has_defeated(tmp_path):
+    handle = Handle()
+    handle.engine.outcome["3"] = {"state": "active", "total": 50, "economy": 40, "military": 0, "exploration": 10}
+    match = make(tmp_path, (*AGENT_VS_PETRA, SeatPlan("3", 3, "petra", "cart", "Petra 3")), handle=handle)
+    await match.setup()
+    match.start()
+    await asyncio.sleep(0.2)
+    match.engine.outcome["2"]["state"] = "defeated"
+    await asyncio.sleep(0.3)
+    assert not match.over and match.seats["1"].executor.fallen == {2}
+
+
 async def test_an_engine_that_stops_answering_fails_the_match_and_is_released(tmp_path):
     handle = Handle()
     match = make(tmp_path, handle=handle)
