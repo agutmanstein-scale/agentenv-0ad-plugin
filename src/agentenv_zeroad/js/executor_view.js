@@ -144,7 +144,8 @@
           seen[ent] = 1;
           const rs = Engine.QueryInterface(ent, IID_ResourceSupply);
           const type = rs.GetType();
-          if (RES.indexOf(type.generic) === -1 || rs.GetCurrentAmount() <= 0) continue;
+          // Infinite supplies are fields (a fallen empire's decay to gaia); their amount would reach Python as null.
+          if (RES.indexOf(type.generic) === -1 || rs.IsInfinite() || rs.GetCurrentAmount() <= 0) continue;
           const at = pos(ent);
           if (!at) continue;
           const owner = cmpTerritory.GetOwner(at[0], at[1]);

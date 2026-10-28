@@ -39,7 +39,8 @@ function component(e, iid) {
     case "Identity": return e.classes ? { GetClassesList: () => e.classes } : null;
     case "Position": return { IsInWorld: () => true, GetPosition2D: () => ({ x: e.pos[0], y: e.pos[1] }) };
     case "ResourceSupply": return e.resource ? {
-      GetType: () => ({ generic: e.resource, specific: e.resource }), GetCurrentAmount: () => 100,
+      GetType: () => ({ generic: e.resource, specific: e.resource }),
+      GetCurrentAmount: () => e.infinite ? Infinity : 100, IsInfinite: () => !!e.infinite,
       GetNumGatherers: () => 0, GetMaxGatherers: () => 8 } : null;
     case "ResourceDropsite": return e.drop ? { GetTypes: () => e.drop } : null;
     case "ProductionQueue": return e.queue ? { GetQueue: () => e.queue } : null;
@@ -73,9 +74,9 @@ WORLD = {
 }  # fmt: skip
 
 
-def run_view() -> ExecutorView:
+def run_view(world: dict = WORLD) -> ExecutorView:
     view_js = executor_view_js([1]).strip().rstrip(";")
-    script = HARNESS.replace("__WORLD__", json.dumps(WORLD)).replace("__VIEW__", view_js)
+    script = HARNESS.replace("__WORLD__", json.dumps(world)).replace("__VIEW__", view_js)
     out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout
     return ExecutorView.from_json(json.loads(out))
 
@@ -94,3 +95,11 @@ def test_production_queue_lists_queued_units_per_batch():
     cc = run_view().seats[1].structure(10)
     assert cc.queue == 2
     assert cc.queued == (("units/rome/support_female_citizen", 2),)
+
+
+def test_a_field_left_to_gaia_by_a_fallen_empire_is_not_a_resource_site():
+    """A field holds infinite food, and a fallen empire's buildings decay to gaia: an infinite amount would reach the
+    view as null and fail every tick of the match."""
+    field = {"id": 22, "owner": 0, "pos": [470, 640], "resource": "food", "infinite": True}
+    seat = run_view({"entities": [*WORLD["entities"], field]}).seats[1]
+    assert [site.id for site in seat.sites["food"]] == [21]
