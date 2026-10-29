@@ -104,6 +104,14 @@ async def test_without_an_urgent_event_the_strategist_calls_on_its_interval():
     assert second - first >= 25.0
 
 
+async def test_a_defeated_seats_strategist_stops_calling_its_model_and_waits_out_the_match():
+    clock = Clock()
+    link = FakeLink(clock, lambda t, calls: {"started": True, "over": t >= 300, "defeated": t >= 30, "open": []})
+    c = commander(FakeLiteLLM(), clock)
+    record = await c.play(link)
+    assert len(link.call_times) == 2 and record.end_reason == "defeated (match_over)" and clock.now >= 300
+
+
 async def test_a_call_while_nothing_is_open_is_no_wait_and_one_while_something_is_open_is():
     clock = Clock()
     link = FakeLink(clock, lambda t, calls: {"started": True, "over": t >= 30, "urgent": 0, "open": []})

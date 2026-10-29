@@ -110,6 +110,7 @@ async def test_each_executor_learns_which_opponents_the_engine_has_defeated(tmp_
     match.engine.outcome["2"]["state"] = "defeated"
     await asyncio.sleep(0.3)
     assert not match.over and match.seats["1"].executor.fallen == {2}
+    assert match.status("2")["defeated"] and not match.status("1")["defeated"]
 
 
 async def test_an_engine_that_stops_answering_fails_the_match_and_is_released(tmp_path):

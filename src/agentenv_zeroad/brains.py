@@ -21,8 +21,9 @@ Setup A). They are wrapped as A2A agents in `agents/zeroad-commander` and `agent
   autopilot carries out the default, logged as the autopilot's.
 
 Each stops before its spend cap (`SpendGuard`) and keeps polling until the match is over, so the seat plays on with
-its executor; it stops at once when the match is over or the env goes away. A failed model call, order call or brief
-costs one turn (a failed order is recorded as rejected), never the rest of the match.
+its executor; it stops at once when the match is over or the env goes away. A defeated seat's strategist stops calling
+its model and polls until the match is over. A failed model call, order call or brief costs one turn (a failed order
+is recorded as rejected), never the rest of the match.
 """
 
 from __future__ import annotations
@@ -232,6 +233,9 @@ class Commander:
                 return self.record
             if st.get("over") or st.get("playing_out"):
                 self.record.end_reason = "match_over"
+                return self.record
+            if st.get("defeated"):
+                self.record.end_reason = f"defeated ({await _wait_over(link, s.poll_s, self._sleep)})"
                 return self.record
             now = self._clock()
             due = st.get("started", True) and (

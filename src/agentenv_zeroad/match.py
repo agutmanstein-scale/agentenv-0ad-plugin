@@ -713,6 +713,7 @@ class LiveMatch:
         return {
             "started": self.started,
             "over": self.over,
+            "defeated": self.states.get(slot) == "defeated",
             "game_ms": self.time_ms,
             "time_cap_ms": int(self.config.time_cap_s * 1000),
             "events": len(pending),
