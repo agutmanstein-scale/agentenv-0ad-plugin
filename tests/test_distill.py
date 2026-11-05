@@ -18,6 +18,7 @@ pytestmark = pytest.mark.anyio
 
 TOOLS = [ToolSpec(n, f"{n} tool", {"type": "object"}) for n in ("army", "hold", "set_economy", "say")]
 SYSTEM = "You command an empire."
+REFERENCE = "Costs for rome (f food): villager 50f."
 POLICIES = {"v2": D.Policy(SYSTEM, tuple(TOOLS))}
 
 
@@ -40,6 +41,7 @@ def save_game(
     turns = [brief_turn(m, status="rejected" if m == rejected_at else "accepted") for m in minutes]
     r = results(game_id, turns={"1": turns}, rows=timeline(minutes=30, net_worth=nw), status=status)
     r["seats"]["1"]["interface"] = interface
+    r["seats"]["1"]["reference"] = REFERENCE
     (games / game_id).mkdir(parents=True)
     (games / game_id / "results.json").write_text(json.dumps(r))
 
@@ -125,9 +127,8 @@ async def test_the_teacher_gets_the_policys_system_prompt_tools_and_brief_and_it
     labels, stats = await D.label(briefs, model, POLICIES)
     assert stats["labelled"] == 4 and stats["no_calls"] == 0 and stats["stopped"] is None
     body = fake.bodies("/v1/chat/completions")[0]
-    assert body["messages"][0] == {"role": "system", "content": SYSTEM} and body["messages"][1]["content"].startswith(
-        "brief"
-    )
+    assert body["messages"][0] == {"role": "system", "content": f"{SYSTEM}\n\n{REFERENCE}"}
+    assert body["messages"][1]["content"].startswith("brief")
     assert [t["function"]["name"] for t in body["tools"]] == ["army", "hold", "set_economy", "say"]
     rows = D.sft_rows(labels, CharTokenizer(), "opus")
     assert (
@@ -266,20 +267,59 @@ async def test_the_second_teacher_labels_only_the_check_subset_and_the_report_ha
 
 
 @pytest.mark.parametrize("interface", ["v1", "v2"])
-def test_the_default_policy_is_the_interfaces_prompt_and_the_tools_a_seat_of_it_is_offered(interface):
+async def test_the_default_policy_is_the_interfaces_prompt_and_the_tools_a_seat_of_it_is_shown(interface):
     from agentenv_zeroad import brains
+    from agentenv_zeroad.server import tool_specs
 
-    policy = D.default_policy(interface)
+    policy = await D.default_policy(interface)
     assert policy.system == brains.strategist_system(interface)
-    assert list(policy.tools) == brains.offered_tools(D.env_tool_specs(), interface)
+    assert list(policy.tools) == brains.offered_tools(await tool_specs(), interface)
     by_name = {t.name: t for t in policy.tools}
     assert ("hold" in by_name) == (interface == "v2") and "get_brief" not in by_name
     assert ("min_size" in by_name["army"].parameters["properties"]) == (interface == "v2")
 
 
-def test_the_env_tool_list_comes_from_the_class_without_a_running_server():
-    names = {t.name for t in D.env_tool_specs()}
-    assert {"army", "train", "get_brief"} <= names
+async def test_the_teachers_tools_are_the_ones_the_commanders_in_process_seat_offers_its_model(tmp_path):
+    from agentenv_zeroad.brains import InProcessSeatLink
+    from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
+    from agentenv_zeroad.server import tool_specs
+    from tests.zeroad_fakes import Handle, placer
+
+    seats = (SeatPlan("1", 1, "agent", "rome", "policy", interface="v2"), SeatPlan("2", 2, "petra", "pers", "Petra"))
+    match = LiveMatch(Handle(), MatchConfig(seats=seats), out_dir=tmp_path, placer=placer())
+    await match.setup()
+    shown = await InProcessSeatLink(match, "1", await tool_specs()).tools()
+    assert list((await D.default_policy("v2")).tools) == shown
+
+
+async def test_the_teachers_system_prompt_is_the_commanders_prompt_plus_the_games_recorded_reference(tmp_path):
+    from agentenv_zeroad.brains import Commander, CommanderSettings
+    from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
+    from tests.zeroad_fakes import Handle, placer
+
+    seats = (SeatPlan("1", 1, "agent", "rome", "policy", interface="v2"), SeatPlan("2", 2, "petra", "pers", "Petra"))
+    match = LiveMatch(Handle(), MatchConfig(seats=seats), out_dir=tmp_path / "m", placer=placer())
+    await match.setup()
+    recorded = match.results()["seats"]["1"]["reference"]
+    assert recorded.startswith("Costs for rome")
+    save_game(tmp_path / "games", "g1", minutes=(3,))
+    path = tmp_path / "games" / "g1" / "results.json"
+    data = json.loads(path.read_text())
+    data["seats"]["1"]["reference"] = recorded
+    path.write_text(json.dumps(data))
+    brief = D.candidates(tmp_path / "games")[0]
+    commander = Commander(StrategistModel("m", "https://p", KEY, SpendGuard("m")), CommanderSettings(interface="v2"))
+    commander._reference = match.reference("1")
+    assert D.system_for(await D.default_policy("v2"), brief) == commander.system
+
+
+def test_a_game_with_no_recorded_reference_gives_no_briefs(tmp_path):
+    save_game(tmp_path, "g1")
+    path = tmp_path / "g1" / "results.json"
+    data = json.loads(path.read_text())
+    del data["seats"]["1"]["reference"]
+    path.write_text(json.dumps(data))
+    assert D.candidates(tmp_path) == []
 
 
 async def test_each_brief_is_asked_under_its_own_interfaces_prompt_and_tools(tmp_path):
@@ -289,7 +329,7 @@ async def test_each_brief_is_asked_under_its_own_interfaces_prompt_and_tools(tmp
     model, fake = teacher([("army", {})])
     await D.label(briefs, model, {"v2": other})
     body = fake.bodies("/v1/chat/completions")[0]
-    assert body["messages"][0]["content"] == "a second prompt" and len(body["tools"]) == 1
+    assert body["messages"][0]["content"] == f"a second prompt\n\n{REFERENCE}" and len(body["tools"]) == 1
 
 
 # --- writing ---

@@ -6,17 +6,18 @@ supervised data can fix, or of finding out through play, which needs RL? The pro
 
 Briefs come from finished v2 games the policy already played (a game whose policy seat's recorded interface is not v2
 is skipped: v1's prompt has no hold or waves, and a label written under it would not fit the v2 prompt ids it is
-trained on),
+trained on; so is one with no recorded reference text, whose policy prompt can't be rebuilt),
 chosen where a good answer is worth most: turns where the policy was behind on net worth in minutes 8 to 12, turns
 after minute 20, and turns where one of its orders was rejected, a third each by default, at most `per_game` from any
 game. A turn is one brief: the user message the policy saw, with the exact prompt token ids it was sampled from, so the
 label sits on the same prompt the policy will meet.
 
 The teacher gets the policy's system prompt and tools for the brief's interface (`default_policy`: `brains.
-strategist_system(interface)` and the env's own tool list as `brains.offered_tools` offers it to that interface; the
-CLI's `--system` and `--tools` override them) through the same client the strategist uses (`llm.py`), under a
-`SpendGuard` cap. Each call reserves the most it could cost, under a lock, before it is sent, so the calls in flight
-together never take spend past the cap; labelling stops at the first call that does not fit, with what it has. Its tool
+strategist_system(interface)` and `server.tool_specs()` as `brains.offered_tools` offers it to that interface; the
+CLI's `--system` and `--tools` override them), and the seat's own per-civ cost tables (the `reference` its game
+recorded) after the prompt, as `Commander.system` composes it, through the same client the strategist uses
+(`llm.py`), under a `SpendGuard` cap. Each call reserves the most it could cost, under a lock, before it is sent, so
+the calls in flight together never take spend past the cap; labelling stops at the first call that does not fit, with what it has. Its tool
 calls become the completion in Qwen's tool-call format, `<tool_call>\\n{"name": ..., "arguments": ...}\\n</tool_call>`
 for each call, then `<|im_end|>`, tokenized with the model's tokenizer. A teacher call that names a tool the policy
 does not have, or whose arguments are not a JSON object, is left out; a brief left with no call is dropped.
@@ -96,6 +97,7 @@ class Brief:
     prompt_token_ids: tuple[int, ...]
     stratum: str
     interface: str = INTERFACE
+    reference: str = ""  # the seat's cost tables, which its system prompt carried after the prompt text
 
     @property
     def key(self) -> str:
@@ -114,13 +116,24 @@ def candidates(games: Path, learners: Sequence[str] | None = None) -> list[Brief
         opp = rs.other_slot(results, slot) if slot else None
         if slot is None or opp is None or results["seats"][slot].get("interface") != INTERFACE:
             continue
+        reference = str(results["seats"][slot].get("reference") or "")
+        if not reference:
+            continue
         game_id = str((results.get("spec") or {}).get("game_id") or path.parent.name)
         for turn in results["seats"][slot].get("turns") or []:
             if not (turn.get("user") and turn.get("prompt_token_ids") and turn.get("began_ms") is not None):
                 continue
             stratum = _stratum(results, slot, opp, turn)
             out.append(
-                Brief(game_id, slot, int(turn["began_ms"]), turn["user"], tuple(turn["prompt_token_ids"]), stratum)
+                Brief(
+                    game_id,
+                    slot,
+                    int(turn["began_ms"]),
+                    turn["user"],
+                    tuple(turn["prompt_token_ids"]),
+                    stratum,
+                    reference=reference,
+                )
             )
     return out
 
@@ -209,23 +222,17 @@ def usable_calls(reply: Reply, tools: Sequence[ToolSpec]) -> list[tuple[str, dic
     return [(c.name, c.arguments) for c in reply.calls if c.error is None and c.name in known]
 
 
-def env_tool_specs() -> list[ToolSpec]:
-    """The env's `@tool` handlers as `ToolSpec`s, read from the class, so no server has to be running."""
-    from agentenv_protocol.types import EnvironmentTool
+async def default_policy(interface: Interface) -> Policy:
+    """The system prompt and order tools a seat of `interface` is shown: the prompt text and the env's tool list as
+    its MCP clients and the in-process link get them (`server.tool_specs()`) through `brains.offered_tools`."""
+    from agentenv_zeroad.server import tool_specs
 
-    from agentenv_zeroad.server import ZeroADEnv
-
-    out = []
-    for member in vars(ZeroADEnv).values():
-        for attr in vars(member).values() if callable(member) else ():
-            if isinstance(attr, EnvironmentTool):
-                out.append(ToolSpec(attr.name, attr.description or "", attr.inputSchema or {"type": "object"}))
-    return out
+    return Policy(brains.strategist_system(interface), tuple(brains.offered_tools(await tool_specs(), interface)))
 
 
-def default_policy(interface: Interface) -> Policy:
-    """The system prompt and order tools a seat of `interface` plays with (the env's own, not a hand-kept copy)."""
-    return Policy(brains.strategist_system(interface), tuple(brains.offered_tools(env_tool_specs(), interface)))
+def system_for(policy: Policy, brief: Brief) -> str:
+    """The system prompt the policy had for this brief: its text, then the seat's cost tables, as `Commander.system`."""
+    return f"{policy.system}\n\n{brief.reference}" if brief.reference else policy.system
 
 
 async def label(
@@ -249,8 +256,8 @@ async def label(
     async def one(i: int, brief: Brief) -> None:
         nonlocal reserved
         policy = policies[brief.interface]
-        tools = list(policy.tools)
-        _, body = teacher.request(policy.system, brief.user, tools)
+        tools, system = list(policy.tools), system_for(policy, brief)
+        _, body = teacher.request(system, brief.user, tools)
         most = spend.bound(teacher.model, body, teacher.max_tokens)
         async with gate:
             async with reserve:
@@ -265,7 +272,7 @@ async def label(
                     return
                 reserved += most
             try:
-                reply = await teacher.call(policy.system, brief.user, tools)
+                reply = await teacher.call(system, brief.user, tools)
             except SpendCapReached as e:
                 stats["stopped"] = str(e)
                 return
@@ -402,13 +409,13 @@ def _teacher(
     return StrategistModel(model, base_url, key, guard, effort="low", max_tokens=1024, http=http)
 
 
-def _policy(args: argparse.Namespace) -> Policy:
+async def _policy(args: argparse.Namespace) -> Policy:
     """The env's own policy for v2, with the system prompt or tool list replaced by the files given."""
     system = args.system.read_text() if args.system else None
     tools = tuple(ToolSpec(**t) for t in json.loads(args.tools.read_text())) if args.tools else None
     if system is not None and tools is not None:
         return Policy(system, tools)
-    base = default_policy(INTERFACE)
+    base = await default_policy(INTERFACE)
     return Policy(base.system if system is None else system, base.tools if tools is None else tools)
 
 
@@ -417,7 +424,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     pool = candidates(args.games, args.learner_slot.split(",") if args.learner_slot else None)
     briefs = select(pool, args.n, per_game=args.per_game, seed=args.seed)
-    policies = {INTERFACE: _policy(args)}
+    policies = {INTERFACE: await _policy(args)}
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as http:
         teacher = _teacher(args.teacher, args.base_url, args.api_key_env, args.cap_usd, http, args.spend_log)
         second = (
