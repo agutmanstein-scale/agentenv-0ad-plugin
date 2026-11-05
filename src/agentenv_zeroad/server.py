@@ -152,9 +152,11 @@ class MatchSettings(BaseModel):
     safety_cap_minutes: float = Field(45.0, gt=0, le=720)
     """With no time cap, the game minutes after which the game is decided by the score rule anyway (ended_by
     "safety_cap")."""
-    score_rule: ScoreRule = "official"
+    score_rule: ScoreRule | None = None
     """What decides a game at the time cap or safety cap: official (the engine's score total) or net_worth (what a
-    player's living units and finished structures cost, plus its banked resources). Conquest is unaffected."""
+    player's living units and finished structures cost, plus its banked resources). Conquest is unaffected. By default
+    the rule the agents' prompt states: net_worth when an agent plays interface v2, else official. A rule the prompt
+    contradicts fails the lobby."""
     draw_margin: float = Field(0.0, ge=0)
     """At the time cap, players within this many points of the top draw (points of the score rule's own measure)."""
     ai_seed: int | None = Field(None, ge=0)

@@ -61,6 +61,14 @@ async def agent_vs_petra(env, **settings):
     await env.close_lobby()
 
 
+async def agent_vs_petra_with(env, agent, **settings):
+    env.new_lobby({**FAST, **settings})
+    slot = {"player_id": "1", "player_kind": "agent", "player_name": "alice", **agent}
+    env.fill_slot(SlotRequest(**slot))
+    env.fill_slot(SlotRequest(player_id="2", player_kind="ai"))
+    await env.close_lobby()
+
+
 async def test_player_slots_are_the_engines_player_numbers(env):
     env.new_lobby(FAST)
     with pytest.raises(GameError, match="player numbers 1 to 8"):
@@ -304,3 +312,28 @@ async def test_the_report_carries_each_players_net_worth_beside_the_engine_score
     await env.live._tick()
     scores = {s.name: s.value for s in env.match.player_states["1"].scores}
     assert scores["net_worth"] == 1500
+
+
+async def test_a_v2_agent_defaults_the_score_rule_to_net_worth_and_a_contradicting_rule_fails_the_lobby(env, handles):
+    v2 = {"game_settings": {"interface": "v2"}}
+    await agent_vs_petra_with(env, v2)
+    assert env.live.config.score_rule == "net_worth"
+    await agent_vs_petra_with(env, {"game_settings": {}})
+    assert env.live.config.score_rule == "official"
+    await agent_vs_petra_with(env, v2, score_rule="net_worth")
+    assert env.live.config.score_rule == "net_worth"
+    before = len(handles)
+    with pytest.raises(ValueError, match="score_rule 'official' contradicts the agents' prompt"):
+        await agent_vs_petra_with(env, v2, score_rule="official")
+    with pytest.raises(ValueError, match="score_rule 'net_worth' contradicts the agents' prompt"):
+        await agent_vs_petra_with(env, {"game_settings": {}}, score_rule="net_worth")
+    assert len(handles) == before and env.lobby.status.value == "failed"
+
+
+async def test_a_v2_bot_or_replay_seat_leaves_the_score_rule_at_official(env):
+    env.new_lobby(FAST)
+    bot = {"controller": "bot", "interface": "v2"}
+    env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings=bot))
+    env.fill_slot(SlotRequest(player_id="2", player_kind="ai"))
+    await env.close_lobby()
+    assert env.live.config.score_rule == "official"

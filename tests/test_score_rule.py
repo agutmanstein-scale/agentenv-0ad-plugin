@@ -2,16 +2,19 @@
 passes to the scenario: how a time-capped game is decided and what results.json records about it."""
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
-from agentenv_zeroad.grading import SCORE_KEYS, time_cap_outcomes
+from agentenv_zeroad.grading import SCORE_KEYS, resolve_score_rule, time_cap_outcomes
 from agentenv_zeroad.match import SAFETY_CAP_S, LiveMatch, MatchConfig, SeatPlan
 from tests.zeroad_fakes import Handle, placer
 
 pytestmark = pytest.mark.anyio
 
-SEATS = (SeatPlan("1", 1, "agent", "rome", "alice"), SeatPlan("2", 2, "petra", "pers", "Petra 2"))
+PETRA = SeatPlan("2", 2, "petra", "pers", "Petra 2")
+AGENT = SeatPlan("1", 1, "agent", "rome", "alice")
+SEATS = (SeatPlan("1", 1, "bot", "rome", "alice"), PETRA)
 
 
 def make(tmp_path, **config) -> LiveMatch:
@@ -34,6 +37,32 @@ async def run_out(match: LiveMatch) -> None:
 
 def test_the_score_rules_name_the_measure_each_one_ranks_by():
     assert SCORE_KEYS == {"official": "total", "net_worth": "net_worth"}
+
+
+def test_the_default_rule_is_the_one_the_agents_prompt_states():
+    assert resolve_score_rule(None, ["v2"]) == "net_worth" and resolve_score_rule(None, ["v1", "v1"]) == "official"
+    assert resolve_score_rule(None, []) == "official"
+    assert resolve_score_rule("net_worth", []) == "net_worth" and resolve_score_rule("official", ["v1"]) == "official"
+
+
+def test_a_rule_the_prompt_contradicts_is_an_error_but_agents_on_both_interfaces_have_no_one_prompt():
+    with pytest.raises(ValueError, match="contradicts the agents' prompt"):
+        resolve_score_rule("official", ["v2"])
+    with pytest.raises(ValueError, match="contradicts the agents' prompt"):
+        resolve_score_rule("net_worth", ["v1"])
+    assert resolve_score_rule(None, ["v1", "v2"]) == "official"
+    assert resolve_score_rule("net_worth", ["v1", "v2"]) == "net_worth"
+
+
+def test_a_match_config_resolves_its_rule_from_its_agent_seats_and_ignores_other_seats():
+    v2 = (replace(AGENT, interface="v2"), PETRA)
+    assert MatchConfig(seats=v2).score_rule == "net_worth"
+    assert MatchConfig(seats=(AGENT, PETRA)).score_rule == "official"
+    bot_v2 = (SeatPlan("1", 1, "bot", "rome", "Bot 1", interface="v2"), PETRA)
+    assert MatchConfig(seats=bot_v2).score_rule == "official"
+    assert MatchConfig(seats=bot_v2, score_rule="net_worth").score_rule == "net_worth"
+    with pytest.raises(ValueError, match="contradicts"):
+        MatchConfig(seats=v2, score_rule="official")
 
 
 def test_a_draw_margin_is_in_the_chosen_measures_own_units():

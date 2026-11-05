@@ -18,7 +18,7 @@ none (a plain MCP agent) is counted by its tool calls instead, each one made, si
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -29,6 +29,25 @@ POINTS = {"won": 1.0, "drawn": 0.5, "lost": 0.0}
 Outcome = Literal["won", "lost", "drawn"]
 ScoreRule = Literal["official", "net_worth"]
 SCORE_KEYS: dict[ScoreRule, str] = {"official": "total", "net_worth": "net_worth"}
+PROMPT_RULES: dict[str, ScoreRule] = {"v1": "official", "v2": "net_worth"}
+
+
+def resolve_score_rule(rule: ScoreRule | None, agent_interfaces: Iterable[str]) -> ScoreRule:
+    """The score rule a match runs under, given what its agents are told.
+
+    An interface's system prompt states how the time cap is decided (v1: the highest score; v2: the higher net
+    worth), so the rule has to agree with it or the policy is trained, and the baseline measured, on a goal the engine
+    does not score. `None` takes the rule the agents' prompt names (official when no agent plays, or when agents on
+    both interfaces do, as in an interface comparison, where no one rule fits both); an explicit rule that contradicts
+    the one prompt all the agents share is an error.
+    """
+    named = {PROMPT_RULES[i] for i in agent_interfaces}
+    prompted = next(iter(named)) if len(named) == 1 else None
+    if rule is None:
+        return prompted or "official"
+    if prompted is not None and rule != prompted:
+        raise ValueError(f"score_rule {rule!r} contradicts the agents' prompt, which says the {prompted} rule decides")
+    return rule
 
 
 @dataclass(frozen=True)

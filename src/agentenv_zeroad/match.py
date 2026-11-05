@@ -15,7 +15,8 @@ player sees, while the observer still sees all.
 
 The match ends by conquest (the engine's own player states), or at the time cap, where the highest score among the
 players still standing wins and a tie on top draws (`grading`); a player the engine already defeated stays lost. The
-score is the engine's official total or, with `score_rule="net_worth"`, each player's net worth (`js/snapshot.js`). A
+score is the engine's official total or, with `score_rule="net_worth"`, each player's net worth (`js/snapshot.js`); an
+unset rule follows what the agents' prompt says (`grading.resolve_score_rule`). A
 `time_cap_s` of 0 means no time cap: the game then ends at the safety cap (`safety_cap_s`), decided the same way and
 recorded as `ended_by` "safety_cap". The cap is checked every seat-loop second even when that second's engine reads
 fail, on the last known scores, and a loop that fails `MAX_FAILED_TICKS` seconds in a row fails the match, so it can't
@@ -136,13 +137,18 @@ class MatchConfig:
     speed: float = 1.0
     time_cap_s: float = 40 * 60  # 0: no time cap, the game ends at `safety_cap_s`
     safety_cap_s: float = SAFETY_CAP_S
-    score_rule: grading.ScoreRule = "official"
+    score_rule: grading.ScoreRule | None = None
+    """None: the rule the agent seats' prompt names (v2 net worth, else official); see grading.resolve_score_rule."""
     draw_margin: float = 0.0
     fog: bool = True
     tick_s: float = TICK_S
     ai_seed: int | None = None  # Petra's seed; the map seed by default
     ceasefire_minutes: int = 0
     starting_resources: int | None = None  # experimental (scenario.py)
+
+    def __post_init__(self) -> None:
+        agents = (s.interface for s in self.seats if s.kind == "agent")
+        object.__setattr__(self, "score_rule", grading.resolve_score_rule(self.score_rule, agents))
 
     @property
     def cap_s(self) -> float:
@@ -524,7 +530,6 @@ class LiveMatch:
                     "gatherers": sum(me.gatherers.values()),
                     "resources": sum(me.resources.values()),
                     "villagers": me.units.get("villager", 0),
-                    "idle_production": len(me.idle_production),
                     "phase": me.phase,
                     "buildings": len(me.buildings),
                     "kills": int(me.stats.get("enemy_units_killed", 0)),
@@ -890,11 +895,7 @@ class LiveMatch:
                 "civ": seat.plan.civ,
                 "name": seat.plan.name,
                 "interface": seat.plan.interface,
-                **(
-                    {"ai_difficulty": seat.plan.ai_difficulty, "ai_behavior": seat.plan.ai_behavior}
-                    if seat.plan.kind == "petra"
-                    else {}
-                ),
+                **self._petra_settings(seat.plan),
                 "state": self.states.get(slot),
                 "outcome": outcome,
                 "score": self.scores.get(slot),
