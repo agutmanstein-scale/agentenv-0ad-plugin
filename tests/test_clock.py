@@ -41,8 +41,8 @@ def test_steps_land_on_a_fixed_wall_clock_grid_at_200ms_over_speed(speed, period
     assert clock.overruns == 0
 
 
-@pytest.mark.parametrize("speed", [0.5, 2.5])
-def test_speed_outside_1_to_2_is_rejected(speed):
+@pytest.mark.parametrize("speed", [0.5, 8.5])
+def test_speed_outside_1_to_8_is_rejected(speed):
     with pytest.raises(ValueError):
         GameClock(FakeEngine(), speed=speed)
 

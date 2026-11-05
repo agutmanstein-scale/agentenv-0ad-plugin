@@ -146,6 +146,11 @@ CHANGE_SCRIPTS = [
     ("fetch.sh", ID, "livestream-1"),
     ("fetch.sh", ID, "--only", "rec/zeroad/2026-10-29_01-00-00-000000.mp4"),
     ("put-secret.sh", "litellm-key"),
+    ("bootstrap.sh", ID, "--pilot"),
+    ("pilot.sh", ID, "start"),
+    ("pilot.sh", ID, "start", "--baseline", "--no-frontier", "--speed", "4"),
+    ("pilot.sh", ID, "stop"),
+    ("pilot.sh", ID, "stop", "--now"),
 ]
 
 
@@ -161,7 +166,7 @@ def test_every_script_that_changes_anything_is_a_dry_run_without_yes_and_calls_n
 
 @pytest.mark.parametrize(
     "cmd",
-    [("status.sh", ID, "--dry-run"), ("health.sh", ID, "--dry-run")],
+    [("status.sh", ID, "--dry-run"), ("health.sh", ID, "--dry-run"), ("pilot.sh", ID, "status", "--dry-run")],
 )
 def test_the_read_only_scripts_plan_with_dry_run_and_call_no_aws(stubs, cmd):
     out = run(stubs, *cmd, forbid_aws=True)
@@ -814,3 +819,67 @@ def test_box_bootstrap_hides_other_users_command_lines_before_anything_is_instal
     assert "remount,hidepid=2 /proc" in plan  # the push's RTMP URL is on ffmpeg's argv
     assert "hidepid=2 0 0" in plan  # kept across reboots
     assert plan.index("hidepid=2") < plan.index("apt-get")
+
+
+def start_pilot(stubs, *args, units=None, **extra):
+    write_exe(stubs["bin"] / "curl", "#!/bin/sh\nexit 0\n")  # vLLM's health
+    clock = {"ZEROAD_NOW_EPOCH": "1800000000", "ZEROAD_BOOT_EPOCH": "1800000000"}
+    return run_box(
+        stubs, "pilot.sh", "start", *args, "--budget", "150", DRY_RUN="0", STUB_UNITS=json.dumps(units or {}), **clock,
+        **extra,
+    )  # fmt: skip
+
+
+def test_the_pilot_starts_its_round_loop_in_its_own_unit_with_the_frontier_probe_unless_told_not_to(box_stubs):
+    out = start_pilot(box_stubs, "--baseline")
+    assert out.returncode == 0, out.stderr
+    [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert "--unit zeroad-pilot" in call and "KillMode=control-group" in call
+    assert call.split("pilot-run.sh ")[1] == "1 --budget 150 --baseline"
+    out = start_pilot(box_stubs, "--no-frontier", "--rounds", "3")
+    assert out.returncode == 0, out.stderr
+    call = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")][-1]
+    assert call.split("pilot-run.sh ")[1] == "0 --budget 150 --frontier  --rounds 3"
+
+
+def test_a_second_pilot_is_refused_while_one_runs_and_a_bad_number_before_anything(box_stubs):
+    out = start_pilot(box_stubs, units={"zeroad-pilot": "active"})
+    assert out.returncode != 0 and "the pilot is running" in out.stderr
+    out = start_pilot(box_stubs, "--rounds", "many")
+    assert out.returncode != 0 and "--rounds needs a number" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_a_pilot_that_would_pass_the_budget_is_refused(box_stubs):
+    ledger = box_stubs["tmp"] / "state" / "spend.jsonl"
+    ledger.write_text(json.dumps({"what": "pilot r00-p-sonnet", "usd_est": 149.9}) + "\n")
+    out = start_pilot(box_stubs)
+    assert out.returncode != 0 and "REFUSED" in out.stdout
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_the_pilot_run_puts_agent_envs_endpoint_on_vllm_without_the_frontier_and_on_litellm_with_it(stubs):
+    out = run_box(stubs, "pilot-run.sh", "0", "--budget", "150", "--baseline", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert "agentenv_zeroad.pilot.run --home" in out.stdout and "with-model" not in out.stdout
+    out = run_box(stubs, "pilot-run.sh", "1", "--budget", "150", DRY_RUN="1")
+    assert "aws ssm get-parameter --name /zeroad-live/litellm-key" in out.stdout and "never printed" in out.stdout
+
+
+def test_a_one_gpu_pilot_box_trains_on_the_gpu_vllm_serves_on(stubs):
+    etc = stubs["tmp"] / "etc"
+    etc.mkdir()
+    (etc / "pilot.conf").write_text("PILOT_TRAIN_GPUS=0\nPILOT_SHARE_GPU=1\n")
+    out = run_box(stubs, "pilot-run.sh", "0", "--budget", "150", DRY_RUN="1", ZEROAD_PILOT_ETC=str(etc))
+    assert out.returncode == 0, out.stderr
+    assert "--train-gpus 0 --share-gpu" in out.stdout.replace("\\", "")
+
+
+def test_the_pilot_bootstrap_binds_vllm_to_the_docker_bridge_behind_a_key_and_splits_the_gpus(stubs):
+    out = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")  # the plan's printf %q escapes commas and quotes
+    assert "-p 172.17.0.1:8000:8000" in text and "--env-file" in text and "VLLM_API_KEY=<random>" in text
+    assert "device=0,1" in text and "--tensor-parallel-size 2" in text and "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True" in text
+    assert "zeroad setup --source" in text and "--live" not in text and "zeroad-trainer" in text
+    assert "zeroad-boxtime.timer" in text and "zeroad-x" not in text

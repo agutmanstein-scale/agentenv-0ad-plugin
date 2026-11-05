@@ -71,7 +71,7 @@ async def test_player_slots_are_the_engines_player_numbers(env):
     with pytest.raises(GameError, match="civ must be one of"):
         env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings={"civ": "klingon"}))
     with pytest.raises(GameError, match="speed"):
-        env.new_lobby({"speed": 3.0})
+        env.new_lobby({"speed": 9.0})
 
 
 async def test_slots_with_a_gap_fail_the_lobby_and_start_no_engine(env, handles):

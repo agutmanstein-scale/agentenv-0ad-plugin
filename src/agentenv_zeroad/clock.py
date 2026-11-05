@@ -31,7 +31,7 @@ from agentenv_zeroad.engine import TURN_MS, GameEngine
 log = logging.getLogger(__name__)
 
 MIN_SPEED = 1.0
-MAX_SPEED = 2.0
+MAX_SPEED = 8.0
 
 
 class StateMailbox:

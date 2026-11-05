@@ -113,6 +113,22 @@ async def test_each_executor_learns_which_opponents_the_engine_has_defeated(tmp_
     assert match.status("2")["defeated"] and not match.status("1")["defeated"]
 
 
+async def test_results_keep_each_logged_turn_and_a_timeline_of_every_players_score(tmp_path):
+    match = make(tmp_path, time_cap_s=0.6)
+    await match.setup()
+    match.record_brain_call("1", BrainCall(2.0, game_ms=1000), model="local/qwen3-8b", turn={"began_ms": 0, "user": "b"})
+    match.record_brain_call("1", BrainCall(2.0))  # an unlogged call keeps no turn
+    match.start()
+    await asyncio.wait_for(match.wait_end(), 10)
+    results = match.results()
+    [turn] = results["seats"]["1"]["turns"]
+    assert turn == {"began_ms": 0, "user": "b", "reported_ms": 1000, "seconds": 2.0, "model": "local/qwen3-8b"}
+    assert "turns" not in results["seats"]["2"]
+    first = results["timeline"][0]
+    assert first["t_ms"] == 0 and set(first["players"]) == {"1", "2"}
+    assert first["players"]["1"]["total"] == 120 and "army" in first["players"]["1"]
+
+
 async def test_an_engine_that_stops_answering_fails_the_match_and_is_released(tmp_path):
     handle = Handle()
     match = make(tmp_path, handle=handle)
