@@ -85,14 +85,22 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 from agentenv_zeroad import grading
 from agentenv_zeroad.engine import DEFAULT_IMAGE, EngineOptions, free_port, start_engine
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.live import Broadcast, BroadcastSettings, overlay_html, overlay_state
 from agentenv_zeroad.match import TICK_S, EngineHandle, LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.orders import (
+    DEFAULT_MIN_SIZE,
+    DEFAULT_REGROUP_BELOW,
     MAX_TRAIN,
+    MAX_VILLAGER_TARGET,
+    MAX_WAVE_SIZE,
+    MIN_VILLAGER_TARGET,
+    MIN_WAVE_SIZE,
     AdvancePhase,
     Army,
     ArmyAction,
     Build,
+    Hold,
     OrderResult,
     Research,
     Role,
@@ -191,6 +199,9 @@ class SlotSettings(BaseModel):
     """luna: GPT-6 Luna reflexes inside the env for this seat (Setup A); for agent and bot seats, not Petra."""
     reflex_max_usd: float | None = Field(None, gt=0, le=100)
     """The reflex's spend cap for the match, in estimated USD; it stops asking before a call could pass it."""
+    interface: Interface = DEFAULT_INTERFACE
+    """The interface version this seat plays: v1 (the live stream's, the default) or v2 (waves, order feedback, a
+    richer brief with players by number; docs/post-training-v2.md). Its brain must be set to the same one."""
 
     @field_validator("civ")
     @classmethod
@@ -286,6 +297,8 @@ class ZeroADEnv(AgentEnvGameEnv):
         petra = slot.player_kind is PlayerKind.AI and (slot.game_settings.get("controller") or "petra") == "petra"
         if petra and slot.game_settings.get("reflex"):
             raise ValueError("reflex is for seats the executor drives (agent or bot); Petra plays on its own")
+        if petra and slot.game_settings.get("interface", DEFAULT_INTERFACE) != DEFAULT_INTERFACE:
+            raise ValueError("interface is for seats the executor drives (agent or bot); Petra has none")
 
     @create_game
     async def new_match(self, lobby: Lobby) -> None:
@@ -355,6 +368,7 @@ class ZeroADEnv(AgentEnvGameEnv):
             ai_difficulty=g.get("ai_difficulty", 3),
             reflex=g.get("reflex"),
             reflex_max_usd=g.get("reflex_max_usd"),
+            interface=g.get("interface", DEFAULT_INTERFACE),
         )
 
     async def _start_after(self, seconds: float) -> None:
@@ -546,10 +560,21 @@ class ZeroADEnv(AgentEnvGameEnv):
         wood: Annotated[int, Field(ge=0, le=100, description="Percent on wood.")],
         stone: Annotated[int, Field(ge=0, le=100, description="Percent on stone.")],
         metal: Annotated[int, Field(ge=0, le=100, description="Percent on metal.")],
+        villagers: Annotated[
+            int | None,
+            Field(
+                ge=MIN_VILLAGER_TARGET,
+                le=MAX_VILLAGER_TARGET,
+                description="Villagers to keep training (20-100, default 45); leave out to keep it.",
+            ),
+        ] = None,
     ):
         """Split your gatherers between the four resources, in percent; the four must add up to 100. Idle and surplus
         gatherers move over the next seconds."""
-        return await self._order("set_economy", lambda: SetEconomy(food=food, wood=wood, stone=stone, metal=metal))
+        return await self._order(
+            "set_economy",
+            lambda: SetEconomy(food=food, wood=wood, stone=stone, metal=metal, villagers=villagers),
+        )
 
     @tool()
     async def train(
@@ -588,10 +613,31 @@ class ZeroADEnv(AgentEnvGameEnv):
         self,
         action: Annotated[ArmyAction, Field(description="gather, attack, raid, defend, retreat or scout.")],
         target: Annotated[str, Field(description=f"The target: {TARGET_HELP}.")] = "home",
+        min_size: Annotated[
+            int,
+            Field(
+                ge=MIN_WAVE_SIZE,
+                le=MAX_WAVE_SIZE,
+                description="Soldiers to gather (4-30) before an attack or raid wave goes.",
+            ),
+        ] = DEFAULT_MIN_SIZE,
+        regroup_below: Annotated[
+            float,
+            Field(ge=0.0, le=0.9, description="A wave below this share (0-0.9) of its launch size falls back."),
+        ] = DEFAULT_REGROUP_BELOW,
     ):
         """Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or
         scout."""
-        return await self._order("army", lambda: Army(action=action, target=target))
+        wave = {
+            "min_size": None if min_size == DEFAULT_MIN_SIZE else min_size,
+            "regroup_below": None if regroup_below == DEFAULT_REGROUP_BELOW else regroup_below,
+        }
+        return await self._order("army", lambda: Army(action=action, target=target, **wave))
+
+    @tool()
+    async def hold(self):
+        """Keep every standing order as it is this turn: a turn with nothing to change."""
+        return await self._order("hold", Hold)
 
     @tool()
     async def say(self, text: Annotated[str, Field(min_length=1, max_length=200, description="One short line.")]):
@@ -605,6 +651,7 @@ class ZeroADEnv(AgentEnvGameEnv):
         app.custom_route("/waiting", methods=["POST"])(self._waiting)
         app.custom_route("/status", methods=["GET"])(self._status)
         app.custom_route("/reflex", methods=["POST"])(self._reflex)
+        app.custom_route("/reference", methods=["GET"])(self._reference)
         app.custom_route("/held", methods=["POST"])(self._held)
         app.custom_route("/live", methods=["GET"])(self._live_page)
         app.custom_route("/live/state.json", methods=["GET"])(self._live_state)
@@ -666,6 +713,14 @@ class ZeroADEnv(AgentEnvGameEnv):
             return error
         assert slot is not None and self.live is not None
         return JSONResponse({"ok": True, **self.live.status(slot), "playing_out": self.playing_out})
+
+    async def _reference(self, request: Request) -> JSONResponse:
+        """The seat's static cost tables for its prompt prefix: `{"text": ...}`, empty unless the seat plays v2."""
+        slot, error = self._route_seat("reference")
+        if error is not None:
+            return error
+        assert slot is not None and self.live is not None
+        return JSONResponse({"ok": True, "text": self.live.reference(slot)})
 
     async def _reflex(self, request: Request) -> JSONResponse:
         """The seat's brain hands its model endpoint to the seat's Luna reflex. The key is never echoed or logged."""

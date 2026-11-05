@@ -52,20 +52,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from agentenv_zeroad import grading
+from agentenv_zeroad.army import ArmyReport
 from agentenv_zeroad.autopilot import held_default
 from agentenv_zeroad.bots import ScriptedBot
 from agentenv_zeroad.brief import json_brief, text_brief
+from agentenv_zeroad.brief_v2 import BriefContext, affordable_text, net_worth, reference_text, text_brief_v2
 from agentenv_zeroad.clock import GameClock
 from agentenv_zeroad.decisions import DecisionsClient
 from agentenv_zeroad.engine import TURN_MS, GameEngine
 from agentenv_zeroad.executor import Executor, build_executors
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.metrics import MatchMetrics, percentile
 from agentenv_zeroad.orders import OrderResult, _Order, call_text, rejected
 from agentenv_zeroad.reflex import Decider, Reflex, ReflexAction, open_decisions
 from agentenv_zeroad.roles import RoleCatalog
 from agentenv_zeroad.scenario import Seat, build_scenario
 from agentenv_zeroad.spend import SpendGuard, results_spend
-from agentenv_zeroad.state import EventTracker, Snapshot, SnapshotQuery, clock_text
+from agentenv_zeroad.state import RESOURCES, EventTracker, Snapshot, SnapshotQuery, clock_text
 from agentenv_zeroad.view import ExecutorView, ViewQuery
 
 if TYPE_CHECKING:
@@ -109,6 +112,7 @@ class SeatPlan:
     ai_difficulty: int = 3
     reflex: str | None = None
     reflex_max_usd: float | None = None
+    interface: Interface = DEFAULT_INTERFACE
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,8 @@ class SeatState:
     holds: dict[str, int] = field(default_factory=dict)  # decision -> game ms of the last held default carried out
     thinking_since: float | None = None
     turns: list[dict[str, Any]] = field(default_factory=list)
+    brief_stats: dict[str, int] = field(default_factory=dict)  # the combat totals at the last v2 brief
+    reference: str | None = None  # the v2 cost tables, written once so every ask gets the same text
 
     @property
     def brain_is_luna(self) -> bool:
@@ -297,6 +303,7 @@ class LiveMatch:
                 players=sorted(self.by_player),
                 catalog=self._catalog,
                 placer=self._placer,
+                interfaces={s.plan.player: s.plan.interface for s in self.seats.values()},
             )
             for p, executor in executors.items():
                 seat = self.seats[self.by_player[p]]
@@ -546,6 +553,8 @@ class LiveMatch:
         player = self.seats[slot].plan.player
         if self.snapshot is None or player not in self.snapshot.players:
             return "The match has not produced a snapshot yet; try again in a second."
+        if self.seats[slot].plan.interface == "v2" and self.seats[slot].executor is not None:
+            return self._brief_v2(slot)
         names = {s.plan.player: s.plan.name for s in self.seats.values()}
         events = self.trackers[player].drain() if player in self.trackers else []
         orders = self.seats[slot].executor.book.summary() if self.seats[slot].executor else {}
@@ -564,6 +573,44 @@ class LiveMatch:
         lines.append(self.footer(slot))
         return "\n".join(lines)
 
+    def _brief_v2(self, slot: str) -> str:
+        """The v2 brief: players by number only, own score and army, what is affordable, the executor's give-ups."""
+        seat = self.seats[slot]
+        player, executor = seat.plan.player, seat.executor
+        assert self.snapshot is not None and executor is not None
+        me = self.snapshot.players[player]
+        tracker = self.trackers.get(player)
+        events = tracker.drain() if tracker else []
+        totals = {k: int(me.stats.get(k, 0)) for k in ("enemy_units_killed", "units_lost")}
+        before, seat.brief_stats = seat.brief_stats, totals
+        view = executor.last_seat
+        book = executor.book
+        ctx = BriefContext(
+            cap_ms=int(self.config.time_cap_s * 1000),
+            scores=self.scores.get(slot, {}),
+            army=executor.army.report(executor, view) if view is not None else ArmyReport({}, "none"),
+            orders=book.army.describe(),
+            killed=totals["enemy_units_killed"] - before.get("enemy_units_killed", 0),
+            lost=totals["units_lost"] - before.get("units_lost", 0),
+            villager_target=book.villager_target,
+            affordable=affordable_text(executor.roles, view, me.resources, executor._phase_tech(view))
+            if view is not None
+            else "",
+            standing=_standing(book.summary()),
+            net_worth=net_worth(self.snapshot, player),
+            notices=executor.drain_notices(),
+        )
+        return text_brief_v2(self.snapshot, player, events, ctx)
+
+    def reference(self, slot: str) -> str:
+        """The seat's static cost tables for its prompt prefix (interface v2; empty for a v1 seat)."""
+        seat = self.seats[slot]
+        if seat.plan.interface != "v2" or seat.executor is None:
+            return ""
+        if seat.reference is None:
+            seat.reference = reference_text(seat.executor.roles, seat.executor.last_seat)
+        return seat.reference
+
     def compact_brief(self, slot: str) -> str:
         """The JSON brief Luna's questions are built from (spec §4.3), with the standing orders and match status."""
         player = self.seats[slot].plan.player
@@ -574,7 +621,10 @@ class LiveMatch:
         brief = json_brief(self.snapshot, player, events)
         brief["state"] = self.snapshot.players[player].state
         brief["orders"] = executor.book.summary() if executor else {}
-        brief["players"] = {str(s.plan.player): s.plan.name for s in self.seats.values()}
+        v2 = self.seats[slot].plan.interface == "v2"
+        brief["players"] = {
+            str(s.plan.player): f"player {s.plan.player}" if v2 else s.plan.name for s in self.seats.values()
+        }
         brief["cap"] = clock_text(int(self.config.time_cap_s * 1000))
         brief["cap_ms"] = int(self.config.time_cap_s * 1000)
         brief["over"] = self.over
@@ -778,6 +828,7 @@ class LiveMatch:
                 "kind": seat.plan.kind,
                 "civ": seat.plan.civ,
                 "name": seat.plan.name,
+                "interface": seat.plan.interface,
                 "state": self.states.get(slot),
                 "outcome": outcome,
                 "score": self.scores.get(slot),
@@ -824,6 +875,22 @@ class LiveMatch:
             "seats": seats,
             "timeline": self.timeline,
         }
+
+
+def _standing(summary: dict[str, Any]) -> str:
+    """The v2 brief's standing orders in a line: the split, what is queued, to build and to research (the villager
+    target and the army posture are in the brief's own lines)."""
+    split = "/".join(str(summary["economy"][r]) for r in RESOURCES)
+    parts = [f"economy {split} (food/wood/stone/metal)"]
+    if summary["train"]:
+        parts.append("train " + ", ".join(f"{n} {role}" for role, n in summary["train"].items()))
+    if summary["build"]:
+        parts.append("build " + ", ".join(summary["build"]))
+    if summary["research"]:
+        parts.append("research " + ", ".join(summary["research"]))
+    if summary["advance_phase"]:
+        parts.append("advancing phase")
+    return "; ".join(parts) + "."
 
 
 def _tool_summary(calls: list[ToolCall], count: int) -> dict[str, Any]:

@@ -137,6 +137,9 @@ async def test_the_envs_own_address_and_an_ai_seat_play_no_one(env):
     assert ai["code"] == "unknown_player"
 
 
+V2_DEFAULTS = {"min_size": {"default": 8}, "regroup_below": {"default": 0.4}}
+
+
 async def test_every_order_tool_takes_its_order_models_fields(env):
     tools = {t.name: t.inputSchema for t in await env.mcp.list_tools()}
     assert set(tools) == {"get_brief"} | {m.model_fields["kind"].default for m in ORDER_TYPES}
@@ -145,6 +148,8 @@ async def test_every_order_tool_takes_its_order_models_fields(env):
         got = tools[model.model_fields["kind"].default].get("properties", {})
         assert set(got) == set(expected)
         for name, prop in expected.items():
+            if name in V2_DEFAULTS:  # optional (None) on the model, a plain default on the tool
+                prop = {**next(b for b in prop.get("anyOf", [prop]) if b.get("type") != "null"), **V2_DEFAULTS[name]}
             for key in ("type", "enum", "minimum", "maximum", "minLength", "maxLength", "default"):
                 assert got[name].get(key) == prop.get(key), (model.__name__, name, key)
 

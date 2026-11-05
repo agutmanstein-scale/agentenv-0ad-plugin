@@ -15,7 +15,10 @@ Setup A). They are wrapped as A2A agents in `agents/zeroad-commander` and `agent
   `game_clock` the interval and gap count game seconds (the status's `game_ms`) instead of wall seconds, so a match
   played faster than real time gets as many calls per game minute. With `log_turns` each reported call carries its
   turn (`turn`: when it began, the user message, the token ids the model saw and sampled, each order and its status),
-  which the env keeps in results.json for training.
+  which the env keeps in results.json for training. With `interface="v2"` (docs/post-training-v2.md) it plays the v2
+  interface: its prompt states the real rules and gets the seat's per-civ cost tables appended once (`/reference`), its
+  tools include `hold`, its memory carries the game's answers (message and suggestion) and the executor's give-up
+  notices, and it sends at most one `say` per turn. v1 is what it was before.
 - `LunaPlayer` (zeroad-luna, Setup B): once the match has started, every `interval_s` (1 s) read the compact JSON brief
   and send one Decisions request with strategic and tactical questions (economy split, phase, army posture, what to
   train and build, how aggressively), each answer mapped to an order tool. An order is only sent when it changes the
@@ -33,6 +36,7 @@ is recorded as rejected), never the rest of the match.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -46,14 +50,22 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 from agentenv_zeroad.autopilot import HELD_ATTACK_MIN, HELD_DEADLINES
+from agentenv_zeroad.brief_v2 import notices_in
 from agentenv_zeroad.decisions import DecisionsClient, Question, choice, score
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.llm import StrategistModel, ToolSpec
 from agentenv_zeroad.spend import SpendCapReached
 
 log = logging.getLogger(__name__)
 
 ORDER_TOOLS = ("set_economy", "train", "build", "research", "advance_phase", "army", "say")
+ORDER_TOOLS_V2 = (*ORDER_TOOLS, "hold")
+V2_ONLY_PARAMS = {"army": ("min_size", "regroup_below"), "set_economy": ("villagers",)}
+DROPPED_KEYS = ("title", "minimum", "maximum", "minLength", "maxLength")
 MEMORY_TURNS = 3
+MEMORY_MESSAGE_CHARS = 120  # a rejected or partial order's message in the v2 memory
+MEMORY_ACCEPTED_CHARS = 50  # an accepted one's
+MEMORY_SUGGEST_CHARS = 70
 
 STRATEGIST_SYSTEM = """You are the strategist of one empire in a live, real-time 0 A.D. match. The game never waits \
 for you: while you think, a script (the executor) keeps your empire running on your standing orders: idle gatherers \
@@ -78,23 +90,59 @@ army is spent); don't flip it back to gather or defend every turn;
 Each turn: read the brief, then call the tools for every order you want now (several in one turn is normal). Don't \
 ask questions; nobody answers."""
 
+STRATEGIST_SYSTEM_V2 = """You command one empire in a live, real-time 0 A.D. match against one opponent. The game \
+never waits for you: while you think, a script (the executor) runs your empire on your standing orders: idle \
+gatherers work your economy split, houses go up, villagers train up to a target, soldiers defend themselves.
+You win by conquest. If nobody is defeated at the time cap, the higher net worth wins: the cost value of your living \
+units and buildings plus your banked resources. Spending keeps value while the units and buildings live; losses cost \
+it, and your kills cost the enemy. Exploring and advancing phase add nothing by themselves.
+Orders stand until you change them, and hold() keeps them all. set_economy's villagers (20-100, default 45) is how \
+many villagers are kept in training. Army waves: attack and raid gather soldiers at the front rally point until \
+min_size (default 8) are there, or 90 s have passed, then attack together; a wave that falls below regroup_below \
+(default 0.4) of its launch size falls back to the rally point; soldiers trained after a launch form the next wave. \
+Repeating an identical army order keeps the wave's progress; a different one starts over. At most one say() a turn.
+Each turn: read the brief, then call the tools for the orders you want now (several is normal). Your last turns' \
+orders are listed with the game's answers: when an order was rejected or the executor gave up, fix the cause instead \
+of repeating it. Don't ask questions; nobody answers."""
+
 
 # ---- the seat --------------------------------------------------------------------------------------------------------
 class SeatLink:
     """A seat's MCP session and its plain HTTP routes. `session` is an initialized `mcp.ClientSession`."""
 
-    def __init__(self, session: Any, seat_url: str, http: httpx.AsyncClient):
+    def __init__(self, session: Any, seat_url: str, http: httpx.AsyncClient, interface: Interface = DEFAULT_INTERFACE):
         self.session = session
         self.base = seat_url.rstrip("/").removesuffix("/mcp")
         self.http = http
+        self.interface = interface
 
     async def tools(self) -> list[ToolSpec]:
+        """The seat's order tools as its interface offers them: v1 is the env's tools without v2's `hold` and
+        parameters, exactly as they were before v2."""
         listed = (await self.session.list_tools()).tools
+        offered = ORDER_TOOLS_V2 if self.interface == "v2" else ORDER_TOOLS
         return [
-            ToolSpec(t.name, t.description or "", t.inputSchema or {"type": "object", "properties": {}})
+            ToolSpec(t.name, t.description or "", self._schema(t.name, t.inputSchema))
             for t in listed
-            if t.name in ORDER_TOOLS
+            if t.name in offered
         ]
+
+    def _schema(self, name: str, schema: dict[str, Any] | None) -> dict[str, Any]:
+        schema = schema or {"type": "object", "properties": {}}
+        if self.interface == "v2":
+            return compact_schema(schema)
+        if name not in V2_ONLY_PARAMS:
+            return schema
+        schema = copy.deepcopy(schema)
+        for param in V2_ONLY_PARAMS[name]:
+            schema.get("properties", {}).pop(param, None)
+        return schema
+
+    async def reference(self) -> str:
+        """The seat's static cost tables (interface v2), for the system prompt's prefix."""
+        response = await self.http.get(f"{self.base}/reference")
+        response.raise_for_status()
+        return str(response.json().get("text", ""))
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         result = await self.session.call_tool(name, arguments)
@@ -132,7 +180,7 @@ class SeatLink:
 
 
 @asynccontextmanager
-async def seat_link(server: dict[str, Any]) -> AsyncIterator[SeatLink]:
+async def seat_link(server: dict[str, Any], interface: Interface = DEFAULT_INTERFACE) -> AsyncIterator[SeatLink]:
     """A link to the seat agent-env gives the agent: `{"url": .../players/<id>/mcp, "headers": {...}}`."""
     async with (
         httpx.AsyncClient(headers=dict(server.get("headers") or {}), timeout=30) as http,
@@ -140,7 +188,7 @@ async def seat_link(server: dict[str, Any]) -> AsyncIterator[SeatLink]:
         ClientSession(read, write) as session,
     ):
         await session.initialize()
-        yield SeatLink(session, server["url"], http)
+        yield SeatLink(session, server["url"], http, interface)
 
 
 @dataclass
@@ -184,6 +232,41 @@ def _message_of(text: str) -> str:
         return text[:300]
 
 
+def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """A tool's parameters without what costs tokens and says little: pydantic's titles, the bounds (the env still
+    checks them, and the descriptions of the parameters with a range name it), `default: null`, and the `null` branch
+    of an optional parameter (it stays optional: it is not in `required`)."""
+    out = {k: v for k, v in schema.items() if k != "title"}
+    props = {}
+    for name, prop in schema.get("properties", {}).items():
+        branches = [b for b in prop.get("anyOf", ()) if b.get("type") != "null"]
+        if len(branches) == 1:
+            prop = {**{k: v for k, v in prop.items() if k != "anyOf"}, **branches[0]}
+        props[name] = {k: v for k, v in prop.items() if k not in DROPPED_KEYS and not (k == "default" and v is None)}
+    if props:
+        out["properties"] = props
+    return out
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _answer_of(text: str) -> str:
+    """The game's answer to an order for the v2 memory: its message and its suggested next call, both clipped."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return _clip(text, MEMORY_MESSAGE_CHARS)
+    if not isinstance(data, dict):
+        return ""
+    limit = MEMORY_ACCEPTED_CHARS if data.get("status") == "accepted" else MEMORY_MESSAGE_CHARS
+    answer = _clip(str(data.get("message") or ""), limit)
+    if data.get("suggest"):
+        answer += f" (try {_clip(str(data['suggest']), MEMORY_SUGGEST_CHARS)})"
+    return answer
+
+
 async def _wait_over(link: SeatLink, poll_s: float, sleep: Callable[[float], Awaitable[None]]) -> str:
     """Poll until the match is over (the brain stopped early: the executor plays on)."""
     while True:
@@ -202,11 +285,20 @@ class CommanderSettings:
     interval_s: float = 25.0
     min_gap_s: float = 8.0
     poll_s: float = 1.0
-    system_prompt: str = STRATEGIST_SYSTEM
+    system_prompt: str | None = None  # the interface's own prompt unless given
     opening: str = ""
     max_calls: int | None = None
     game_clock: bool = False
     log_turns: bool = False
+    interface: Interface = DEFAULT_INTERFACE
+
+    def __post_init__(self) -> None:
+        if self.system_prompt is None:
+            self.system_prompt = strategist_system(self.interface)
+
+
+def strategist_system(interface: Interface) -> str:
+    return STRATEGIST_SYSTEM_V2 if interface == "v2" else STRATEGIST_SYSTEM
 
 
 class Commander:
@@ -223,10 +315,19 @@ class Commander:
         self.record = BrainRecord()
         self._clock, self._sleep = clock, sleep
         self._memory: list[str] = []
+        self._reference = ""
+        self._notices: list[str] = []
+
+    @property
+    def system(self) -> str:
+        """The system prompt: the settings' text, then (interface v2) the seat's per-civ cost tables."""
+        return f"{self.settings.system_prompt}\n\n{self._reference}" if self._reference else self.settings.system_prompt
 
     async def play(self, link: SeatLink, *, reflex_key: tuple[str, str] | None = None) -> BrainRecord:
         s = self.settings
         tools = await link.tools()
+        if s.interface == "v2":
+            self._reference = await link.reference()
         await link.brief()  # the first call marks the seat ready; the match starts when every agent is
         if reflex_key is not None:
             await link.offer_reflex(*reflex_key)
@@ -278,6 +379,8 @@ class Commander:
             self.record.last_error = f"brief failed: {type(e).__name__}: {str(e)[:200]}"
             return True
         user = self._user(brief, urgent)
+        if self.settings.interface == "v2":
+            self._notices = notices_in(brief)
         if waiting:
             await link.waiting("begin")
         try:
@@ -291,7 +394,7 @@ class Commander:
     ) -> bool:
         started = time.perf_counter()
         try:
-            reply = await self.model.call(self.settings.system_prompt, user, tools)
+            reply = await self.model.call(self.system, user, tools)
         except SpendCapReached as e:
             self.record.last_error = str(e)
             return False
@@ -303,18 +406,24 @@ class Commander:
             usd = round(self.model.guard.last_usd, 6)
             await link.report_call(seconds, self.record.last_error, usd=usd, model=self.model.model)
             return True
-        orders, applied = [], []
+        v2 = self.settings.interface == "v2"
+        offered = ORDER_TOOLS_V2 if v2 else ORDER_TOOLS
+        orders, applied, said = [], [], False
         for c in reply.calls:
-            if c.error or c.name not in ORDER_TOOLS:
+            if c.error or c.name not in offered:
                 result = json.dumps({"status": "rejected", "message": c.error or f"unknown tool {c.name}"})
+            elif v2 and c.name == "say" and said:
+                result = json.dumps({"status": "rejected", "message": "Only one say() per turn."})
             else:
+                said = said or c.name == "say"
                 result = await _safe_call(link, c.name, c.arguments)
             status = _status_of(result)
             self.record.orders += 1
             if status == "rejected":
                 self.record.rejected += 1
                 self.record.last_error = _message_of(result)
-            orders.append(f"{c.name}({json.dumps(c.arguments, separators=(',', ':'))}) -> {status}")
+            line = f"{c.name}({json.dumps(c.arguments, separators=(',', ':'))}) -> {status}"
+            orders.append(f"{line}: {_answer_of(result)}" if v2 else line)
             applied.append({"tool": c.name, "arguments": c.arguments, "status": status})
         seconds = time.perf_counter() - started
         self.record.calls += 1
@@ -339,7 +448,13 @@ class Commander:
             model=self.model.model,
             turn=turn,
         )
-        self._memory = (self._memory + ["; ".join(orders) or "(no orders)"])[-MEMORY_TURNS:]
+        if v2:
+            entry = " | ".join(orders) or "(no orders)"
+            if self._notices:
+                entry += " | executor gave up: " + "; ".join(self._notices)
+            self._memory = (self._memory + [entry])[-MEMORY_TURNS:]
+        else:
+            self._memory = (self._memory + ["; ".join(orders) or "(no orders)"])[-MEMORY_TURNS:]
         self.record.turns.append({"seconds": round(seconds, 2), "orders": orders, "text": reply.text[:500]})
         return True
 
@@ -349,7 +464,12 @@ class Commander:
             parts.append(self.settings.opening)
         parts.append(brief)
         if self._memory:
-            parts.append("Your orders in your last turns (oldest first):\n" + "\n".join(self._memory))
+            title = (
+                "Your orders in your last turns and the game's answers"
+                if self.settings.interface == "v2"
+                else ("Your orders in your last turns")
+            )
+            parts.append(f"{title} (oldest first):\n" + "\n".join(self._memory))
         parts.append(
             ("URGENT: something happened that needs an answer now. " if urgent else "")
             + "Decide your orders now and call the tools."

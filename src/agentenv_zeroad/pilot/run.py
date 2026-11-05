@@ -44,6 +44,7 @@ from typing import Any
 
 import httpx
 
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, INTERFACES
 from agentenv_zeroad.pilot import ladder, ratings, report, scoring
 from agentenv_zeroad.pilot.games import CIVS, GameSpec, Opponent, PilotSettings, task, version_model
 from agentenv_zeroad.spend import append_ledger
@@ -402,7 +403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     (home / "adapters").mkdir(exist_ok=True)
     state = State.load(home / "state.json")
     games_path = home / "games.jsonl"
-    settings = PilotSettings(args.vllm_url, args.vllm_key, args.cap_minutes, args.speed)
+    settings = PilotSettings(args.vllm_url, args.vllm_key, args.cap_minutes, args.speed, interface=args.interface)
     rng = random.Random(args.seed + state.round)
     train_s = 0 if args.baseline else (35 if args.share_gpu else 20) * 60
     round_hours = (args.cap_minutes * 60 / args.speed + 15 * 60 + train_s) / 3600
@@ -567,6 +568,7 @@ def parse(argv: Sequence[str] | None) -> argparse.Namespace:
     p.add_argument("--probes", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cap-minutes", type=float, default=30.0)
     p.add_argument("--speed", type=float, default=2.0)
+    p.add_argument("--interface", choices=INTERFACES, default=DEFAULT_INTERFACE, help="the seats' interface version")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--vllm-url", default="http://172.17.0.1:8000", help="vLLM as the agents' containers reach it")
     p.add_argument("--vllm-host", default="http://172.17.0.1:8000", help="vLLM as this process reaches it")

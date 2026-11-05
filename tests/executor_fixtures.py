@@ -9,6 +9,7 @@ from typing import Any
 
 from agentenv_zeroad.engine import FakeEngine
 from agentenv_zeroad.executor import Executor
+from agentenv_zeroad.interface import Interface
 from agentenv_zeroad.placement import Placement, Search
 from agentenv_zeroad.roles import RoleCatalog, RoleTable
 from agentenv_zeroad.state import Snapshot
@@ -49,8 +50,12 @@ class FakePlacer:
         return Placement(True, x=x + 20.0, z=z, tried=1)
 
 
-def make_executor(*, ok: bool = True, players=(1, 2)) -> tuple[Executor, list[tuple[int, dict]], FakePlacer]:
+def make_executor(
+    *, ok: bool = True, players=(1, 2), interface: Interface = "v1"
+) -> tuple[Executor, list[tuple[int, dict]], FakePlacer]:
     queued: list[tuple[int, dict]] = []
     placer = FakePlacer(ok)
-    executor = Executor(1, rome_table(), queue=lambda p, c: queued.append((p, c)), placer=placer, players=players)
+    executor = Executor(
+        1, rome_table(), queue=lambda p, c: queued.append((p, c)), placer=placer, players=players, interface=interface
+    )
     return executor, queued, placer

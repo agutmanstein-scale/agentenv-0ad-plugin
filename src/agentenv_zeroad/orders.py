@@ -32,6 +32,9 @@ TARGET_RE = re.compile(r"^(home|center|front|(player_)?\d+)$")
 MAX_TRAIN = 50
 DEFAULT_SPLIT = {"food": 55, "wood": 40, "stone": 0, "metal": 5}
 DEFAULT_VILLAGER_TARGET = 45
+MIN_VILLAGER_TARGET, MAX_VILLAGER_TARGET = 20, 100
+DEFAULT_MIN_SIZE, MIN_WAVE_SIZE, MAX_WAVE_SIZE = 8, 4, 30
+DEFAULT_REGROUP_BELOW = 0.4
 
 
 class _Order(BaseModel):
@@ -39,13 +42,16 @@ class _Order(BaseModel):
 
 
 class SetEconomy(_Order):
-    """Split gatherers between the four resources, in percent (they must add up to 100)."""
+    """Split gatherers between the four resources, in percent (they must add up to 100).
+
+    Interface v2 only: `villagers` sets how many villagers the autopilot trains (the default is 45)."""
 
     kind: Literal["set_economy"] = "set_economy"
     food: int = Field(ge=0, le=100)
     wood: int = Field(ge=0, le=100)
     stone: int = Field(ge=0, le=100)
     metal: int = Field(ge=0, le=100)
+    villagers: int | None = Field(None, ge=MIN_VILLAGER_TARGET, le=MAX_VILLAGER_TARGET)
 
     @model_validator(mode="after")
     def _sums_to_100(self) -> SetEconomy:
@@ -96,11 +102,17 @@ class AdvancePhase(_Order):
 
 
 class Army(_Order):
-    """Set the army's posture. `target` is a player ("player_2" or "2"), a named area ("center", "front") or "home"."""
+    """Set the army's posture. `target` is a player ("player_2" or "2"), a named area ("center", "front") or "home".
+
+    Interface v2 only: an attack or raid goes in waves of `min_size` soldiers (`DEFAULT_MIN_SIZE` when unset), and a
+    wave below `regroup_below` of its launch strength falls back (`DEFAULT_REGROUP_BELOW`). Both stay `None` unless
+    given, so a v1 order reads and records exactly as before."""
 
     kind: Literal["army"] = "army"
     action: ArmyAction
     target: str = "home"
+    min_size: int | None = Field(None, ge=MIN_WAVE_SIZE, le=MAX_WAVE_SIZE)
+    regroup_below: float | None = Field(None, ge=0.0, le=0.9)
 
     @field_validator("target")
     @classmethod
@@ -114,6 +126,20 @@ class Army(_Order):
         digits = self.target.removeprefix("player_")
         return int(digits) if digits.isdigit() else None
 
+    @property
+    def wave_min_size(self) -> int:
+        return DEFAULT_MIN_SIZE if self.min_size is None else self.min_size
+
+    @property
+    def wave_regroup_below(self) -> float:
+        return DEFAULT_REGROUP_BELOW if self.regroup_below is None else self.regroup_below
+
+
+class Hold(_Order):
+    """Interface v2: keep every standing order as it is (an accepted no-op, so a quiet turn is on record)."""
+
+    kind: Literal["hold"] = "hold"
+
 
 class Say(_Order):
     """A short line in character for the overlay."""
@@ -122,8 +148,8 @@ class Say(_Order):
     text: str = Field(min_length=1, max_length=200)
 
 
-Order = Annotated[SetEconomy | Train | Build | Research | AdvancePhase | Army | Say, Field(discriminator="kind")]
-ORDER_TYPES: tuple[type[_Order], ...] = (SetEconomy, Train, Build, Research, AdvancePhase, Army, Say)
+Order = Annotated[SetEconomy | Train | Build | Research | AdvancePhase | Army | Hold | Say, Field(discriminator="kind")]
+ORDER_TYPES: tuple[type[_Order], ...] = (SetEconomy, Train, Build, Research, AdvancePhase, Army, Hold, Say)
 _ORDER_ADAPTER: TypeAdapter[Any] = TypeAdapter(Order)
 
 
@@ -199,13 +225,25 @@ class ArmyPosture:
 
     `focus` is what an attack or raid hits first: `any` (the nearest known structure, fighting what it meets), `army`
     (the enemy's visible soldiers), `workers` (its visible gatherers) or `buildings`. It is not part of the order
-    vocabulary: every army order resets it to `any`, and only the Luna reflex changes it (Setup A)."""
+    vocabulary: every army order resets it to `any`, and only the Luna reflex changes it (Setup A).
+
+    `min_size` and `regroup_below` are the waves' settings (interface v2, `army.py`)."""
 
     action: str = "gather"
     target: str = "home"
     since_ms: int = 0
     seq: int = 0
     focus: str = "any"
+    min_size: int = DEFAULT_MIN_SIZE
+    regroup_below: float = DEFAULT_REGROUP_BELOW
+
+    def waves_text(self) -> str:
+        return f"waves of {self.min_size}, regrouping below {round(self.regroup_below * 100)}%"
+
+    def describe(self) -> str:
+        """The posture as a brain reads it: `attack player_2, waves of 8, regrouping below 40%`."""
+        text = f"{self.action} {self.target}"
+        return f"{text}, {self.waves_text()}" if self.action in ("attack", "raid") else text
 
 
 @dataclass

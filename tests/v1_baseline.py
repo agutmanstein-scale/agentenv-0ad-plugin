@@ -26,7 +26,8 @@ from tests.zeroad_fakes import Handle, ScriptedEngine, placer
 FIXTURE = Path(__file__).parent / "fixtures" / "interface_v1.json"
 SNAPSHOT_SECONDS = (60, 300)
 MEMORY = [
-    'set_economy({"food":50,"wood":30,"stone":10,"metal":10}) -> accepted; train({"role":"villager","count":5}) -> accepted',
+    'set_economy({"food":50,"wood":30,"stone":10,"metal":10}) -> accepted; '
+    'train({"role":"villager","count":5}) -> accepted',
     'army({"action":"attack","target":"player_2"}) -> rejected',
 ]
 
