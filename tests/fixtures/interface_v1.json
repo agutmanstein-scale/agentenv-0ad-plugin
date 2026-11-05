@@ -1,0 +1,778 @@
+{
+ "system": "You are the strategist of one empire in a live, real-time 0 A.D. match. The game never waits for you: while you think, a script (the executor) keeps your empire running on your standing orders: idle gatherers go back to work on your economy split, houses go up, villagers train up to a target, soldiers defend themselves.\nYou give orders to groups through the tools; they stand until you change them:\n- set_economy(food, wood, stone, metal): the gatherer split in percent (sums to 100);\n- train(role, count): villager, infantry_melee, infantry_ranged, cavalry, siege or champion;\n- build(structure, where): e.g. house, barracks, storehouse, farmstead, field, temple, blacksmith, tower;\n  where is base, front, near_<resource> or toward_<player>;\n- research(tech) and advance_phase() (village -> town -> city);\n- army(action, target): gather, attack, raid, defend, retreat or scout; target player_<n>, center, front or home;\n- say(text): one short in-character line for the viewers of the live stream.\nYou win by conquest, or with the highest score at the time cap. This is a live match that viewers watch. The score adds economy, military (the value of enemy units you kill and buildings you destroy) and exploration, so passivity loses: an empire that only gathers falls behind one that fights and wins its fights. Commit to it:\n- get a barracks up early and keep soldiers in production from about 2:00 (batches of 5 or more, never an empty queue); soldiers gather while the army order is gather, and leave work when you send them;\n- attack by about the 4:00 mark with army(attack, player_<n>) or raid their gatherers with cavalry, and keep the attack standing: new soldiers join it on their own. Change it only for a real reason (your base is attacked, the army is spent); don't flip it back to gather or defend every turn;\n- advance to town phase when you can afford it; it adds score and stronger units.\nEach turn: read the brief, then call the tools for every order you want now (several in one turn is normal). Don't ask questions; nobody answers.",
+ "opening": "You command an empire in a live, real-time 0 A.D. match against one opponent. The game never pauses for you. Win by conquest, or hold the highest score at the time cap. Read the brief, then give your orders with the tools.",
+ "tools": [
+  {
+   "name": "advance_phase",
+   "description": "Advance to the next phase (village, town, city) as soon as its requirements and resources allow.",
+   "parameters": {
+    "properties": {},
+    "title": "advance_phaseArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "army",
+   "description": "Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or\nscout.",
+   "parameters": {
+    "properties": {
+     "action": {
+      "description": "gather, attack, raid, defend, retreat or scout.",
+      "enum": [
+       "gather",
+       "attack",
+       "raid",
+       "defend",
+       "retreat",
+       "scout"
+      ],
+      "title": "Action",
+      "type": "string"
+     },
+     "target": {
+      "default": "home",
+      "description": "The target: a player (player_2 or 2), center, front or home.",
+      "title": "Target",
+      "type": "string"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "title": "armyArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "build",
+   "description": "Place one building; villagers build it. The spot is found near the anchor `where` names.",
+   "parameters": {
+    "properties": {
+     "structure": {
+      "description": "e.g. \"house\", \"barracks\".",
+      "maxLength": 40,
+      "minLength": 1,
+      "title": "Structure",
+      "type": "string"
+     },
+     "where": {
+      "default": "base",
+      "description": "Where to place it: base, front, near_<food|wood|stone|metal> or toward_<player> (e.g. toward_2).",
+      "title": "Where",
+      "type": "string"
+     }
+    },
+    "required": [
+     "structure"
+    ],
+    "title": "buildArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "research",
+   "description": "Research one technology by its engine name, at a building that offers it.",
+   "parameters": {
+    "properties": {
+     "tech": {
+      "description": "e.g. \"gather_lumbering_ironaxes\".",
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Tech",
+      "type": "string"
+     }
+    },
+    "required": [
+     "tech"
+    ],
+    "title": "researchArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "say",
+   "description": "Say a short line in character, shown on the live overlay. Optional.",
+   "parameters": {
+    "properties": {
+     "text": {
+      "description": "One short line.",
+      "maxLength": 200,
+      "minLength": 1,
+      "title": "Text",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "title": "sayArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "set_economy",
+   "description": "Split your gatherers between the four resources, in percent; the four must add up to 100. Idle and surplus\ngatherers move over the next seconds.",
+   "parameters": {
+    "properties": {
+     "food": {
+      "description": "Percent of gatherers on food.",
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Food",
+      "type": "integer"
+     },
+     "wood": {
+      "description": "Percent on wood.",
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Wood",
+      "type": "integer"
+     },
+     "stone": {
+      "description": "Percent on stone.",
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Stone",
+      "type": "integer"
+     },
+     "metal": {
+      "description": "Percent on metal.",
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Metal",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "food",
+     "wood",
+     "stone",
+     "metal"
+    ],
+    "title": "set_economyArguments",
+    "type": "object"
+   }
+  },
+  {
+   "name": "train",
+   "description": "Train `count` more units of a role, mapped to your civilization's units; batches go to free buildings as\npopulation room and resources allow.",
+   "parameters": {
+    "properties": {
+     "role": {
+      "description": "villager, infantry_melee, infantry_ranged, cavalry, siege, champion",
+      "enum": [
+       "villager",
+       "infantry_melee",
+       "infantry_ranged",
+       "cavalry",
+       "siege",
+       "champion"
+      ],
+      "title": "Role",
+      "type": "string"
+     },
+     "count": {
+      "description": "How many more units of the role to train.",
+      "maximum": 50,
+      "minimum": 1,
+      "title": "Count",
+      "type": "integer"
+     },
+     "at": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Only at this kind of building, e.g. \"barracks\".",
+      "title": "At"
+     }
+    },
+    "required": [
+     "role",
+     "count"
+    ],
+    "title": "trainArguments",
+    "type": "object"
+   }
+  }
+ ],
+ "snapshots": {
+  "60": {
+   "results": [
+    {
+     "status": "accepted",
+     "message": "Economy split set: food 50%, wood 30%, stone 10%, metal 10%. Idle and surplus gatherers move over the next ticks."
+    },
+    {
+     "status": "accepted",
+     "message": "Queued 5 villager; production starts as resources and houses allow."
+    },
+    {
+     "status": "rejected",
+     "message": "A stable can't train infantry_melee; these can: army_camp, barracks, civil_centre.",
+     "code": "bad_building",
+     "alternatives": [
+      "army_camp",
+      "barracks",
+      "civil_centre"
+     ],
+     "suggest": "train(role=\"infantry_melee\", count=3, at=\"army_camp\")"
+    },
+    {
+     "status": "accepted",
+     "message": "Will place a barracks at base (200 wood, 100 stone) when resources allow."
+    },
+    {
+     "status": "accepted",
+     "message": "Army set to attack player_2."
+    },
+    {
+     "status": "rejected",
+     "message": "Player 9 is not an opponent in this match.",
+     "code": "bad_target",
+     "alternatives": [
+      "player_2",
+      "home",
+      "center",
+      "front"
+     ]
+    },
+    {
+     "status": "accepted",
+     "message": "Said."
+    }
+   ],
+   "brief": "Time 00:00. You are Bot (rome), player 1, active.\nPhase: village. Population 18/30 (max 300).\nResources: food 10 wood 20 stone 300 metal 300.\nGatherers: food 5 wood 4 stone 0 metal 0.\nResources left near base: food 1561 metal 5000 stone 5000 wood 6300.\nArmy by role: 12 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 0 production buildings with empty queues.\nBuildings:\n  CivCentre: 1 (ids 150)\n  Farmstead: 0, 1 under construction\n  House: 1 (ids 1946)\n  Storehouse: 1 (ids 1930)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 18/30 \u00b7 f10 w20 s300 m300 \u00b7 village \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]",
+   "compact_brief": "{\"t\":\"00:00\",\"time_ms\":0,\"player\":1,\"civ\":\"rome\",\"phase\":\"village\",\"pop\":[18,30],\"res\":{\"food\":10,\"wood\":20,\"stone\":300,\"metal\":300},\"gath\":{\"food\":5,\"wood\":4,\"stone\":0,\"metal\":0},\"army\":{\"cavalry\":1,\"infantry_melee\":2,\"infantry_ranged\":2,\"villager\":12},\"idle\":{\"villagers\":0,\"units\":{\"cavalry\":1},\"production\":[]},\"researching\":[],\"bld\":{\"CivCentre\":1,\"Farmstead\":0,\"House\":1,\"Storehouse\":1},\"killed\":0,\"lost\":0,\"near_base_left\":{\"food\":1561,\"metal\":5000,\"stone\":5000,\"wood\":6300},\"threat\":0,\"enemies\":{},\"events\":[],\"state\":\"active\",\"orders\":{\"economy\":{\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10},\"villager_target\":45,\"train\":{\"villager\":5},\"build\":[\"barracks@base\"],\"research\":[],\"advance_phase\":false,\"army\":\"attack player_2\"},\"players\":{\"1\":\"policy v3\",\"2\":\"Petra 2\"},\"cap\":\"30:00\",\"cap_ms\":1800000,\"over\":false,\"next_phase\":{\"tech\":\"phase_town_generic\",\"ready\":false,\"cost\":{\"food\":500,\"wood\":500}}}",
+   "user": "You command an empire in a live, real-time 0 A.D. match against one opponent. The game never pauses for you. Win by conquest, or hold the highest score at the time cap. Read the brief, then give your orders with the tools.\n\nTime 00:00. You are Bot (rome), player 1, active.\nPhase: village. Population 18/30 (max 300).\nResources: food 10 wood 20 stone 300 metal 300.\nGatherers: food 5 wood 4 stone 0 metal 0.\nResources left near base: food 1561 metal 5000 stone 5000 wood 6300.\nArmy by role: 12 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 0 production buildings with empty queues.\nBuildings:\n  CivCentre: 1 (ids 150)\n  Farmstead: 0, 1 under construction\n  House: 1 (ids 1946)\n  Storehouse: 1 (ids 1930)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 18/30 \u00b7 f10 w20 s300 m300 \u00b7 village \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]\n\nYour orders in your last turns (oldest first):\nset_economy({\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10}) -> accepted; train({\"role\":\"villager\",\"count\":5}) -> accepted\narmy({\"action\":\"attack\",\"target\":\"player_2\"}) -> rejected\n\nURGENT: something happened that needs an answer now. Decide your orders now and call the tools.",
+   "request": {
+    "model": "local/qwen-base",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are the strategist of one empire in a live, real-time 0 A.D. match. The game never waits for you: while you think, a script (the executor) keeps your empire running on your standing orders: idle gatherers go back to work on your economy split, houses go up, villagers train up to a target, soldiers defend themselves.\nYou give orders to groups through the tools; they stand until you change them:\n- set_economy(food, wood, stone, metal): the gatherer split in percent (sums to 100);\n- train(role, count): villager, infantry_melee, infantry_ranged, cavalry, siege or champion;\n- build(structure, where): e.g. house, barracks, storehouse, farmstead, field, temple, blacksmith, tower;\n  where is base, front, near_<resource> or toward_<player>;\n- research(tech) and advance_phase() (village -> town -> city);\n- army(action, target): gather, attack, raid, defend, retreat or scout; target player_<n>, center, front or home;\n- say(text): one short in-character line for the viewers of the live stream.\nYou win by conquest, or with the highest score at the time cap. This is a live match that viewers watch. The score adds economy, military (the value of enemy units you kill and buildings you destroy) and exploration, so passivity loses: an empire that only gathers falls behind one that fights and wins its fights. Commit to it:\n- get a barracks up early and keep soldiers in production from about 2:00 (batches of 5 or more, never an empty queue); soldiers gather while the army order is gather, and leave work when you send them;\n- attack by about the 4:00 mark with army(attack, player_<n>) or raid their gatherers with cavalry, and keep the attack standing: new soldiers join it on their own. Change it only for a real reason (your base is attacked, the army is spent); don't flip it back to gather or defend every turn;\n- advance to town phase when you can afford it; it adds score and stronger units.\nEach turn: read the brief, then call the tools for every order you want now (several in one turn is normal). Don't ask questions; nobody answers."
+     },
+     {
+      "role": "user",
+      "content": "You command an empire in a live, real-time 0 A.D. match against one opponent. The game never pauses for you. Win by conquest, or hold the highest score at the time cap. Read the brief, then give your orders with the tools.\n\nTime 00:00. You are Bot (rome), player 1, active.\nPhase: village. Population 18/30 (max 300).\nResources: food 10 wood 20 stone 300 metal 300.\nGatherers: food 5 wood 4 stone 0 metal 0.\nResources left near base: food 1561 metal 5000 stone 5000 wood 6300.\nArmy by role: 12 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 0 production buildings with empty queues.\nBuildings:\n  CivCentre: 1 (ids 150)\n  Farmstead: 0, 1 under construction\n  House: 1 (ids 1946)\n  Storehouse: 1 (ids 1930)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 18/30 \u00b7 f10 w20 s300 m300 \u00b7 village \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]\n\nYour orders in your last turns (oldest first):\nset_economy({\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10}) -> accepted; train({\"role\":\"villager\",\"count\":5}) -> accepted\narmy({\"action\":\"attack\",\"target\":\"player_2\"}) -> rejected\n\nURGENT: something happened that needs an answer now. Decide your orders now and call the tools."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "advance_phase",
+       "description": "Advance to the next phase (village, town, city) as soon as its requirements and resources allow.",
+       "parameters": {
+        "properties": {},
+        "title": "advance_phaseArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "army",
+       "description": "Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or\nscout.",
+       "parameters": {
+        "properties": {
+         "action": {
+          "description": "gather, attack, raid, defend, retreat or scout.",
+          "enum": [
+           "gather",
+           "attack",
+           "raid",
+           "defend",
+           "retreat",
+           "scout"
+          ],
+          "title": "Action",
+          "type": "string"
+         },
+         "target": {
+          "default": "home",
+          "description": "The target: a player (player_2 or 2), center, front or home.",
+          "title": "Target",
+          "type": "string"
+         }
+        },
+        "required": [
+         "action"
+        ],
+        "title": "armyArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "build",
+       "description": "Place one building; villagers build it. The spot is found near the anchor `where` names.",
+       "parameters": {
+        "properties": {
+         "structure": {
+          "description": "e.g. \"house\", \"barracks\".",
+          "maxLength": 40,
+          "minLength": 1,
+          "title": "Structure",
+          "type": "string"
+         },
+         "where": {
+          "default": "base",
+          "description": "Where to place it: base, front, near_<food|wood|stone|metal> or toward_<player> (e.g. toward_2).",
+          "title": "Where",
+          "type": "string"
+         }
+        },
+        "required": [
+         "structure"
+        ],
+        "title": "buildArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "research",
+       "description": "Research one technology by its engine name, at a building that offers it.",
+       "parameters": {
+        "properties": {
+         "tech": {
+          "description": "e.g. \"gather_lumbering_ironaxes\".",
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Tech",
+          "type": "string"
+         }
+        },
+        "required": [
+         "tech"
+        ],
+        "title": "researchArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "say",
+       "description": "Say a short line in character, shown on the live overlay. Optional.",
+       "parameters": {
+        "properties": {
+         "text": {
+          "description": "One short line.",
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+         }
+        },
+        "required": [
+         "text"
+        ],
+        "title": "sayArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_economy",
+       "description": "Split your gatherers between the four resources, in percent; the four must add up to 100. Idle and surplus\ngatherers move over the next seconds.",
+       "parameters": {
+        "properties": {
+         "food": {
+          "description": "Percent of gatherers on food.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Food",
+          "type": "integer"
+         },
+         "wood": {
+          "description": "Percent on wood.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Wood",
+          "type": "integer"
+         },
+         "stone": {
+          "description": "Percent on stone.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Stone",
+          "type": "integer"
+         },
+         "metal": {
+          "description": "Percent on metal.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Metal",
+          "type": "integer"
+         }
+        },
+        "required": [
+         "food",
+         "wood",
+         "stone",
+         "metal"
+        ],
+        "title": "set_economyArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "train",
+       "description": "Train `count` more units of a role, mapped to your civilization's units; batches go to free buildings as\npopulation room and resources allow.",
+       "parameters": {
+        "properties": {
+         "role": {
+          "description": "villager, infantry_melee, infantry_ranged, cavalry, siege, champion",
+          "enum": [
+           "villager",
+           "infantry_melee",
+           "infantry_ranged",
+           "cavalry",
+           "siege",
+           "champion"
+          ],
+          "title": "Role",
+          "type": "string"
+         },
+         "count": {
+          "description": "How many more units of the role to train.",
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Count",
+          "type": "integer"
+         },
+         "at": {
+          "anyOf": [
+           {
+            "type": "string"
+           },
+           {
+            "type": "null"
+           }
+          ],
+          "default": null,
+          "description": "Only at this kind of building, e.g. \"barracks\".",
+          "title": "At"
+         }
+        },
+        "required": [
+         "role",
+         "count"
+        ],
+        "title": "trainArguments",
+        "type": "object"
+       }
+      }
+     }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 2000,
+    "top_p": 1.0
+   }
+  },
+  "300": {
+   "results": [
+    {
+     "status": "accepted",
+     "message": "Economy split set: food 50%, wood 30%, stone 10%, metal 10%. Idle and surplus gatherers move over the next ticks."
+    },
+    {
+     "status": "accepted",
+     "message": "Queued 5 villager; production starts as resources and houses allow."
+    },
+    {
+     "status": "rejected",
+     "message": "A stable can't train infantry_melee; these can: army_camp, barracks, civil_centre.",
+     "code": "bad_building",
+     "alternatives": [
+      "army_camp",
+      "barracks",
+      "civil_centre"
+     ],
+     "suggest": "train(role=\"infantry_melee\", count=3, at=\"army_camp\")"
+    },
+    {
+     "status": "accepted",
+     "message": "Will place a barracks at base (200 wood, 100 stone) when resources allow."
+    },
+    {
+     "status": "accepted",
+     "message": "Army set to attack player_2."
+    },
+    {
+     "status": "rejected",
+     "message": "Player 9 is not an opponent in this match.",
+     "code": "bad_target",
+     "alternatives": [
+      "player_2",
+      "home",
+      "center",
+      "front"
+     ]
+    },
+    {
+     "status": "accepted",
+     "message": "Said."
+    }
+   ],
+   "brief": "Time 00:00. You are Bot (rome), player 1, active.\nPhase: town. Population 35/40 (max 300).\nResources: food 86 wood 5 stone 230 metal 300.\nGatherers: food 14 wood 7 stone 0 metal 3.\nResources left near base: food 48 metal 4994 stone 4970 wood 4982.\nArmy by role: 28 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 1 production buildings with empty queues.\nBuildings:\n  Barracks: 1 (ids 1988)\n  CivCentre: 1 (ids 150)\n  Farmstead: 1 (ids 1961)\n  Field: 0, 1 under construction\n  House: 2 (ids 1946,1985), 1 under construction\n  Storehouse: 2 (ids 1930,1989)\n  Tower: 1 (ids 2006)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 35/40 \u00b7 f86 w5 s230 m300 \u00b7 town \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]",
+   "compact_brief": "{\"t\":\"00:00\",\"time_ms\":0,\"player\":1,\"civ\":\"rome\",\"phase\":\"town\",\"pop\":[35,40],\"res\":{\"food\":86,\"wood\":5,\"stone\":230,\"metal\":300},\"gath\":{\"food\":14,\"wood\":7,\"stone\":0,\"metal\":3},\"army\":{\"cavalry\":1,\"infantry_melee\":2,\"infantry_ranged\":2,\"villager\":28},\"idle\":{\"villagers\":0,\"units\":{\"cavalry\":1},\"production\":[1988]},\"researching\":[],\"bld\":{\"Barracks\":1,\"CivCentre\":1,\"Farmstead\":1,\"Field\":0,\"House\":2,\"Storehouse\":2,\"Tower\":1},\"killed\":0,\"lost\":0,\"near_base_left\":{\"food\":48,\"metal\":4994,\"stone\":4970,\"wood\":4982},\"threat\":0,\"enemies\":{},\"events\":[],\"state\":\"active\",\"orders\":{\"economy\":{\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10},\"villager_target\":45,\"train\":{\"villager\":5},\"build\":[\"barracks@base\"],\"research\":[],\"advance_phase\":false,\"army\":\"attack player_2\"},\"players\":{\"1\":\"policy v3\",\"2\":\"Petra 2\"},\"cap\":\"30:00\",\"cap_ms\":1800000,\"over\":false,\"next_phase\":{\"tech\":\"phase_city_generic\",\"ready\":false,\"cost\":{\"metal\":750,\"stone\":750}}}",
+   "user": "You command an empire in a live, real-time 0 A.D. match against one opponent. The game never pauses for you. Win by conquest, or hold the highest score at the time cap. Read the brief, then give your orders with the tools.\n\nTime 00:00. You are Bot (rome), player 1, active.\nPhase: town. Population 35/40 (max 300).\nResources: food 86 wood 5 stone 230 metal 300.\nGatherers: food 14 wood 7 stone 0 metal 3.\nResources left near base: food 48 metal 4994 stone 4970 wood 4982.\nArmy by role: 28 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 1 production buildings with empty queues.\nBuildings:\n  Barracks: 1 (ids 1988)\n  CivCentre: 1 (ids 150)\n  Farmstead: 1 (ids 1961)\n  Field: 0, 1 under construction\n  House: 2 (ids 1946,1985), 1 under construction\n  Storehouse: 2 (ids 1930,1989)\n  Tower: 1 (ids 2006)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 35/40 \u00b7 f86 w5 s230 m300 \u00b7 town \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]\n\nYour orders in your last turns (oldest first):\nset_economy({\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10}) -> accepted; train({\"role\":\"villager\",\"count\":5}) -> accepted\narmy({\"action\":\"attack\",\"target\":\"player_2\"}) -> rejected\n\nURGENT: something happened that needs an answer now. Decide your orders now and call the tools.",
+   "request": {
+    "model": "local/qwen-base",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are the strategist of one empire in a live, real-time 0 A.D. match. The game never waits for you: while you think, a script (the executor) keeps your empire running on your standing orders: idle gatherers go back to work on your economy split, houses go up, villagers train up to a target, soldiers defend themselves.\nYou give orders to groups through the tools; they stand until you change them:\n- set_economy(food, wood, stone, metal): the gatherer split in percent (sums to 100);\n- train(role, count): villager, infantry_melee, infantry_ranged, cavalry, siege or champion;\n- build(structure, where): e.g. house, barracks, storehouse, farmstead, field, temple, blacksmith, tower;\n  where is base, front, near_<resource> or toward_<player>;\n- research(tech) and advance_phase() (village -> town -> city);\n- army(action, target): gather, attack, raid, defend, retreat or scout; target player_<n>, center, front or home;\n- say(text): one short in-character line for the viewers of the live stream.\nYou win by conquest, or with the highest score at the time cap. This is a live match that viewers watch. The score adds economy, military (the value of enemy units you kill and buildings you destroy) and exploration, so passivity loses: an empire that only gathers falls behind one that fights and wins its fights. Commit to it:\n- get a barracks up early and keep soldiers in production from about 2:00 (batches of 5 or more, never an empty queue); soldiers gather while the army order is gather, and leave work when you send them;\n- attack by about the 4:00 mark with army(attack, player_<n>) or raid their gatherers with cavalry, and keep the attack standing: new soldiers join it on their own. Change it only for a real reason (your base is attacked, the army is spent); don't flip it back to gather or defend every turn;\n- advance to town phase when you can afford it; it adds score and stronger units.\nEach turn: read the brief, then call the tools for every order you want now (several in one turn is normal). Don't ask questions; nobody answers."
+     },
+     {
+      "role": "user",
+      "content": "You command an empire in a live, real-time 0 A.D. match against one opponent. The game never pauses for you. Win by conquest, or hold the highest score at the time cap. Read the brief, then give your orders with the tools.\n\nTime 00:00. You are Bot (rome), player 1, active.\nPhase: town. Population 35/40 (max 300).\nResources: food 86 wood 5 stone 230 metal 300.\nGatherers: food 14 wood 7 stone 0 metal 3.\nResources left near base: food 48 metal 4994 stone 4970 wood 4982.\nArmy by role: 28 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 1 production buildings with empty queues.\nBuildings:\n  Barracks: 1 (ids 1988)\n  CivCentre: 1 (ids 150)\n  Farmstead: 1 (ids 1961)\n  Field: 0, 1 under construction\n  House: 2 (ids 1946,1985), 1 under construction\n  Storehouse: 2 (ids 1930,1989)\n  Tower: 1 (ids 2006)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 30:00.\nStanding orders: {\"economy\": {\"food\": 50, \"wood\": 30, \"stone\": 10, \"metal\": 10}, \"villager_target\": 45, \"train\": {\"villager\": 5}, \"build\": [\"barracks@base\"], \"research\": [], \"advance_phase\": false, \"army\": \"attack player_2\"}\n[00:00 / cap 30:00 \u00b7 playing \u00b7 pop 35/40 \u00b7 f86 w5 s230 m300 \u00b7 town \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]\n\nYour orders in your last turns (oldest first):\nset_economy({\"food\":50,\"wood\":30,\"stone\":10,\"metal\":10}) -> accepted; train({\"role\":\"villager\",\"count\":5}) -> accepted\narmy({\"action\":\"attack\",\"target\":\"player_2\"}) -> rejected\n\nURGENT: something happened that needs an answer now. Decide your orders now and call the tools."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "advance_phase",
+       "description": "Advance to the next phase (village, town, city) as soon as its requirements and resources allow.",
+       "parameters": {
+        "properties": {},
+        "title": "advance_phaseArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "army",
+       "description": "Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or\nscout.",
+       "parameters": {
+        "properties": {
+         "action": {
+          "description": "gather, attack, raid, defend, retreat or scout.",
+          "enum": [
+           "gather",
+           "attack",
+           "raid",
+           "defend",
+           "retreat",
+           "scout"
+          ],
+          "title": "Action",
+          "type": "string"
+         },
+         "target": {
+          "default": "home",
+          "description": "The target: a player (player_2 or 2), center, front or home.",
+          "title": "Target",
+          "type": "string"
+         }
+        },
+        "required": [
+         "action"
+        ],
+        "title": "armyArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "build",
+       "description": "Place one building; villagers build it. The spot is found near the anchor `where` names.",
+       "parameters": {
+        "properties": {
+         "structure": {
+          "description": "e.g. \"house\", \"barracks\".",
+          "maxLength": 40,
+          "minLength": 1,
+          "title": "Structure",
+          "type": "string"
+         },
+         "where": {
+          "default": "base",
+          "description": "Where to place it: base, front, near_<food|wood|stone|metal> or toward_<player> (e.g. toward_2).",
+          "title": "Where",
+          "type": "string"
+         }
+        },
+        "required": [
+         "structure"
+        ],
+        "title": "buildArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "research",
+       "description": "Research one technology by its engine name, at a building that offers it.",
+       "parameters": {
+        "properties": {
+         "tech": {
+          "description": "e.g. \"gather_lumbering_ironaxes\".",
+          "maxLength": 80,
+          "minLength": 1,
+          "title": "Tech",
+          "type": "string"
+         }
+        },
+        "required": [
+         "tech"
+        ],
+        "title": "researchArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "say",
+       "description": "Say a short line in character, shown on the live overlay. Optional.",
+       "parameters": {
+        "properties": {
+         "text": {
+          "description": "One short line.",
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+         }
+        },
+        "required": [
+         "text"
+        ],
+        "title": "sayArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "set_economy",
+       "description": "Split your gatherers between the four resources, in percent; the four must add up to 100. Idle and surplus\ngatherers move over the next seconds.",
+       "parameters": {
+        "properties": {
+         "food": {
+          "description": "Percent of gatherers on food.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Food",
+          "type": "integer"
+         },
+         "wood": {
+          "description": "Percent on wood.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Wood",
+          "type": "integer"
+         },
+         "stone": {
+          "description": "Percent on stone.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Stone",
+          "type": "integer"
+         },
+         "metal": {
+          "description": "Percent on metal.",
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Metal",
+          "type": "integer"
+         }
+        },
+        "required": [
+         "food",
+         "wood",
+         "stone",
+         "metal"
+        ],
+        "title": "set_economyArguments",
+        "type": "object"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "train",
+       "description": "Train `count` more units of a role, mapped to your civilization's units; batches go to free buildings as\npopulation room and resources allow.",
+       "parameters": {
+        "properties": {
+         "role": {
+          "description": "villager, infantry_melee, infantry_ranged, cavalry, siege, champion",
+          "enum": [
+           "villager",
+           "infantry_melee",
+           "infantry_ranged",
+           "cavalry",
+           "siege",
+           "champion"
+          ],
+          "title": "Role",
+          "type": "string"
+         },
+         "count": {
+          "description": "How many more units of the role to train.",
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Count",
+          "type": "integer"
+         },
+         "at": {
+          "anyOf": [
+           {
+            "type": "string"
+           },
+           {
+            "type": "null"
+           }
+          ],
+          "default": null,
+          "description": "Only at this kind of building, e.g. \"barracks\".",
+          "title": "At"
+         }
+        },
+        "required": [
+         "role",
+         "count"
+        ],
+        "title": "trainArguments",
+        "type": "object"
+       }
+      }
+     }
+    ],
+    "tool_choice": "auto",
+    "max_tokens": 2000,
+    "top_p": 1.0
+   }
+  }
+ }
+}
