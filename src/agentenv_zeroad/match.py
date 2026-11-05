@@ -728,7 +728,7 @@ class LiveMatch:
     def footer(self, slot: str) -> str:
         """One line every tool result ends with: clock, the seat's essentials, pending events, how the match ends."""
         player = self.seats[slot].plan.player
-        # With no time cap the safety cap is internal bookkeeping: the seat is told there is no limit, never a countdown.
+        # With no time cap the safety cap is internal: the seat is told there is no limit, never a countdown.
         cap = f"/ cap {clock_text(self.cap_ms)}" if self.config.time_cap_s > 0 else "· no time limit"
         if self.snapshot is None or player not in self.snapshot.players:
             return f"[{self.game_clock} {cap}]"
