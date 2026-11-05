@@ -133,8 +133,9 @@ class MatchSettings(BaseModel):
     biome: str = "generic/temperate"
     placement: str = "circle"
     """Player placement: circle, river, groupedLines, randomGroup or stronghold."""
-    speed: float = Field(1.0, ge=1.0, le=2.0)
-    """Game speed: 1.0 steps the engine every 200 ms of wall time (real time), 2.0 every 100 ms."""
+    speed: float = Field(1.0, ge=1.0, le=8.0)
+    """Game speed: 1.0 steps the engine every 200 ms of wall time (real time), 2.0 every 100 ms, up to 8.0 (25 ms) for
+    an unrendered match. The executors tick once a game second at any speed."""
     time_cap_minutes: float = Field(40.0, gt=0, le=720)
     """Game minutes until the time cap, where the highest engine score wins."""
     draw_margin: float = Field(0.0, ge=0)
@@ -307,7 +308,7 @@ class ZeroADEnv(AgentEnvGameEnv):
             time_cap_s=s["time_cap_minutes"] * 60,
             draw_margin=s["draw_margin"],
             fog=s["fog"],
-            tick_s=self.tick_s,
+            tick_s=self.tick_s / s["speed"],
         )
         out_dir = self.out_root / lobby.lobby_id
         broadcast = self.broadcast_for(s, out_dir) if s.get("render") else None
@@ -696,7 +697,8 @@ class ZeroADEnv(AgentEnvGameEnv):
 
     async def _brain_calls(self, request: Request) -> JSONResponse:
         """A brain reports one model call of its seat: `{"seconds": 12.5, "error": null}`, optionally with its
-        `usd` estimate, `input_tokens`, `output_tokens` and `model`. At /players/<id>/."""
+        `usd` estimate, `input_tokens`, `output_tokens`, `model` and `turn` (the call's logged turn, kept in
+        results.json for training). At /players/<id>/."""
         slot_id, error = self._route_seat("brain_calls")
         if error is not None:
             return error
@@ -708,7 +710,7 @@ class ZeroADEnv(AgentEnvGameEnv):
         assert slot_id is not None and self.live is not None
         call = grading.BrainCall(seconds=body.seconds, error=body.error, game_ms=self.live.time_ms)
         tokens = (body.input_tokens, body.output_tokens) if body.input_tokens is not None else None
-        self.live.record_brain_call(slot_id, call, usd=body.usd, tokens=tokens, model=body.model)
+        self.live.record_brain_call(slot_id, call, usd=body.usd, tokens=tokens, model=body.model, turn=body.turn)
         made, missed = self.live.seats[slot_id].moves()
         return JSONResponse({"ok": True, "missed": call.missed, "made": made, "missed_total": missed})
 
@@ -724,6 +726,7 @@ class BrainCallBody(BaseModel):
     input_tokens: int | None = Field(None, ge=0)
     output_tokens: int | None = Field(None, ge=0)
     model: str | None = Field(None, max_length=100)
+    turn: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _tokens_come_in_pairs(self) -> BrainCallBody:

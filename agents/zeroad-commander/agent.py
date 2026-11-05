@@ -7,9 +7,13 @@ LITELLM_BASE_URL / LITELLM_API_KEY); the task's prompt_agent step names the mode
 reflex (Setup A), which the env only uses when the slot sets `reflex: luna`.
 
 Environment: ZEROAD_INTERVAL_S (25), ZEROAD_MIN_GAP_S (8), ZEROAD_MAX_COST_USD (this brain's spend cap; none if
-unset), ZEROAD_SHARE_REFLEX_KEY (1). The key is never logged or put in the result.
+unset), ZEROAD_SHARE_REFLEX_KEY (1). The key is never logged or put in the result. For a model the box serves itself
+(vLLM, the post-training pilot): ZEROAD_INTERVAL_CLOCK=game counts the interval in game seconds, ZEROAD_TURN_LOG=1
+reports each turn (prompt and sampled token ids, orders) to the env for training, and ZEROAD_EXTRA_BODY (a JSON
+object) is added to every chat request (sampling, chat template settings, `return_token_ids`).
 """
 
+import json
 import logging
 import os
 from typing import Any
@@ -66,12 +70,19 @@ class ZeroADCommander(AgentEnvAgent):
         [server] = request.mcp_servers.values()
         guard = SpendGuard(f"commander {config.model}", cap_usd=_float(environ, "ZEROAD_MAX_COST_USD", None))
         max_tokens = int((config.model_params or {}).get("max_tokens", 2000))
-        model = StrategistModel(config.model, base, key, guard, effort=config.effort, max_tokens=max_tokens)
+        extra = json.loads(environ.get("ZEROAD_EXTRA_BODY") or "{}")
+        if not isinstance(extra, dict):
+            return TaskResult.failure("bad_config", "ZEROAD_EXTRA_BODY must be a JSON object")
+        model = StrategistModel(
+            config.model, base, key, guard, effort=config.effort, max_tokens=max_tokens, extra_body=extra
+        )
         settings = CommanderSettings(
             interval_s=_float(environ, "ZEROAD_INTERVAL_S", 25.0) or 25.0,
             min_gap_s=_float(environ, "ZEROAD_MIN_GAP_S", 8.0) or 8.0,
             system_prompt=config.system_prompt or STRATEGIST_SYSTEM,
             opening="\n".join(p.text for p in request.parts if getattr(p, "text", None)),
+            game_clock=environ.get("ZEROAD_INTERVAL_CLOCK", "wall") == "game",
+            log_turns=environ.get("ZEROAD_TURN_LOG", "0") in ("1", "true", "yes"),
         )
         commander = Commander(model, settings)
         share = environ.get("ZEROAD_SHARE_REFLEX_KEY", "1") not in ("0", "false", "no")

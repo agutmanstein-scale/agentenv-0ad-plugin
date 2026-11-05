@@ -8,6 +8,10 @@
 A call is stateless (system prompt + one user message: the brief and a short memory), so its cost stays flat over a
 match. Each call is checked against the brain's `SpendGuard` before it is sent and charged after; tool calls come
 back as `(name, arguments)` with arguments parsed, or an error for arguments that aren't a JSON object.
+
+`extra_body` goes into every chat request as is: a vLLM server takes sampling settings, `chat_template_kwargs` (e.g.
+Qwen's `enable_thinking: false`) and `return_token_ids`, whose prompt and completion token ids the reply keeps, so a
+trainer sees exactly what the model saw and sampled.
 """
 
 from __future__ import annotations
@@ -48,6 +52,8 @@ class Reply:
     input_tokens: int | None = None
     output_tokens: int | None = None
     raw_usage: dict[str, Any] = field(default_factory=dict)
+    prompt_token_ids: list[int] | None = None
+    token_ids: list[int] | None = None
 
 
 def route(model: str) -> str:
@@ -83,6 +89,7 @@ class StrategistModel:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         http: httpx.AsyncClient | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         self.model = model
         self.base = base_of(base_url)
@@ -92,6 +99,7 @@ class StrategistModel:
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
         self._http = http
+        self.extra_body = dict(extra_body or {})
         self.route = route(model)
 
     def request(self, system: str, user: str, tools: list[ToolSpec]) -> tuple[str, dict[str, Any]]:
@@ -122,6 +130,7 @@ class StrategistModel:
             ],
             "tool_choice": "auto",
             "max_tokens": self.max_tokens,
+            **self.extra_body,
         }
         return "/v1/chat/completions", body
 
@@ -148,7 +157,18 @@ class StrategistModel:
             self.guard.record(self.model, None, None, most_usd=most)
             raise
         usd = self.guard.record(self.model, tokens_in, tokens_out, most_usd=most)
-        return Reply(text, calls, time.perf_counter() - started, usd, tokens_in, tokens_out, data.get("usage") or {})
+        choice = (data.get("choices") or [{}])[0]
+        return Reply(
+            text,
+            calls,
+            time.perf_counter() - started,
+            usd,
+            tokens_in,
+            tokens_out,
+            data.get("usage") or {},
+            prompt_token_ids=data.get("prompt_token_ids") or choice.get("prompt_token_ids"),
+            token_ids=choice.get("token_ids"),
+        )
 
     @staticmethod
     def _parse_chat(data: dict[str, Any]) -> tuple[str, list[ToolCall], int | None, int | None]:

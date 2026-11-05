@@ -11,7 +11,11 @@ Setup A). They are wrapped as A2A agents in `agents/zeroad-commander` and `agent
   seat's status (under attack, building lost), at most every `min_gap_s`. Calls are sequential, so one is in flight
   at a time. The seat counts as waiting on the call (spec §5) only when its status said a decision was open as the
   turn began (`open`: an urgent event, a resource run out, an idle army or a threat, a free queue with nothing
-  ordered), from the call's start until its orders are applied; a routine call with nothing open is no wait.
+  ordered), from the call's start until its orders are applied; a routine call with nothing open is no wait. With
+  `game_clock` the interval and gap count game seconds (the status's `game_ms`) instead of wall seconds, so a match
+  played faster than real time gets as many calls per game minute. With `log_turns` each reported call carries its
+  turn (`turn`: when it began, the user message, the token ids the model saw and sampled, each order and its status),
+  which the env keeps in results.json for training.
 - `LunaPlayer` (zeroad-luna, Setup B): once the match has started, every `interval_s` (1 s) read the compact JSON brief
   and send one Decisions request with strategic and tactical questions (economy split, phase, army posture, what to
   train and build, how aggressively), each answer mapped to an order tool. An order is only sent when it changes the
@@ -201,6 +205,8 @@ class CommanderSettings:
     system_prompt: str = STRATEGIST_SYSTEM
     opening: str = ""
     max_calls: int | None = None
+    game_clock: bool = False
+    log_turns: bool = False
 
 
 class Commander:
@@ -237,7 +243,7 @@ class Commander:
             if st.get("defeated"):
                 self.record.end_reason = f"defeated ({await _wait_over(link, s.poll_s, self._sleep)})"
                 return self.record
-            now = self._clock()
+            now = st.get("game_ms", 0) / 1000 if s.game_clock else self._clock()
             due = st.get("started", True) and (
                 last is None or now - last >= s.interval_s or (st.get("urgent", 0) > 0 and now - last >= s.min_gap_s)
             )
@@ -248,14 +254,24 @@ class Commander:
                 self.record.end_reason = await _wait_over(link, s.poll_s, self._sleep)
                 return self.record
             last = now
-            if not await self.turn(link, tools, urgent=st.get("urgent", 0) > 0, waiting=bool(st.get("open"))):
+            urgent, waiting = st.get("urgent", 0) > 0, bool(st.get("open"))
+            if not await self.turn(link, tools, urgent=urgent, waiting=waiting, game_ms=st.get("game_ms")):
                 self.record.end_reason = await _wait_over(link, s.poll_s, self._sleep)
                 self.record.end_reason = f"spend_cap ({self.record.end_reason})"
                 return self.record
 
-    async def turn(self, link: SeatLink, tools: list[ToolSpec], *, urgent: bool = False, waiting: bool = False) -> bool:
+    async def turn(
+        self,
+        link: SeatLink,
+        tools: list[ToolSpec],
+        *,
+        urgent: bool = False,
+        waiting: bool = False,
+        game_ms: int | None = None,
+    ) -> bool:
         """One brief -> model -> orders turn. False when the spend cap stops the brain. `waiting`: the seat had a
-        decision open when the turn began, so it waits on this call until its orders are applied."""
+        decision open when the turn began, so it waits on this call until its orders are applied. `game_ms`: the
+        game time the turn began at, for its logged turn."""
         try:
             brief = await link.brief()
         except Exception as e:  # noqa: BLE001 - no brief, no turn; the next trigger tries again
@@ -265,12 +281,14 @@ class Commander:
         if waiting:
             await link.waiting("begin")
         try:
-            return await self._call_and_apply(link, user, tools)
+            return await self._call_and_apply(link, user, tools, game_ms=game_ms, urgent=urgent)
         finally:
             if waiting:
                 await link.waiting("end")
 
-    async def _call_and_apply(self, link: SeatLink, user: str, tools: list[ToolSpec]) -> bool:
+    async def _call_and_apply(
+        self, link: SeatLink, user: str, tools: list[ToolSpec], *, game_ms: int | None = None, urgent: bool = False
+    ) -> bool:
         started = time.perf_counter()
         try:
             reply = await self.model.call(self.settings.system_prompt, user, tools)
@@ -285,7 +303,7 @@ class Commander:
             usd = round(self.model.guard.last_usd, 6)
             await link.report_call(seconds, self.record.last_error, usd=usd, model=self.model.model)
             return True
-        orders = []
+        orders, applied = [], []
         for c in reply.calls:
             if c.error or c.name not in ORDER_TOOLS:
                 result = json.dumps({"status": "rejected", "message": c.error or f"unknown tool {c.name}"})
@@ -297,9 +315,21 @@ class Commander:
                 self.record.rejected += 1
                 self.record.last_error = _message_of(result)
             orders.append(f"{c.name}({json.dumps(c.arguments, separators=(',', ':'))}) -> {status}")
+            applied.append({"tool": c.name, "arguments": c.arguments, "status": status})
         seconds = time.perf_counter() - started
         self.record.calls += 1
         self.record.latencies_s.append(reply.seconds)
+        turn = None
+        if self.settings.log_turns:
+            turn = {
+                "began_ms": game_ms,
+                "urgent": urgent,
+                "user": user,
+                "text": reply.text,
+                "orders": applied,
+                "prompt_token_ids": reply.prompt_token_ids,
+                "token_ids": reply.token_ids,
+            }
         await link.report_call(
             reply.seconds,
             None,
@@ -307,6 +337,7 @@ class Commander:
             input_tokens=reply.input_tokens,
             output_tokens=reply.output_tokens,
             model=self.model.model,
+            turn=turn,
         )
         self._memory = (self._memory + ["; ".join(orders) or "(no orders)"])[-MEMORY_TURNS:]
         self.record.turns.append({"seconds": round(seconds, 2), "orders": orders, "text": reply.text[:500]})

@@ -1,0 +1,596 @@
+<title>0 A.D. Qwen Pilot</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one scanning column; status and the four numbers first, then the rating, the probes, the mix, health,
+   training and one game, each chart in its own panel; tables last. */
+:root {
+  --plane: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11, 11, 11, 0.10); --wash: rgba(11, 11, 11, 0.04);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300;
+  --pos: #2a78d6; --neg: #e34948; --up: #006300; --down: #d03b3b; --note-bg: #fff4d6; --note-ink: #5c4300;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300;
+    --pos: #3987e5; --neg: #e66767; --up: #0ca30c; --down: #e66767; --note-bg: #3a2f10; --note-ink: #f3dfa8;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300;
+  --pos: #3987e5; --neg: #e66767; --up: #0ca30c; --down: #e66767; --note-bg: #3a2f10; --note-ink: #f3dfa8;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--plane); color: var(--ink); font: 14px/1.5 var(--sans);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 24px 48px;
+}
+main { max-width: 1120px; margin: 0 auto; display: grid; gap: 20px; }
+header { display: grid; gap: 6px; }
+h1 { font-size: 26px; line-height: 1.2; margin: 0; font-weight: 650; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font-size: 15px; margin: 0; font-weight: 600; text-wrap: balance; }
+.sub { color: var(--ink-2); margin: 0; max-width: 72ch; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--ink-2); font-size: 13px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px;
+  background: var(--surface); box-shadow: inset 0 0 0 1px var(--ring); font-variant-numeric: tabular-nums; }
+.chip b { color: var(--ink); font-weight: 600; }
+.runs { display: inline-flex; gap: 4px; padding: 3px; border-radius: 999px; background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--ring); }
+.runs button { font: inherit; font-size: 13px; border: 0; border-radius: 999px; padding: 2px 12px; cursor: pointer;
+  background: transparent; color: var(--ink-2); }
+.runs button[aria-pressed="true"] { background: var(--ink); color: var(--surface); font-weight: 600; }
+.runs button:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
+.note { background: var(--note-bg); color: var(--note-ink); border-radius: 8px; padding: 10px 14px; font-size: 13px; }
+.note[hidden] { display: none; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border-radius: 10px; box-shadow: inset 0 0 0 1px var(--ring); padding: 14px 16px;
+  display: grid; gap: 4px; align-content: start; min-width: 0; }
+.tile .label { color: var(--ink-2); font-size: 13px; }
+.tile .value { font-size: 26px; font-weight: 600; line-height: 1.15; }
+.tile.hero .value { font-size: 52px; letter-spacing: -0.02em; }
+.tile .delta { font-size: 13px; color: var(--ink-2); }
+.delta .up { color: var(--up); font-weight: 600; }
+.delta .down { color: var(--down); font-weight: 600; }
+.panel { background: var(--surface); border-radius: 10px; box-shadow: inset 0 0 0 1px var(--ring); padding: 16px;
+  display: grid; gap: 10px; min-width: 0; }
+.panel .how { color: var(--ink-2); font-size: 13px; margin: 0; max-width: 80ch; }
+.chart { position: relative; min-width: 0; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.row3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.row2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 12px; }
+.multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px 18px; }
+.mult h3 { font-size: 13px; font-weight: 600; margin: 0 0 2px; color: var(--ink); }
+.mult .cap { font-size: 12px; color: var(--muted); margin: 0 0 4px; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.legend i.line { width: 14px; height: 2px; border-radius: 1px; }
+.tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dlabel { fill: var(--ink-2); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dlabel.strong { fill: var(--ink); font-weight: 600; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); font-size: 12px;
+  border-radius: 8px; box-shadow: 0 0 0 1px var(--ring), 0 6px 20px rgba(0, 0, 0, 0.12); padding: 8px 10px;
+  min-width: 140px; z-index: 5; font-variant-numeric: tabular-nums; }
+.tip[hidden] { display: none; }
+.tip .t { color: var(--ink-2); margin-bottom: 4px; }
+.tip .r { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.tip .r span { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
+.tip .r b { font-weight: 600; color: var(--ink); }
+.tip .k { width: 12px; height: 2px; border-radius: 1px; display: inline-block; }
+.hit { fill: transparent; cursor: default; }
+.hit:focus { outline: none; }
+.hit:focus-visible { stroke: var(--ink); stroke-width: 1; }
+details { background: var(--surface); border-radius: 10px; box-shadow: inset 0 0 0 1px var(--ring); padding: 12px 16px; }
+summary { cursor: pointer; font-weight: 600; }
+summary:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 4px; }
+.tablewrap { overflow-x: auto; margin-top: 10px; }
+table { border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; min-width: 560px; width: 100%; }
+th, td { text-align: left; padding: 5px 10px 5px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--ink-2); font-weight: 600; }
+td.num, th.num { text-align: right; }
+.pill { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+.pill.won { background: color-mix(in srgb, var(--pos) 16%, transparent); color: var(--ink); }
+.pill.lost { background: color-mix(in srgb, var(--neg) 16%, transparent); color: var(--ink); }
+.pill.other { background: var(--wash); color: var(--ink-2); }
+.empty { color: var(--muted); font-size: 13px; padding: 20px 0; }
+footer { color: var(--muted); font-size: 12px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<main>
+  <header>
+    <h1>0 A.D. Qwen Pilot</h1>
+    <p class="sub">Qwen3-8B commands an empire in 30-minute 1v1 games of 0 A.D. at double speed and is trained on its own
+      decisions after every round. Ratings put Petra, the game's own AI, at medium difficulty on 1,000.</p>
+    <div class="meta" id="meta"></div>
+    <div class="meta" id="runPick" hidden><span>Run</span><span class="runs" id="runs" role="group" aria-label="Run"></span></div>
+  </header>
+  <div class="note" id="example" hidden>Example data: three simulated 10-round runs through the pilot's real driver,
+    scoring and report code, with the games and the trainer faked, so every number here is made up. Real rounds
+    replace it as they finish.</div>
+
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="panel">
+    <h2 id="ratingTitle">Rating by round</h2>
+    <p class="how" id="ratingHow">The version that played each round, fit over every game up to that round. The flat
+      lines are the opponents' ratings from the same fit.</p>
+    <div class="legend" id="ratingLegend"></div>
+    <div class="chart" id="rating"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Probe games: score margin each round</h2>
+    <p class="how">The probes, each on its own seed that no training game uses, sampled at temperature 0.7: Petra's five
+      levels and the previous version every round; Sonnet, Opus, Astra and Sol all in the baseline, then one a round in
+      turn. A column above the line is a lead at the 30-minute cap; below is a deficit; a gap is a round without it.</p>
+    <div class="legend"><span><i style="background:var(--pos)"></i>Policy ahead</span><span><i style="background:var(--neg)"></i>Policy behind</span></div>
+    <div class="multiples" id="probes"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Who it trained against</h2>
+    <p class="how">Training games per round by opponent. The ladder sends most games where the policy wins about half
+      the time, and keeps a tenth on opponents it already beats.</p>
+    <div class="legend" id="mixLegend"></div>
+    <div class="chart" id="mix"></div>
+  </section>
+
+  <section class="row3" aria-label="Play health">
+    <div class="panel"><h2>Orders rejected</h2><p class="how">Share of the policy's orders the env refused.</p><div class="chart" id="rejected"></div></div>
+    <div class="panel"><h2>Calls missed</h2><p class="how">Model calls that failed or took over 120 s.</p><div class="chart" id="missed"></div></div>
+    <div class="panel"><h2>Median call time</h2><p class="how">Seconds from brief to orders, per round.</p><div class="chart" id="latency"></div></div>
+  </section>
+
+  <section class="row2">
+    <div class="panel"><h2>Drift from base Qwen</h2><p class="how">Mean per-token KL of each version's training batch
+      against the base model. Training penalizes it so the model keeps calling tools correctly.</p><div class="chart" id="kl"></div></div>
+    <div class="panel"><h2>A game against Petra medium</h2><p class="how">Both totals over the 30 game-minutes of the
+      Petra medium probe, first round and latest.</p>
+      <div class="legend"><span><i class="line" style="background:var(--s1)"></i>Policy</span><span><i class="line" style="background:var(--s2)"></i>Petra medium</span></div>
+      <div class="multiples" id="games"></div></div>
+  </section>
+
+  <details>
+    <summary>Tables</summary>
+    <div class="tablewrap"><table id="probeTable"></table></div>
+    <div class="tablewrap"><table id="mixTable"></table></div>
+  </details>
+  <footer id="foot"></footer>
+</main>
+
+<script>
+(() => {
+  const NS = "http://www.w3.org/2000/svg";
+  const OPP = {
+    "petra-1": "Petra very easy", "petra-2": "Petra easy", "petra-3": "Petra medium", "petra-4": "Petra hard",
+    "petra-5": "Petra very hard", sonnet: "Sonnet 5.5", opus: "Opus 5.5", astra: "GPT-6 Astra", sol: "GPT-6 Sol",
+  };
+  const FRONTIER = ["sonnet", "opus", "astra", "sol"];
+  const MIX = ["petra-1", "petra-2", "petra-3", "petra-4", "petra-5", "earlier"];
+  const MIXNAME = { ...OPP, earlier: "Earlier versions" };
+  const MIXVAR = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const fmt = (n, d = 0) => n == null || Number.isNaN(n) ? "–" : n.toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+  const signed = (n) => n == null ? "–" : (n > 0 ? "+" : n < 0 ? "−" : "") + fmt(Math.abs(n));
+  const pct = (x, d = 1) => x == null ? "–" : fmt(x * 100, d) + "%";
+  const oppName = (id) => OPP[id] || (/^v\d+$/.test(id) ? `Version ${id.slice(1)}` : id);
+  let R = null, DATA = null, P = null, pick = 0;
+  const RUNVAR = ["--s1", "--s2", "--s3", "--s4"];
+
+  function el(tag, attrs = {}, parent) {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function html(tag, cls, text, parent) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function nice(lo, hi, count = 5) {
+    if (lo === hi) { lo -= 1; hi += 1; }
+    const span = hi - lo, raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => span / s <= count) || 10 * mag;
+    const a = Math.floor(lo / step) * step, b = Math.ceil(hi / step) * step, ticks = [];
+    for (let v = a; v <= b + step / 2; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+    return { lo: a, hi: b, ticks };
+  }
+  function tickText(v, unit) {
+    if (unit === "%") return fmt(v * 100, v * 100 % 1 ? 1 : 0) + "%";
+    if (unit === "s") return fmt(v, v % 1 ? 1 : 0) + " s";
+    if (unit === "min") return fmt(v) + ":00";
+    if (v !== 0 && Math.abs(v) < 1) return fmt(v, Math.abs(v) < 0.01 ? 3 : 2);
+    return Math.abs(v) >= 10000 ? fmt(v / 1000) + "K" : fmt(v);
+  }
+
+  function tooltip(host) {
+    const tip = html("div", "tip", null, host);
+    tip.hidden = true;
+    return {
+      show(x, y, title, rows) {
+        tip.replaceChildren();
+        html("div", "t", title, tip);
+        for (const [key, name, value] of rows) {
+          const r = html("div", "r", null, tip), s = html("span", null, null, r);
+          if (key) { const k = html("i", "k", null, s); k.style.background = key; }
+          s.appendChild(document.createTextNode(name));
+          html("b", null, value, r);
+        }
+        tip.hidden = false;
+        const w = host.clientWidth, tw = tip.offsetWidth;
+        tip.style.left = Math.max(0, Math.min(w - tw, x + 14)) + "px";
+        tip.style.top = Math.max(0, y - tip.offsetHeight - 10) + "px";
+      },
+      hide() { tip.hidden = true; },
+    };
+  }
+
+  // A line chart over integer x (rounds or versions): series of {name, color, points:[[x,y]]}, optional flat
+  // reference lines {name, y}, one y axis.
+  function lineChart(host, { series, refs = [], unit = "", height = 240, xLabel = "Round", yFloor = null, xFmt }) {
+    host.replaceChildren();
+    const pts = series.flatMap((s) => s.points);
+    if (!pts.length) { html("div", "empty", "No rounds yet.", host); return; }
+    const W = Math.max(280, host.clientWidth), labelRoom = refs.length ? 136 : 16;
+    const m = { t: 12, r: labelRoom, b: 28, l: 48 };
+    const xs = [...new Set(pts.map((p) => p[0]))].sort((a, b) => a - b);
+    const ys = pts.map((p) => p[1]).concat(refs.map((r) => r.y));
+    let lo = Math.min(...ys), hi = Math.max(...ys);
+    if (yFloor != null) lo = Math.min(lo, yFloor);
+    const Y = nice(lo, hi);
+    const svg = el("svg", { viewBox: `0 0 ${W} ${height}`, role: "img", "aria-label": host.dataset.label || "" }, host);
+    const x0 = m.l, x1 = W - m.r, y0 = height - m.b, y1 = m.t;
+    const sx = (v) => xs.length === 1 ? (x0 + x1) / 2 : x0 + (v - xs[0]) / (xs[xs.length - 1] - xs[0]) * (x1 - x0);
+    const sy = (v) => y0 - (v - Y.lo) / (Y.hi - Y.lo) * (y0 - y1);
+    for (const t of Y.ticks) {
+      el("line", { x1: x0, x2: x1, y1: sy(t), y2: sy(t), stroke: css(t === 0 && Y.lo < 0 ? "--axis" : "--grid"), "stroke-width": 1 }, svg);
+      el("text", { x: x0 - 8, y: sy(t) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = tickText(t, unit);
+    }
+    const every = Math.max(1, Math.ceil(xs.length / Math.floor((x1 - x0) / 36)));
+    xs.forEach((v, i) => {
+      if (i % every) return;
+      el("text", { x: sx(v), y: y0 + 18, "text-anchor": "middle", class: "tick" }, svg).textContent = xFmt ? xFmt(v) : v;
+    });
+    el("line", { x1: x0, x2: x1, y1: y0, y2: y0, stroke: css("--axis"), "stroke-width": 1 }, svg);
+    let lastLabelY = -1e9;
+    for (const r of [...refs].sort((a, b) => b.y - a.y)) {
+      el("line", { x1: x0, x2: x1, y1: sy(r.y), y2: sy(r.y), stroke: css("--axis"), "stroke-width": 1 }, svg);
+      const ly = Math.max(sy(r.y) + 4, lastLabelY + 13);
+      lastLabelY = ly;
+      el("text", { x: x1 + 8, y: ly, class: "dlabel" }, svg).textContent = `${r.name} ${fmt(r.y)}`;
+    }
+    for (const s of series) {
+      if (s.area) {
+        const d = s.points.map((p, i) => `${i ? "L" : "M"}${sx(p[0])},${sy(p[1])}`).join("") +
+          `L${sx(s.points[s.points.length - 1][0])},${y0}L${sx(s.points[0][0])},${y0}Z`;
+        el("path", { d, fill: s.color, "fill-opacity": 0.1 }, svg);
+      }
+      el("path", {
+        d: s.points.map((p, i) => `${i ? "L" : "M"}${sx(p[0])},${sy(p[1])}`).join(""), fill: "none", stroke: s.color,
+        "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round",
+      }, svg);
+      const last = s.points[s.points.length - 1];
+      el("circle", { cx: sx(last[0]), cy: sy(last[1]), r: 4.5, fill: s.color, stroke: css("--surface"), "stroke-width": 2 }, svg);
+      if (s.endLabel) {
+        el("text", { x: sx(last[0]) - 8, y: sy(last[1]) - 10, class: "dlabel strong", "text-anchor": "end" }, svg)
+          .textContent = s.endLabel;
+      }
+    }
+    const tip = tooltip(host), cross = el("line", { y1: y1, y2: y0, stroke: css("--axis"), "stroke-width": 1, visibility: "hidden" }, svg);
+    const hit = el("rect", { x: x0, y: y1, width: x1 - x0, height: y0 - y1, class: "hit", tabindex: 0 }, svg);
+    let focusI = xs.length - 1;
+    const at = (xv) => {
+      cross.setAttribute("x1", sx(xv)); cross.setAttribute("x2", sx(xv)); cross.setAttribute("visibility", "visible");
+      const rows = series.map((s) => {
+        const p = s.points.find((q) => q[0] === xv);
+        return [s.color, s.name, p ? (s.fmt ? s.fmt(p[1], xv) : tickText(p[1], unit)) : "–"];
+      });
+      tip.show(sx(xv) / W * host.clientWidth, sy(Math.max(...series.map((s) => (s.points.find((q) => q[0] === xv) || [0, Y.lo])[1]))) / height * svg.clientHeight,
+        `${xLabel} ${xFmt ? xFmt(xv) : xv}`, rows);
+    };
+    const nearest = (evt) => {
+      const box = svg.getBoundingClientRect(), px = (evt.clientX - box.left) / box.width * W;
+      return xs.reduce((a, b) => Math.abs(sx(b) - px) < Math.abs(sx(a) - px) ? b : a);
+    };
+    hit.addEventListener("pointermove", (e) => at(nearest(e)));
+    hit.addEventListener("pointerleave", () => { tip.hide(); cross.setAttribute("visibility", "hidden"); });
+    hit.addEventListener("focus", () => at(xs[focusI]));
+    hit.addEventListener("blur", () => { tip.hide(); cross.setAttribute("visibility", "hidden"); });
+    hit.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        focusI = Math.max(0, Math.min(xs.length - 1, focusI + (e.key === "ArrowRight" ? 1 : -1)));
+        at(xs[focusI]); e.preventDefault();
+      }
+    });
+  }
+
+  // Columns per round: diverging (one value each) or stacked (parts per round).
+  function columns(host, { rounds, values = null, stacks = null, height = 140, unit = "", title }) {
+    host.replaceChildren();
+    if (!rounds.length) { html("div", "empty", "No rounds yet.", host); return; }
+    const W = Math.max(220, host.clientWidth), m = { t: 8, r: 6, b: 22, l: stacks ? 30 : 44 };
+    const svg = el("svg", { viewBox: `0 0 ${W} ${height}`, role: "img", "aria-label": title || "" }, host);
+    const x0 = m.l, x1 = W - m.r, y0 = height - m.b, y1 = m.t;
+    let lo = 0, hi = 0;
+    if (values) for (const v of values) { if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); } }
+    if (stacks) for (const s of stacks) hi = Math.max(hi, s.reduce((a, p) => a + p.n, 0));
+    const Y = nice(lo, hi, stacks ? 4 : 4);
+    const sy = (v) => y0 - (v - Y.lo) / (Y.hi - Y.lo) * (y0 - y1);
+    for (const t of Y.ticks) {
+      el("line", { x1: x0, x2: x1, y1: sy(t), y2: sy(t), stroke: css(t === 0 ? "--axis" : "--grid"), "stroke-width": 1 }, svg);
+      el("text", { x: x0 - 6, y: sy(t) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = tickText(t, unit);
+    }
+    const band = (x1 - x0) / rounds.length, bw = Math.min(24, band - 4);
+    const tip = tooltip(host);
+    const every = Math.max(1, Math.ceil(rounds.length / Math.floor((x1 - x0) / 26)));
+    rounds.forEach((r, i) => {
+      const cx = x0 + band * (i + 0.5);
+      if (i % every === 0) el("text", { x: cx, y: y0 + 15, "text-anchor": "middle", class: "tick" }, svg).textContent = r;
+      const g = el("g", { tabindex: 0, class: "hit" }, svg);
+      let rows, tipY;
+      if (values) {
+        const v = values[i];
+        if (v != null) {
+          const top = Math.min(sy(v), sy(0)), h = Math.abs(sy(v) - sy(0));
+          el("path", { d: roundedBar(cx - bw / 2, top, bw, Math.max(h, 1), v >= 0), fill: css(v >= 0 ? "--pos" : "--neg") }, g);
+          tipY = top;
+        }
+        rows = [[null, "Margin", v == null ? "no result" : signed(v)]];
+        if (title && values.meta && values.meta[i]) rows.push([null, "Outcome", values.meta[i]]);
+      } else {
+        let acc = 0;
+        const parts = stacks[i];
+        parts.forEach((p, k) => {
+          if (!p.n) return;
+          const yb = sy(acc), yt = sy(acc + p.n);
+          const isTop = parts.slice(k + 1).every((q) => !q.n);
+          const gap = acc > 0 ? 2 : 0;
+          el("path", { d: isTop ? roundedBar(cx - bw / 2, yt, bw, Math.max(1, yb - yt - gap), true) : `M${cx - bw / 2},${yt}h${bw}v${Math.max(1, yb - yt - gap)}h${-bw}Z`, fill: p.color }, g);
+          acc += p.n;
+        });
+        tipY = sy(acc);
+        rows = parts.filter((p) => p.n).map((p) => [p.color, p.name, `${p.n} (${p.wins} won)`]);
+      }
+      el("rect", { x: cx - band / 2, y: y1, width: band, height: y0 - y1, fill: "transparent" }, g);
+      const show = () => tip.show(cx / W * host.clientWidth, (tipY ?? y0) / height * svg.clientHeight, `Round ${r}`, rows);
+      g.addEventListener("pointerenter", show);
+      g.addEventListener("focus", show);
+      g.addEventListener("pointerleave", () => tip.hide());
+      g.addEventListener("blur", () => tip.hide());
+    });
+  }
+  function roundedBar(x, y, w, h, up) {
+    const r = Math.min(4, h, w / 2);
+    return up
+      ? `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`
+      : `M${x},${y}H${x + w}V${y + h - r}Q${x + w},${y + h} ${x + w - r},${y + h}H${x + r}Q${x},${y + h} ${x},${y + h - r}Z`;
+  }
+
+  function tiles() {
+    const host = document.getElementById("tiles");
+    host.replaceChildren();
+    const rt = R.ratings, last = rt[rt.length - 1], first = rt[0];
+    const lastRound = R.rounds[R.rounds.length - 1];
+    const probes = R.probes.filter((p) => p.round === lastRound);
+    const health = R.health, h0 = health[0], h1 = health[health.length - 1];
+    const tile = (label, value, delta, hero) => {
+      const t = html("div", "tile" + (hero ? " hero" : ""), null, host);
+      html("div", "label", label, t);
+      html("div", "value", value, t);
+      if (delta) t.appendChild(delta);
+    };
+    const delta = (cls, strong, rest) => {
+      const d = html("div", "delta");
+      if (strong) html("span", cls, strong, d);
+      d.appendChild(document.createTextNode(rest));
+      return d;
+    };
+    let change = last && first ? last.policy - first.policy : null;
+    if (P) {
+      const line = (P.lines.find((l) => l.run === DATA.runs[pick].id) || { points: [] }).points;
+      if (line.length && last) {
+        last.policy = line[line.length - 1][1];
+        change = line.length > 1 ? line[line.length - 1][1] - line[0][1] : null;
+      }
+    }
+    tile(`Rating of version ${last ? last.version : 0}`, last ? fmt(last.policy) : "–",
+      change == null || rt.length < 2 ? delta(null, null, "Petra medium is 1,000")
+        : delta(change >= 0 ? "up" : "down", signed(change), ` since round ${first.round} (version ${first.version})`), true);
+    const wins = probes.filter((p) => p.outcome === "won").length;
+    tile("Probes won, latest round", `${wins} of ${probes.length}`,
+      delta(null, null, probes.map((p) => (p.outcome === "won" ? "✓ " : "✗ ") + oppName(p.opponent).replace("Petra ", "")).join(" · ")));
+    const rj = h1 ? h1.rejected_share : null, rj0 = h0 ? h0.rejected_share : null;
+    tile("Orders rejected, latest round", pct(rj),
+      rj != null && rj0 != null && health.length > 1
+        ? delta(rj <= rj0 ? "up" : "down", (rj <= rj0 ? "↓ " : "↑ ") + pct(Math.abs(rj - rj0)), ` vs round ${h0.round}`) : null);
+    const tr = R.trainer;
+    const spend = health.reduce((a, h) => a + (h.spend_usd || 0), 0);
+    tile("Versions trained", fmt(tr.length),
+      delta(null, null, tr.length ? `${fmt(tr.reduce((a, t) => a + t.seconds, 0) / tr.length / 60, 1)} min per step · $${fmt(spend, 2)} opponent spend` : "none yet"));
+  }
+
+  function rating() {
+    const host = document.getElementById("rating");
+    const legend = document.getElementById("ratingLegend");
+    legend.replaceChildren();
+    if (P) {
+      document.getElementById("ratingTitle").textContent = "Rating by version, every run on one scale";
+      document.getElementById("ratingHow").textContent = "One fit over every run's games: each run's versions are "
+        + "its own players, and Petra's levels and the frontier models are the same players in every run. The flat "
+        + "lines are those shared opponents.";
+      const series = P.lines.map((l, i) => {
+        const s = html("span", null, null, legend), sw = html("i", "line", null, s);
+        sw.style.background = css(RUNVAR[i % RUNVAR.length]);
+        s.appendChild(document.createTextNode("Run " + l.run.toUpperCase()));
+        return { name: "Run " + l.run.toUpperCase(), color: css(RUNVAR[i % RUNVAR.length]), points: l.points };
+      });
+      const refs = ["petra-1", "petra-2", "petra-3", "petra-4", "petra-5", ...FRONTIER].filter((k) => P.board[k] != null)
+        .map((k) => ({ name: OPP[k], y: P.board[k] }));
+      lineChart(host, { series, refs, height: 360, xLabel: "Version", xFmt: (v) => "v" + v });
+      return;
+    }
+    const rt = R.ratings.filter((r) => r.policy != null);
+    const board = rt.length ? rt[rt.length - 1].board : {};
+    const refs = ["petra-1", "petra-2", "petra-3", "petra-4", "petra-5", ...FRONTIER].filter((k) => board[k] != null)
+      .map((k) => ({ name: OPP[k], y: board[k] }));
+    lineChart(host, {
+      series: [{
+        name: "Rating", color: css("--s1"), area: false, points: rt.map((r) => [r.round, r.policy]),
+        endLabel: rt.length ? fmt(rt[rt.length - 1].policy) : "", fmt: (y, x) => `${fmt(y)} (v${rt.find((r) => r.round === x).version})`,
+      }],
+      refs, height: 360,
+    });
+  }
+
+  function probes() {
+    const host = document.getElementById("probes");
+    host.replaceChildren();
+    const order = ["petra-1", "petra-2", "petra-3", "petra-4", "petra-5", "previous", ...FRONTIER];
+    const keyOf = (p) => /^v\d+$/.test(p.opponent) ? "previous" : p.opponent;
+    for (const key of order) {
+      const rows = R.probes.filter((p) => keyOf(p) === key);
+      if (!rows.length) continue;
+      const box = html("div", "mult", null, host);
+      html("h3", null, key === "previous" ? "Previous version" : OPP[key], box);
+      const won = rows.filter((p) => p.outcome === "won").length;
+      html("p", "cap", `${won} of ${rows.length} won`, box);
+      const chart = html("div", "chart", null, box);
+      const values = R.rounds.map((r) => { const p = rows.find((q) => q.round === r); return p ? p.margin : null; });
+      values.meta = R.rounds.map((r) => { const p = rows.find((q) => q.round === r); return p ? (p.outcome || p.status) + (key === "previous" ? ` vs ${oppName(p.opponent)}` : "") : null; });
+      columns(chart, { rounds: R.rounds, values, title: key });
+    }
+  }
+
+  function mix() {
+    const legend = document.getElementById("mixLegend");
+    legend.replaceChildren();
+    MIX.forEach((k, i) => {
+      const s = html("span", null, null, legend), sw = html("i", null, null, s);
+      sw.style.background = css(MIXVAR[i]);
+      s.appendChild(document.createTextNode(MIXNAME[k]));
+    });
+    const stacks = R.rounds.map((r) => MIX.map((k, i) => {
+      const rows = R.training.filter((t) => t.round === r && (k === "earlier" ? /^v\d+$/.test(t.opponent) : t.opponent === k));
+      return { name: MIXNAME[k], color: css(MIXVAR[i]), n: rows.reduce((a, t) => a + t.games, 0), wins: rows.reduce((a, t) => a + t.wins, 0) };
+    }));
+    columns(document.getElementById("mix"), { rounds: R.rounds, stacks, height: 200, title: "Training games by opponent" });
+  }
+
+  function health() {
+    const H = R.health;
+    const one = (id, key, unit, name) => lineChart(document.getElementById(id), {
+      series: [{ name, color: css("--s1"), area: true, points: H.filter((h) => h[key] != null).map((h) => [h.round, h[key]]),
+        endLabel: H.length ? tickText(H[H.length - 1][key] ?? 0, unit) : "" }],
+      unit, height: 160, yFloor: 0,
+    });
+    one("rejected", "rejected_share", "%", "Rejected");
+    one("missed", "missed_share", "%", "Missed");
+    one("latency", "latency_p50_s", "s", "Median");
+  }
+
+  function kl() {
+    lineChart(document.getElementById("kl"), {
+      series: [{ name: "Mean KL", color: css("--s1"), area: true, points: R.trainer.map((t) => [t.version, t.mean_kl]),
+        fmt: (y) => fmt(y, 4), endLabel: R.trainer.length ? fmt(R.trainer[R.trainer.length - 1].mean_kl, 4) : "" }],
+      height: 200, yFloor: 0, xLabel: "Version", xFmt: (v) => "v" + v,
+    });
+  }
+
+  function games() {
+    const host = document.getElementById("games");
+    host.replaceChildren();
+    if (!R.games.length) { html("div", "empty", "No Petra medium probe yet.", host); return; }
+    for (const g of R.games) {
+      const box = html("div", "mult", null, host);
+      html("h3", null, `Round ${g.round}, version ${g.version}`, box);
+      const last = g.points[g.points.length - 1] || {};
+      html("p", "cap", `${g.outcome || "unfinished"}, ${fmt(last.policy)} to ${fmt(last.opponent)}`, box);
+      const chart = html("div", "chart", null, box);
+      const step = Math.max(1, Math.floor(g.points.length / 60));
+      const pts = g.points.filter((_, i) => i % step === 0 || i === g.points.length - 1);
+      lineChart(chart, {
+        series: [
+          { name: "Policy", color: css("--s1"), points: pts.map((p) => [Math.round(p.t_ms / 6000) / 10, p.policy]) },
+          { name: "Petra medium", color: css("--s2"), points: pts.map((p) => [Math.round(p.t_ms / 6000) / 10, p.opponent]) },
+        ],
+        height: 170, yFloor: 0, xLabel: "Game minute", xFmt: (v) => Math.round(v) + ":00",
+      });
+    }
+  }
+
+  function tables() {
+    const pt = document.getElementById("probeTable");
+    pt.replaceChildren();
+    const head = (t, cols) => { const tr = html("tr", null, null, html("thead", null, null, t)); cols.forEach(([c, n]) => html("th", n ? "num" : null, c, tr)); };
+    head(pt, [["Round"], ["Version"], ["Probe opponent"], ["Outcome"], ["Margin", 1], ["Policy", 1], ["Opponent", 1]]);
+    const tb = html("tbody", null, null, pt);
+    for (const p of [...R.probes].sort((a, b) => b.round - a.round)) {
+      const tr = html("tr", null, null, tb);
+      html("td", null, p.round, tr); html("td", null, "v" + p.policy_version, tr); html("td", null, oppName(p.opponent), tr);
+      const td = html("td", null, null, tr);
+      html("span", "pill " + (p.outcome === "won" ? "won" : p.outcome === "lost" ? "lost" : "other"), p.outcome || p.status, td);
+      html("td", "num", signed(p.margin), tr); html("td", "num", fmt(p.policy_score), tr); html("td", "num", fmt(p.opponent_score), tr);
+    }
+    const mt = document.getElementById("mixTable");
+    mt.replaceChildren();
+    head(mt, [["Round"], ["Training opponent"], ["Games", 1], ["Won", 1], ["Mean margin", 1]]);
+    const mb = html("tbody", null, null, mt);
+    for (const t of [...R.training].sort((a, b) => b.round - a.round || a.opponent.localeCompare(b.opponent))) {
+      const tr = html("tr", null, null, mb);
+      html("td", null, t.round, tr); html("td", null, oppName(t.opponent), tr);
+      html("td", "num", t.games, tr); html("td", "num", t.wins, tr); html("td", "num", signed(t.mean_margin), tr);
+    }
+  }
+
+  function meta() {
+    const m = document.getElementById("meta");
+    m.replaceChildren();
+    const chip = (label, value) => { const c = html("span", "chip", null, m); c.appendChild(document.createTextNode(label + " ")); html("b", null, value, c); };
+    const st = R.state || {};
+    chip("Rounds played", fmt(R.rounds.length));
+    chip("Next", st.pending_train ? `train version ${(st.version ?? 0) + 1}` : `play version ${st.version ?? 0}`);
+    chip("Updated", new Date(R.updated).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }));
+    document.getElementById("example").hidden = !(R.example || (DATA && DATA.example));
+    const runs = document.getElementById("runs"), pickRow = document.getElementById("runPick");
+    pickRow.hidden = !(DATA && DATA.runs);
+    runs.replaceChildren();
+    if (DATA && DATA.runs) DATA.runs.forEach((run, i) => {
+      const b = html("button", null, "Run " + run.id.toUpperCase(), runs);
+      b.type = "button"; b.id = "run-" + run.id;
+      b.setAttribute("aria-pressed", String(i === pick));
+      b.addEventListener("click", () => { pick = i; R = DATA.runs[i]; draw(); document.getElementById("run-" + run.id).focus(); });
+    });
+    document.getElementById("foot").textContent =
+      "Qwen3-8B with a rank-32 LoRA adapter, policy gradient with a KL penalty to the base model. Each round: training games on the ladder and the probes (Petra 1 to 5, the previous version, and the frontier models: all four in the baseline, then one a round in turn), 30 game-minutes at 2x.";
+  }
+
+  function draw() { if (!R) return; meta(); tiles(); rating(); probes(); mix(); health(); kl(); games(); tables(); }
+
+  fetch("report.json", { cache: "no-store" }).then((r) => {
+    if (!r.ok) throw new Error(`report.json: ${r.status}`);
+    return r.json();
+  }).then((data) => {
+    DATA = data;
+    if (data.runs) { P = data.pooled; R = data.runs[0]; } else { R = data; }
+    draw();
+  }).catch((e) => {
+    document.getElementById("tiles").textContent = "The pilot's report could not be loaded (" + e.message + ").";
+  });
+  let t = null;
+  addEventListener("resize", () => { clearTimeout(t); t = setTimeout(draw, 120); });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+})();
+</script>

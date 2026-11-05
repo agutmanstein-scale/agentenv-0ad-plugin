@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# put-secret.sh litellm-key|rtmp-server|rtmp-key [--yes|--dry-run]
+# put-secret.sh litellm-key|litellm-key-alt|rtmp-server|rtmp-key [--yes|--dry-run]
 # Reads one secret without echoing it and stores it as a SecureString at $LIVE_SSM_PREFIX/<name>. The value travels
 # to aws in a JSON body, never on a command line, and never reaches the terminal, the shell history or a log. The body
 # is a 0600 file in a fresh 0700 temporary folder, removed on exit: the macOS aws CLI reads no JSON from a pipe
 # (file:///dev/stdin arrives empty). rtmp-server is the ingest URL (X Media Studio: Producer, Sources, RTMP: rtmps://<region>.pscp.tv:443/x);
-# rtmp-key is the stream key ("-" when the server URL already holds it).
+# rtmp-key is the stream key ("-" when the server URL already holds it). litellm-key-alt is a second LiteLLM key that
+# only model-check.sh reads, to compare two keys from a box.
 # shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
 parse_mode change "$@"
 set -- "${ARGS[@]+"${ARGS[@]}"}"
-case ${1:-} in litellm-key|rtmp-server|rtmp-key) ;; *) echo "put-secret.sh: litellm-key, rtmp-server or rtmp-key" >&2; usage ;; esac
+case ${1:-} in litellm-key|litellm-key-alt|rtmp-server|rtmp-key) ;; *) echo "put-secret.sh: litellm-key, litellm-key-alt, rtmp-server or rtmp-key" >&2; usage ;; esac
 [ $# -le 1 ] || { echo "unknown argument: $2" >&2; usage; }
 NAME=$SSM_PREFIX/$1
 if [ "$DRY_RUN" = 1 ]; then

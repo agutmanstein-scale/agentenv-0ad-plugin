@@ -26,6 +26,7 @@ class FakeLiteLLM:
         usage: bool = True,
         fail: int | None = None,
         delay_s: float = 0.0,
+        token_ids: bool = False,
     ):
         self.tool_calls = (
             tool_calls if tool_calls is not None else [("set_economy", _split()), ("say", {"text": "Ave"})]
@@ -34,6 +35,7 @@ class FakeLiteLLM:
         self.usage = usage
         self.fail = fail
         self.delay_s = delay_s
+        self.token_ids = token_ids
         self.requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
 
     def http(self) -> httpx.AsyncClient:
@@ -56,6 +58,9 @@ class FakeLiteLLM:
                 for i, (n, a) in enumerate(self.tool_calls)
             ]
             out: dict[str, Any] = {"choices": [{"message": {"content": "Plan.", "tool_calls": calls}}]}
+            if self.token_ids:  # vLLM's return_token_ids
+                out["prompt_token_ids"] = [1, 2, 3]
+                out["choices"][0]["token_ids"] = [7, 8]
             if self.usage:
                 out["usage"] = {"prompt_tokens": 3000, "completion_tokens": 400}
             return httpx.Response(200, json=out)

@@ -13,6 +13,7 @@ def test_prices_are_the_price_map_with_a_margin_and_unknown_models_are_priced_hi
     assert spend.price("anthropic/claude-opus-5-5") == (6.0, 30.0)
     assert spend.price("openai/gpt-6-luna") == pytest.approx((0.15, 0.75))
     assert spend.price("xai/grok-4.7") == spend.DEFAULT_PRICE
+    assert spend.price("local/policy-r3") == (0.0, 0.0)  # served on the box's own GPUs
     assert spend.cost("anthropic/claude-opus-5-5", 1_000_000, 100_000) == pytest.approx(9.0)
 
 

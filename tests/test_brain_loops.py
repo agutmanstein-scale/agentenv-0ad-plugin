@@ -104,6 +104,31 @@ async def test_without_an_urgent_event_the_strategist_calls_on_its_interval():
     assert second - first >= 25.0
 
 
+async def test_on_the_game_clock_the_interval_counts_game_seconds_at_any_speed():
+    clock = Clock()
+    status = lambda t, calls: {"started": True, "over": t >= 60, "game_ms": int(t * 4000), "open": []}  # 4x  # noqa: E731
+    link = FakeLink(clock, status)
+    await commander(FakeLiteLLM(), clock, game_clock=True).play(link)
+    first, second = link.call_times[:2]
+    assert 6.0 <= second - first < 8.0  # 25 game seconds at 4x
+
+
+async def test_a_logged_turn_reports_its_start_the_user_message_its_orders_and_token_ids():
+    clock = Clock()
+    status = lambda t, calls: {"started": True, "over": t >= 10, "game_ms": int(t * 1000), "open": []}  # noqa: E731
+    link = FakeLink(clock, status)
+    c = commander(FakeLiteLLM(token_ids=True, tool_calls=[("army", {"action": "defend"})]), clock, log_turns=True)
+    await c.play(link)
+    turn = link.reports[0]["turn"]
+    assert turn["began_ms"] == 0 and "Decide your orders now" in turn["user"] and turn["urgent"] is False
+    assert turn["orders"] == [{"tool": "army", "arguments": {"action": "defend"}, "status": "accepted"}]
+    assert turn["prompt_token_ids"] == [1, 2, 3] and turn["token_ids"] == [7, 8]
+    unlogged = Clock()
+    link = FakeLink(unlogged, status)
+    await commander(FakeLiteLLM(), unlogged).play(link)
+    assert link.reports[0].get("turn") is None  # SeatLink drops a None extra from the body
+
+
 async def test_a_defeated_seats_strategist_stops_calling_its_model_and_waits_out_the_match():
     clock = Clock()
     link = FakeLink(clock, lambda t, calls: {"started": True, "over": t >= 300, "defeated": t >= 30, "open": []})

@@ -9,7 +9,7 @@ bound. Each call can be appended to a JSON-lines spend log, `{"what", "model", "
 
 Prices are deliberately conservative (spec §3: the runner stops before passing the cap): LiteLLM's public price map
 (2026-10, as in agentenv-airops-plugin) with a 1.5x margin, and any model not listed at a high default, so an estimate
-errs high. The loop's ledger (`spend.jsonl`, one `{"what", "usd_est"}` per line) is checked with `check_budget` before
+errs high. A model named `local/...` is one this box serves itself (vLLM on its own GPUs) and costs nothing. The loop's ledger (`spend.jsonl`, one `{"what", "usd_est"}` per line) is checked with `check_budget` before
 a paid run and appended with `append_ledger` after it.
 """
 
@@ -35,10 +35,13 @@ BASE_PRICES = {  # USD per 1M tokens (input, output), LiteLLM public price map 2
 }
 DEFAULT_PRICE = (15.00, 75.00)  # anything else (Gemini, Grok, new ids): a frontier upper bound
 PRICES = {model: (i * MARGIN, o * MARGIN) for model, (i, o) in BASE_PRICES.items()}
+LOCAL_PREFIX = "local/"
 
 
 def price(model: str) -> tuple[float, float]:
-    """(input, output) USD per 1M tokens for `model`; unknown models at `DEFAULT_PRICE`."""
+    """(input, output) USD per 1M tokens for `model`; a `local/` model is free, unknown models at `DEFAULT_PRICE`."""
+    if model.startswith(LOCAL_PREFIX):
+        return (0.0, 0.0)
     return PRICES.get(model, DEFAULT_PRICE)
 
 

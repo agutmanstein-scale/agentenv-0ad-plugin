@@ -1,6 +1,7 @@
 """One live 0 A.D. match: the engine, its wall-clock schedule, every seat's executor, the bots, and how it ends.
 
-The clock (U1) steps the engine on its own 200 ms / speed schedule. Beside it, one loop ticks once a wall second:
+The clock (U1) steps the engine on its own 200 ms / speed schedule. Beside it, one loop ticks every `tick_s` (the env
+sets one game second: a wall second over the speed):
 it reads the executor view and the fog-limited snapshot (U2), ticks each agent and bot seat's executor (U3), lets
 the bots read their snapshot and give orders, feeds the metrics and event trackers, and checks the end. Brains never
 touch this loop: their MCP tool calls only put orders in a seat's book (`submit`) or read the latest snapshot
@@ -76,6 +77,8 @@ SeatKind = Literal["agent", "bot", "petra"]
 TICK_S = 1.0
 MAX_FAILED_TICKS = 30
 TOOL_LOG_LIMIT = 2000
+TIMELINE_EVERY_MS = 10_000  # results' timeline: every player's score and essentials this often (game time)
+TURNS_KEPT = 1000  # logged brain turns a seat keeps for results (a 12-hour match at 25 s is under 1,800)
 REFLEX_RECENT = 3  # reflex and autopilot actions the strategist's brief lists
 ACTIONS_KEPT = 500
 HOLD_REPEAT_MS = 30_000  # a held default is carried out at most this often per decision
@@ -169,6 +172,7 @@ class SeatState:
     action_counts: Counter[str] = field(default_factory=Counter)
     holds: dict[str, int] = field(default_factory=dict)  # decision -> game ms of the last held default carried out
     thinking_since: float | None = None
+    turns: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def brain_is_luna(self) -> bool:
@@ -264,6 +268,7 @@ class LiveMatch:
         self.started_wall: float | None = None
         self.ended_wall: float | None = None
         self.ticks = 0
+        self.timeline: list[dict[str, Any]] = []
         self.tick_errors = 0
         self.failed_ticks = 0
         self.files: dict[str, Path] = {}
@@ -429,6 +434,7 @@ class LiveMatch:
         self.snapshot = snap
         outcome = await self.engine.evaluate(js("outcome.js"))
         self._read_outcome(outcome or {})
+        self._sample_timeline(snap)
         self.ticks += 1
         self._check_end(snap.time_ms)
 
@@ -443,6 +449,31 @@ class LiveMatch:
         for seat in self.seats.values():
             if seat.executor is not None:
                 seat.executor.fallen = fallen
+
+    def _sample_timeline(self, snap: Snapshot) -> None:
+        """Every `TIMELINE_EVERY_MS` of game time, each player's engine score and essentials (no fog: the whole
+        match as the observer sees it, for training's value estimate and the progress plots, never for a brain)."""
+        if self.timeline and snap.time_ms - self.timeline[-1]["t_ms"] < TIMELINE_EVERY_MS:
+            return
+        players = {}
+        for slot, seat in self.seats.items():
+            me = snap.players.get(seat.plan.player)
+            row: dict[str, Any] = {"state": self.states.get(slot), **self.scores.get(slot, {})}
+            if me is not None:
+                row |= {
+                    "pop": me.pop,
+                    "pop_cap": me.pop_cap,
+                    "army": me.army,
+                    "gatherers": sum(me.gatherers.values()),
+                    "resources": sum(me.resources.values()),
+                    "phase": me.phase,
+                    "buildings": len(me.buildings),
+                    "kills": int(me.stats.get("enemy_units_killed", 0)),
+                    "lost": int(me.stats.get("units_lost", 0)),
+                    "buildings_lost": int(me.stats.get("buildings_lost", 0)),
+                }
+            players[slot] = row
+        self.timeline.append({"t_ms": snap.time_ms, "players": players})
 
     def _check_end(self, time_ms: int) -> None:
         if self.over:
@@ -601,9 +632,12 @@ class LiveMatch:
         usd: float | None = None,
         tokens: tuple[int, int] | None = None,
         model: str | None = None,
+        turn: Mapping[str, Any] | None = None,
     ) -> None:
         seat = self.seats[slot]
         seat.brain_calls.append(call)
+        if turn is not None and len(seat.turns) < TURNS_KEPT:
+            seat.turns.append({**turn, "reported_ms": call.game_ms, "seconds": call.seconds, "model": model})
         seat.thinking_since = None
         metrics = self.metrics.seats[seat.plan.player]
         metrics.record_decision(call.seconds, missed=call.missed)
@@ -770,6 +804,7 @@ class LiveMatch:
                     "brain": dict(seat.brain_spend),
                     **({"reflex": seat.reflex_guard.summary()} if seat.reflex_guard is not None else {}),
                 },
+                **({"turns": seat.turns} if seat.turns else {}),
             }
         return {
             "status": "failed" if self.failed else "finished" if self.outcomes is not None else "cancelled",
@@ -787,6 +822,7 @@ class LiveMatch:
             "spend_usd_est": round(results_spend({"seats": seats}), 6),
             "rendered": self.broadcast is not None,
             "seats": seats,
+            "timeline": self.timeline,
         }
 
 
