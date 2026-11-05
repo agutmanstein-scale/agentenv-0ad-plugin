@@ -8,7 +8,8 @@
 - `front`: further toward the nearest enemy, as far forward as own territory allows.
 
 Economy floor: a field or a storehouse is what keeps villagers working, so when the search above finds nothing,
-`fallback_searches` widens it before the executor gives up: rings at 15, 25 and 35 m around the farmstead or civic
+`fallback_searches` widens it before the executor gives up (for a field whatever its `where`, for a storehouse placed
+`near_<resource>`, which is what anchors it): rings at 15, 25 and 35 m around the farmstead or civic
 centre (fields) or the resource site (storehouses), then any free tile within 60 m.
 
 Enemy bases are what the seat has seen (enemy structures in its fog-limited snapshot); until it has seen one, the
@@ -178,12 +179,12 @@ def search_for(seat: SeatView, where: str, enemy_bases: Mapping[int, Pos]) -> Se
 
 def fallback_searches(seat: SeatView, where: str, kind: str) -> tuple[Search, ...]:
     """The wider searches to try, in order, after the normal one for `where` found no spot (empty for anything but a
-    field or a storehouse placed `near_<resource>`).
+    field, wherever it was asked for, or a storehouse placed `near_<resource>`).
 
     A field anchors on the own farmstead nearest the civic centre, else the civic centre; a storehouse on the
     resource's site, else the civic centre. The rings keep the corridor spacing; the last search takes any free tile
     within `FALLBACK_ANY_WITHIN` m (no spacing), so a cramped base still gets its field."""
-    if kind not in FALLBACK_KINDS or seat.base is None or not where.startswith("near_"):
+    if kind not in FALLBACK_KINDS or seat.base is None or (kind != "Field" and not where.startswith("near_")):
         return ()
     base = seat.base
     anchors: list[Pos] = []

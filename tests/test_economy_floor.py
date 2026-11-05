@@ -80,8 +80,15 @@ def test_a_storehouse_falls_back_to_rings_around_the_resource_site_then_the_civi
         assert (rings.anchors[0], rings.anchors[-1]) == (site, seat.base) and anywhere.max_r == 60.0
 
 
+@pytest.mark.parametrize("where", ["base", "front", "toward_player_2", "near_food", "near_wood"])
+def test_a_field_falls_back_whatever_place_it_was_asked_for(where):
+    seat, _ = load(300)
+    assert len(fallback_searches(seat, where, "Field")) == 2
+
+
 @pytest.mark.parametrize(
-    ("where", "kind"), [("base", "Field"), ("near_food", "House"), ("front", "Storehouse"), ("near_wood", "Barracks")]
+    ("where", "kind"),
+    [("near_food", "House"), ("front", "Storehouse"), ("base", "Storehouse"), ("near_wood", "Barracks")],
 )
 def test_other_buildings_and_places_get_no_fallback(where, kind):
     seat, _ = load(300)

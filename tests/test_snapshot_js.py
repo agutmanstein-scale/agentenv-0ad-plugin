@@ -39,7 +39,10 @@ function component(e, iid) {
     case "Identity": return { GetClassesList: () => e.classes };
     case "Position": return { IsInWorld: () => true, GetPosition2D: () => ({ x: e.pos[0], y: e.pos[1] }) };
     case "Foundation": return e.foundation ? {} : null;
-    case "Cost": return e.cost ? { GetResourceCosts: owner => (owner === e.owner ? e.cost : { food: 99999 }) } : null;
+    case "Cost": return e.cost ? { GetResourceCosts: owner => {
+      if (e.cost_throws) throw new Error("GetResourceCosts: no such cost");
+      return owner === e.owner ? e.cost : { food: 99999 };
+    } } : null;
     default: return null;
   }
 }
@@ -83,9 +86,9 @@ WORLD = {
 }  # fmt: skip
 
 
-def run_snapshot() -> Snapshot:
+def run_snapshot(world: dict | None = None) -> Snapshot:
     code = snapshot_js([1]).strip().rstrip(";")
-    script = HARNESS.replace("__WORLD__", json.dumps(WORLD)).replace("__SNAPSHOT__", code)
+    script = HARNESS.replace("__WORLD__", json.dumps(world or WORLD)).replace("__SNAPSHOT__", code)
     out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=True).stdout
     return Snapshot.from_json(json.loads(out))
 
@@ -109,3 +112,11 @@ def test_net_worth_is_the_cost_of_living_units_and_finished_structures_plus_the_
     structures = 1500 + 150  # the civic centre and a house; the barracks foundation and the Gaia entity add nothing
     bank = 120 + 80 + 0 + 5
     assert me.net_worth == units + structures + bank == 2005
+
+
+def test_a_cost_the_engine_cannot_answer_drops_the_net_worth_and_keeps_the_snapshot():
+    world = json.loads(json.dumps(WORLD))
+    world["entities"][1]["cost_throws"] = True
+    me = run_snapshot(world).players[1]
+    assert me.net_worth is None
+    assert len(me.buildings) == 3 and me.units["villager"] == 1

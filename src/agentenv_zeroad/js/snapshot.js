@@ -55,12 +55,17 @@
     if (tm.IsTechnologyResearched("phase_village")) return "village";
     return "";
   }
-  // What an entity cost to make (food + wood + stone + metal) at the owner's current tech modifiers.
+  // What an entity cost to make (food + wood + stone + metal) at the owner's current tech modifiers. null when the
+  // engine's Cost interface does not answer as expected: the net worth is then left out instead of failing the snapshot.
   function worth(ent, p) {
-    const cost = Engine.QueryInterface(ent, IID_Cost);
-    if (!cost) return 0;
-    const c = cost.GetResourceCosts(p);
-    return RES.reduce((sum, r) => sum + (c[r] || 0), 0);
+    try {
+      const cost = Engine.QueryInterface(ent, IID_Cost);
+      if (!cost) return 0;
+      const c = cost.GetResourceCosts(p);
+      return RES.reduce((sum, r) => sum + (c[r] || 0), 0);
+    } catch (e) {
+      return null;
+    }
   }
   function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
 
@@ -109,6 +114,11 @@
     const bases = [];
     const mySoldiers = [];
     let netWorth = 0;
+    let worthKnown = true;
+    function addWorth(ent) {
+      const w = worth(ent, p);
+      if (w === null) worthKnown = false; else netWorth += w;
+    }
     for (const ent of owned[p]) {
       const cls = info(ent);
       if (!cls) continue;
@@ -124,11 +134,11 @@
           if (trains && b.queue === 0 && b.kind !== "House") me.idle_production.push(ent);
         }
         me.buildings.push(b);
-        if (!found) netWorth += worth(ent, p);
+        if (!found) addWorth(ent);
         if (!found && at && (b.kind === "CivCentre" || b.kind === "Fortress")) bases.push(at);
       } else if (cls.indexOf("Unit") !== -1) {
         const rl = role(cls);
-        netWorth += worth(ent, p);
+        addWorth(ent);
         me.units[rl] = (me.units[rl] || 0) + 1;
         if (at && rl !== "villager" && rl !== "other") mySoldiers.push(at);
         const ai = Engine.QueryInterface(ent, IID_UnitAI);
@@ -140,7 +150,7 @@
     }
     // Net worth decides a time-capped match under the "net_worth" score rule: living units and finished structures at
     // their cost, plus what is banked. Foundations are not counted until they are built.
-    me.net_worth = r1(netWorth + RES.reduce((sum, r) => sum + me.resources[r], 0));
+    me.net_worth = worthKnown ? r1(netWorth + RES.reduce((sum, r) => sum + me.resources[r], 0)) : null;
     if (!bases.length) for (const b of me.buildings) if (b.pos && !b.foundation) { bases.push(b.pos); break; }
     me.base = bases.length ? bases[0] : null;
     // Resources left near each base: what "resource exhausted near base" events read.
