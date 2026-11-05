@@ -60,8 +60,8 @@ def results(
     }
 
 
-def game(tmp_path: Path, game_id: str, **kwargs) -> Game:
-    path = tmp_path / "rounds" / "r00" / "games" / game_id / "@local" / "zeroad-lb-x-results.json"
+def game(tmp_path: Path, game_id: str, box="a", run="pilot", **kwargs) -> Game:
+    path = tmp_path / box / run / "rounds" / "r00" / "games" / game_id / "@local" / "zeroad-lb-x-results.json"
     return Game(path, results(**kwargs))
 
 
@@ -78,12 +78,13 @@ def test_the_opponent_is_petras_recorded_level_else_the_rounds_logs_else_the_gam
     assert game(tmp_path, "g1", level=3).opponent == "petra-3"
     assert game(tmp_path, "r00-p-petra-2").opponent == "petra-2"
     assert game(tmp_path, "r00-t01").opponent == "petra"
-    (tmp_path / "rounds" / "r00").mkdir(parents=True)
-    (tmp_path / "rounds" / "r00" / "specs.json").write_text(
+    run = tmp_path / "a" / "pilot"
+    (run / "rounds" / "r00").mkdir(parents=True)
+    (run / "rounds" / "r00" / "specs.json").write_text(
         json.dumps([{"game_id": "r00-t01", "opponent": {"kind": "petra", "level": 4}}])
     )
     assert game(tmp_path, "r00-t01").opponent == "petra-4"
-    (tmp_path / "games.jsonl").write_text(json.dumps({"game_id": "r00-t02", "opponent": "petra-5"}) + "\n")
+    (run / "games.jsonl").write_text(json.dumps({"game_id": "r00-t02", "opponent": "petra-5"}) + "\n")
     assert game(tmp_path, "r00-t02").opponent == "petra-5"
 
 
@@ -108,10 +109,21 @@ def test_games_are_picked_by_version_and_turns_and_spread_over_opponents(tmp_pat
 
 def test_a_replay_spec_has_the_seats_orders_and_how_to_set_the_game_up_again(tmp_path):
     spec = replay_spec(game(tmp_path, "r00-t05", level=2), delay_ms=5_000)
-    assert (spec.source, spec.slot, spec.delay_ms) == ("r00-t05", "1", 5_000) and len(spec.orders) == 20
+    assert (spec.source, spec.slot, spec.delay_ms) == ("a-pilot-r00-t05", "1", 5_000) and len(spec.orders) == 20
     assert spec.game["map"] == {"name": "mainland", "size": 128, "seed": 9} and spec.game["opponent"] == "petra-2"
     assert spec.game["seats"]["2"]["kind"] == "petra"
     assert ReplaySpec.from_json(json.loads(json.dumps(spec.to_json()))) == spec
+
+
+def test_games_that_share_an_id_across_boxes_and_runs_get_distinct_spec_ids(tmp_path):
+    same = [
+        game(tmp_path, "r00-t02", box=b, run=r, level=2)
+        for b, r in (("a", "pilot-1"), ("b", "pilot-1"), ("c", "pilot-solo"))
+    ]
+    ids = [g.unique_id for g in same]
+    assert ids == ["a-pilot-1-r00-t02", "b-pilot-1-r00-t02", "c-pilot-solo-r00-t02"]
+    assert {replay_spec(g).source for g in same} == set(ids)
+    assert Game(tmp_path / "x-results.json", results()).unique_id == "x-results"
 
 
 def test_the_metrics_read_failures_timeline_and_idle_production(tmp_path):
@@ -147,20 +159,50 @@ def test_the_summary_has_a_column_per_seat_kind_and_interface_and_a_win_rate_per
     assert next(ln for ln in text.splitlines() if ln.strip().startswith("petra-3")).split()[-1] == "(0/1)"
 
 
+def write_pilot_game(root: Path, box: str, run: str, game_id: str, **kwargs) -> None:
+    folder = root / box / run / "rounds" / "r00" / "games" / game_id / "@local"
+    folder.mkdir(parents=True)
+    (folder / "zeroad-lb-x-results.json").write_text(json.dumps(results(**kwargs)))
+
+
 def test_the_two_scripts_write_specs_and_print_the_summary(tmp_path, capsys):
-    root = tmp_path / "pilot" / "rounds" / "r00" / "games" / "r00-t01" / "@local"
-    root.mkdir(parents=True)
-    (root / "zeroad-lb-x-results.json").write_text(json.dumps(results(level=1)))
+    pilot = tmp_path / "pilot"
+    write_pilot_game(pilot, "a", "pilot-1", "r00-t01", level=1)
     specs = load_script("s1_specs")
-    assert (
-        specs.main([str(tmp_path / "pilot"), "--out", str(tmp_path / "specs"), "--n", "3", "--delay-ms", "5000"]) == 0
-    )
-    assert "r00-t01" in capsys.readouterr().out
-    index = json.loads((tmp_path / "specs" / "index.json").read_text())
-    assert index == [{"game_id": "r00-t01", "opponent": "petra-1", "slot": "1", "orders": 20}]
-    assert ReplaySpec.load(tmp_path / "specs" / "r00-t01.json").delay_ms == 5000
+    out = tmp_path / "specs"
+    assert specs.main([str(pilot), "--out", str(out), "--n", "3", "--delay-ms", "5000"]) == 0
+    assert "a-pilot-1-r00-t01" in capsys.readouterr().out
+    index = json.loads((out / "index.json").read_text())
+    assert index == [
+        {"id": "a-pilot-1-r00-t01", "game_id": "r00-t01", "opponent": "petra-1", "slot": "1", "orders": 20}
+    ]
+    spec = ReplaySpec.load(out / "a-pilot-1-r00-t01.json")
+    assert spec.delay_ms == 5000 and spec.source == "a-pilot-1-r00-t01"
     summary = load_script("s1_summary")
-    assert summary.main([str(tmp_path / "pilot")]) == 0
+    assert summary.main([str(pilot)]) == 0
     assert "agent/v1 (1 games)" in capsys.readouterr().out
     assert summary.main([str(tmp_path / "nothing")]) == 1
-    assert len(list(load_games(tmp_path / "pilot"))) == 1
+    assert len(list(load_games(pilot))) == 1
+
+
+def test_specs_of_games_sharing_an_id_each_keep_their_own_file_and_an_existing_spec_is_never_overwritten(
+    tmp_path, capsys
+):
+    pilot = tmp_path / "pilot"
+    for box, level in (("a", 1), ("b", 2), ("c", 3)):
+        write_pilot_game(pilot, box, "pilot-1", "r00-t02", level=level)
+    specs = load_script("s1_specs")
+    out = tmp_path / "specs"
+    assert specs.main([str(pilot), "--out", str(out), "--n", "3"]) == 0
+    index = json.loads((out / "index.json").read_text())
+    assert sorted(r["id"] for r in index) == ["a-pilot-1-r00-t02", "b-pilot-1-r00-t02", "c-pilot-1-r00-t02"]
+    assert sorted(p.name for p in out.glob("*-r00-t02.json")) == [
+        f"{r['id']}.json" for r in sorted(index, key=lambda r: r["id"])
+    ]
+    for row in index:
+        assert ReplaySpec.load(out / f"{row['id']}.json").source == row["id"]
+    before = (out / "a-pilot-1-r00-t02.json").read_text()
+    capsys.readouterr()
+    assert specs.main([str(pilot), "--out", str(out), "--n", "3"]) == 1
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert (out / "a-pilot-1-r00-t02.json").read_text() == before

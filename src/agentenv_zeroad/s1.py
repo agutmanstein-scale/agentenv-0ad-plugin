@@ -12,8 +12,8 @@ file), else from the game id (`r00-p-petra-2`).
 The metrics are the S1 gate's: field placement failures per game, villagers at 15 minutes, idle production buildings
 (the mean count over the game), the minute the town phase is reached, the median army at 10 and 15 minutes, and the win
 rate by opponent. They are read from the results the match writes: the focus seat's `failures` and `metrics`, and the
-timeline rows (`villagers` and `idle_production` where the match recorded them, else population minus army for
-villagers).
+timeline rows (`villagers` where the match recorded them, else population minus army); the idle production buildings
+are the seat's `idle_production_s` over the game's length, which is their mean count.
 """
 
 from __future__ import annotations
@@ -47,6 +47,19 @@ class Game:
         """The pilot's game id (the folder under `games/`), else the results file's stem."""
         parts = self.path.parts
         return parts[parts.index("games") + 1] if "games" in parts else self.path.stem
+
+    @property
+    def unique_id(self) -> str:
+        """`<box>-<run>-<game id>`: the two folders above `rounds/` and the game id, since the pilot reuses game ids
+        across its boxes and runs. A path without that layout is its own game id."""
+        parts = self.path.parts
+        if "games" not in parts:
+            return self.game_id
+        above = parts[: parts.index("games")]
+        if "rounds" not in above:
+            return self.game_id
+        runs = above[: len(above) - 1 - above[::-1].index("rounds")]
+        return "-".join((*runs[-2:], self.game_id))
 
     @property
     def focus(self) -> str | None:
@@ -148,7 +161,7 @@ def replay_spec(game: Game, *, delay_ms: int = 0) -> ReplaySpec:
         "opponent": game.opponent,
         "seats": seats,
     }
-    return ReplaySpec.from_results(results, game.focus, source=game.game_id, delay_ms=delay_ms, game=setup)
+    return ReplaySpec.from_results(results, game.focus, source=game.unique_id, delay_ms=delay_ms, game=setup)
 
 
 @dataclass(frozen=True)
@@ -194,11 +207,7 @@ def game_metrics(game: Game) -> GameMetrics | None:
         group=game.group,
         opponent=game.opponent,
         points={"won": 1.0, "drawn": 0.5, "lost": 0.0}.get(outcome),
-        field_failures=sum(
-            1
-            for f in seat.get("failures", ())
-            if f.get("key") == "field" and str(f.get("reason", "")).startswith("no valid")
-        ),
+        field_failures=sum(1 for f in seat.get("failures", ()) if _is_field_placement_failure(f)),
         villagers_15=None if at15 is None else int(at15.get("villagers", at15.get("pop", 0) - at15.get("army", 0))),
         idle_production=None if idle_s is None or not match_s else idle_s / match_s,
         town_minute=town,

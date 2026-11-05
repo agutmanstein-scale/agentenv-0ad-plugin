@@ -4,8 +4,10 @@
 
 Reads the pilot's results.json files under ROOT and picks N games of policy `--version` (the base model is 0; `any`
 takes every version) whose policy seat logged at least `--min-turns` turns, spread over the opponents. For each it
-writes `DIR/<game_id>.json`, a replay spec (`agentenv_zeroad.replay.ReplaySpec`): the seat's logged orders with their
-game times, and the settings of the game they came from. An `index.json` beside them lists what was picked.
+writes `DIR/<id>.json`, a replay spec (`agentenv_zeroad.replay.ReplaySpec`): the seat's logged orders with their
+game times, and the settings of the game they came from. The id is `<box>-<run>-<game id>` (the pilot reuses game ids
+across boxes and runs), and it is the spec's `source`. An `index.json` beside them lists what was picked. A spec that
+already exists, or an id picked twice, stops the script before it writes anything.
 
 To run S1, play each spec as a `replay` seat (lobby slot `controller: "replay"`, `replay_spec: <path>`) once per
 interface (`interface: "v1"` and `"v2"`) in the game it came from, then compare the results with `s1_summary.py`.
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from agentenv_zeroad.s1 import load_games, pick_games, replay_spec
@@ -35,18 +38,29 @@ def main(argv: list[str] | None = None) -> int:
         list(load_games(Path(args.root))), args.n, version=version, min_turns=args.min_turns, seed=args.seed
     )
     out = Path(args.out)
+    ids = [g.unique_id for g in games]
+    clashes = sorted({i for i in ids if ids.count(i) > 1 or (out / f"{i}.json").exists()})
+    if clashes:
+        print(f"refusing to overwrite or repeat {', '.join(clashes)} in {out}", file=sys.stderr)
+        return 1
     out.mkdir(parents=True, exist_ok=True)
     index = []
     for game in games:
         spec = replay_spec(game, delay_ms=args.delay_ms)
-        (out / f"{game.game_id}.json").write_text(json.dumps(spec.to_json(), indent=1))
+        (out / f"{game.unique_id}.json").write_text(json.dumps(spec.to_json(), indent=1))
         index.append(
-            {"game_id": game.game_id, "opponent": game.opponent, "slot": spec.slot, "orders": len(spec.orders)}
+            {
+                "id": game.unique_id,
+                "game_id": game.game_id,
+                "opponent": game.opponent,
+                "slot": spec.slot,
+                "orders": len(spec.orders),
+            }
         )
     (out / "index.json").write_text(json.dumps(index, indent=1))
     print(f"wrote {len(index)} replay specs to {out}")
     for row in index:
-        print(f"  {row['game_id']:<20} vs {row['opponent']:<10} seat {row['slot']} {row['orders']} orders")
+        print(f"  {row['id']:<40} vs {row['opponent']:<10} seat {row['slot']} {row['orders']} orders")
     return 0
 
 
