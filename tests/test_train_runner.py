@@ -76,6 +76,8 @@ def test_an_llm_seat_plays_v2_unless_it_asks_for_v1_and_the_score_rule_follows_i
     assert GameSpec.from_json(json.loads(json.dumps(spec.to_json()))) == spec
     with pytest.raises(ValueError, match="contradicts the agents' prompt"):
         GameSpec.from_json(spec_json(score_rule="official"))
+    with pytest.raises(ValueError, match="a petra seat has no orders to shape"):
+        GameSpec.from_json(spec_json(seats=[QWEN, {"kind": "petra", "civ": "pers", "interface": "v2"}]))
     with pytest.raises(ValueError, match="interface must be one of v1, v2"):
         GameSpec.from_json(spec_json(seats=[{**QWEN, "interface": "v9"}, {"kind": "bot", "civ": "cart"}]))
 

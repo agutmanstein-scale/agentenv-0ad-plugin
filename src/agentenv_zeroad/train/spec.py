@@ -88,6 +88,8 @@ class SeatSpec:
             object.__setattr__(self, "interface", LLM_INTERFACE if self.kind == "llm" else "v1")
         elif self.interface not in INTERFACES:
             raise ValueError(f"interface must be one of {', '.join(INTERFACES)}, not {self.interface!r}")
+        if self.kind == "petra" and self.interface != "v1":
+            raise ValueError(f"a petra seat has no orders to shape: its interface is v1, not {self.interface!r}")
 
     def to_json(self) -> dict[str, Any]:
         """The seat as a spec line has it (no secrets: only the key's variable name)."""
