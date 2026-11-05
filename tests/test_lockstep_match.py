@@ -210,3 +210,15 @@ async def test_live_play_publishes_the_snapshot_after_the_trackers_ran_on_it_and
     spy(lock, "lock")
     await lock._act(view)
     assert seen["lock"] is False
+
+
+async def test_an_in_process_army_order_with_explicit_default_waves_is_recorded_like_an_unset_one(tmp_path):
+    match = make(tmp_path)
+    await match.setup()
+    link = InProcessSeatLink(match, "1", await tool_specs())
+    explicit = {"action": "attack", "target": "player_2", "min_size": 8, "regroup_below": 0.4}
+    await link.call("army", {"action": "attack", "target": "player_2"})
+    unset = [a.what for a in match.seats["1"].actions]
+    await link.call("army", explicit)
+    both = [a.what for a in match.seats["1"].actions]
+    assert both[0] == both[1] == unset[0] and "min_size" not in both[1]
