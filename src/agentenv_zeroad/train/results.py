@@ -93,6 +93,11 @@ def behaviour(results: Mapping[str, Any], slot: str) -> str | None:
     return (spec_seats(results).get(slot) or {}).get("behaviour")
 
 
+def is_field_placement_failure(failure: Mapping[str, Any]) -> bool:
+    """A recorded executor give-up on a farm field with no valid spot (the rule `s1.py` counts them by)."""
+    return failure.get("key") == "field" and str(failure.get("reason", "")).startswith("no valid spot")
+
+
 NET_WORTH_STALE_MAX = 5  # a net worth carried over more than this many reads at the game's end is not trusted
 
 

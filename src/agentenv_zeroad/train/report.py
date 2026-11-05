@@ -226,6 +226,7 @@ def _tally(game: Played, results: Mapping[str, Any], slot: str) -> None:
     m["kills"] = _number(combat.get("enemy_units_killed"))
     m["lost"] = _number(combat.get("units_lost"))
     m["kills_home"], m["kills_away"] = _number(combat.get("kills_home")), _number(combat.get("kills_away"))
+    m["field_failures"] = float(sum(rs.is_field_placement_failure(f) for f in seat.get("failures") or []))
     game.metrics = m
     for turn in seat.get("turns") or []:
         game.turns += 1

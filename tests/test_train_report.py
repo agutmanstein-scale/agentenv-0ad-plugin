@@ -125,6 +125,24 @@ def test_behaviour_by_hour_reads_army_waves_holds_tools_and_rejections(tmp_path)
     assert report["behaviour"]["overall"]["games"] == 3
 
 
+def test_behaviour_counts_kills_at_home_and_away_and_failed_field_placements_per_game(tmp_path):
+    games = tmp_path / "games"
+    games.mkdir()
+    r = save(games, "k1", T0 + 60, model_1="local/policy-v1", turns={"1": [turn(0, model="local/policy-v1")]})
+    seat = r["seats"]["1"]
+    seat["combat"] = {"enemy_units_killed": 9, "units_lost": 3, "kills_home": 4, "kills_away": 5}
+    seat["failures"] = [
+        {"key": "field", "reason": "no valid spot near the farmstead"},
+        {"key": "field", "reason": "no valid spot near the town centre"},
+        {"key": "field", "reason": "not enough wood"},
+        {"key": "house", "reason": "no valid spot"},
+    ]
+    (games / "k1" / "results.json").write_text(json.dumps(r))
+    played, _ = R.read_games(games, None)
+    m = played[0].metrics
+    assert (m["kills_home"], m["kills_away"], m["field_failures"]) == (4.0, 5.0, 2.0)
+
+
 def test_a_game_that_ended_before_a_minute_has_no_army_for_it(tmp_path):
     games = tmp_path / "games"
     games.mkdir()
