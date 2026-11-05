@@ -1158,6 +1158,20 @@ def test_a_fallback_type_with_no_rate_is_refused_before_anything_is_launched(stu
     assert not any("run-instances" in c["argv"] for c in aws_calls(stubs))
 
 
+def test_a_stream_box_without_rates_still_falls_back_at_its_default_rate_and_warns(stubs):
+    env = {"LIVE_GPU_TYPES": "g6.4xlarge gr6.4xlarge"}  # the stream settings: no LIVE_GPU_RATES, no LIVE_REQUIRE_RATE
+    rules = launch_rules(
+        ["run-instances&&g6.4xlarge", "", 254], ["run-instances&&gr6.4xlarge", "i-00000000000000003\n", 0]
+    )
+    out = run(stubs, "launch.sh", "--yes", extra={"STUB_AWS_RULES": rules, **env})
+    assert out.returncode == 0, out.stderr
+    runs = [c["argv"] for c in aws_calls(stubs) if "run-instances" in c["argv"]]
+    tags = runs[-1][runs[-1].index("--tag-specifications") + 1]
+    assert (
+        "Key=zeroad-box-usd-per-hour,Value=1.32" in tags and "no rate for gr6.4xlarge in LIVE_GPU_RATES" in out.stderr
+    )
+
+
 def test_the_power_off_is_armed_on_every_boot_from_the_launch_deadline(stubs, tmp_path):
     out = run(stubs, "launch.sh", "--max-hours", "12", forbid_aws=True)
     script = base64.b64decode(re.search(r"--user-data (\S+)", out.stderr).group(1)).decode()

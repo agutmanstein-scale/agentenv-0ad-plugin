@@ -105,9 +105,9 @@ box_conf() {
   cat <<EOF
 # /etc/zeroad-live.conf: written by live/bootstrap.sh from live/live.env. No secrets: keys stay in SSM.
 AWS_DEFAULT_REGION=$AWS_REGION
-ZEROAD_SSM_LITELLM_KEY=$SSM_PREFIX/litellm-key
-ZEROAD_SSM_RTMP_SERVER=$SSM_PREFIX/rtmp-server
-ZEROAD_SSM_RTMP_KEY=$SSM_PREFIX/rtmp-key
+ZEROAD_SSM_LITELLM_KEY=${SSM_PREFIX:-/zeroad-live}/litellm-key
+ZEROAD_SSM_RTMP_SERVER=${SSM_PREFIX:-/zeroad-live}/rtmp-server
+ZEROAD_SSM_RTMP_KEY=${SSM_PREFIX:-/zeroad-live}/rtmp-key
 LITELLM_BASE_URL=${LIVE_LITELLM_BASE_URL:-}
 LITELLM_ALT_BASE_URL=${LIVE_LITELLM_ALT_BASE_URL:-}
 ZEROAD_BOX_USD_PER_HOUR=$RATE

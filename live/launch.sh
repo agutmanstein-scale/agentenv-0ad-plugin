@@ -41,14 +41,21 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 [ -n "$SUBNETS" ] || die "set LIVE_SUBNETS in $LIVE_ENV"
 need LIVE_SECURITY_GROUP LIVE_INSTANCE_PROFILE
-# rate_for TYPE: its price in LIVE_GPU_RATES, or LIVE_BOX_USD_PER_HOUR for the first type; nothing for a fallback without one.
+# rate_for TYPE: its price in LIVE_GPU_RATES, or LIVE_BOX_USD_PER_HOUR for the first type. A fallback with no price is
+# refused (nothing printed) when LIVE_REQUIRE_RATE=1, a training box, whose types cost several times each other; the
+# stream box keeps LIVE_BOX_USD_PER_HOUR for it and the launch warns.
 rate_for() {
   local pair
   for pair in ${LIVE_GPU_RATES:-}; do
     if [ "${pair%%=*}" = "$1" ]; then echo "${pair#*=}"; return 0; fi
   done
-  if [ "$1" = "${TYPES%% *}" ]; then echo "$RATE"; fi
+  if [ "$1" = "${TYPES%% *}" ] || [ "${LIVE_REQUIRE_RATE:-0}" != 1 ]; then echo "$RATE"; fi
   return 0
+}
+priced_at_default() { # TYPE: a fallback type with no entry in LIVE_GPU_RATES
+  local pair
+  [ "$1" != "${TYPES%% *}" ] || return 1
+  for pair in ${LIVE_GPU_RATES:-}; do [ "${pair%%=*}" != "$1" ] || return 1; done
 }
 for t in $TYPES; do
   [ -n "$(rate_for "$t")" ] || die "no rate for the fallback type $t: add $t=USD_PER_HOUR to LIVE_GPU_RATES in $LIVE_ENV (a box is never priced at another type's rate)"
@@ -90,7 +97,9 @@ BOOTHOOK
           --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" \
           --query 'Instances[0].InstanceId' --output text); then
         log "launched $id ($t in $s at \$$trate/h, $ROOT_GB GB root, powers off ($SHUTDOWN) after $MAX_HOURS h)"
-        if [ "$trate" != "$RATE" ]; then
+        if priced_at_default "$t"; then
+          log "WARNING: no rate for $t in LIVE_GPU_RATES: it is priced at the \$$RATE/h of LIVE_BOX_USD_PER_HOUR, which may not be its cost"
+        elif [ "$trate" != "$RATE" ]; then
           log "WARNING: $t costs \$$trate/h, not the \$$RATE/h in $LIVE_ENV: the run config's box_usd_per_hour must be $trate (bootstrap.sh writes it to the box)"
         fi
         break 2
