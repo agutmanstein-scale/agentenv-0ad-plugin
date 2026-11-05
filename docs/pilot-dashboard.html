@@ -102,6 +102,21 @@ td.num, th.num { text-align: right; }
 .pill.other { background: var(--wash); color: var(--ink-2); }
 .empty { color: var(--muted); font-size: 13px; padding: 20px 0; }
 footer { color: var(--muted); font-size: 12px; }
+.v2 { display: grid; gap: 20px; }
+.v2[hidden], #pilotView[hidden] { display: none; }
+#pilotView { display: contents; }
+.ladder { display: grid; gap: 8px; }
+.rung { display: grid; grid-template-columns: minmax(120px, 190px) 1fr minmax(96px, auto); gap: 4px 12px; align-items: center;
+  font-size: 13px; font-variant-numeric: tabular-nums; }
+.rung .bar { position: relative; height: 10px; border-radius: 5px; background: var(--wash); overflow: hidden; }
+.rung .bar i { position: absolute; inset: 0 auto 0 0; border-radius: 5px; background: var(--s1); }
+.rung.passed .bar i { background: var(--s3); }
+.rung .bar b { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); }
+.rung .state { color: var(--ink-2); text-align: right; }
+.rung.passed .state { color: var(--up); font-weight: 600; }
+.trips { display: grid; gap: 4px; font-size: 13px; color: var(--ink-2); }
+.trips b { color: var(--down); font-weight: 600; }
+@media (max-width: 520px) { .rung { grid-template-columns: 1fr; } .rung .state { text-align: left; } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 
@@ -117,6 +132,7 @@ footer { color: var(--muted); font-size: 12px; }
     scoring and report code, with the games and the trainer faked, so every number here is made up. Real rounds
     replace it as they finish.</div>
 
+  <div id="pilotView">
   <section class="tiles" id="tiles" aria-label="Summary"></section>
 
   <section class="panel">
@@ -164,6 +180,48 @@ footer { color: var(--muted); font-size: 12px; }
     <div class="tablewrap"><table id="probeTable"></table></div>
     <div class="tablewrap"><table id="mixTable"></table></div>
   </details>
+  </div>
+
+  <div class="v2" id="v2View" hidden>
+    <section class="tiles" id="v2Tiles" aria-label="Summary"></section>
+    <section class="panel">
+      <h2>Elo by training hour</h2>
+      <p class="how">One Bradley-Terry fit over every game a version played, versions grouped by the hour they were
+        published in, with a 95% interval from resampling games. Lines across are the fixed opponents from the same fit;
+        Petra medium is 1,000 and v0 is the base model.</p>
+      <div class="chart" id="v2Elo"></div>
+    </section>
+    <section class="panel">
+      <h2>Milestones</h2>
+      <p class="how" id="v2LadderHow"></p>
+      <div class="ladder" id="v2Ladder"></div>
+    </section>
+    <section class="row2">
+      <div class="panel"><h2>Trend</h2><p class="how" id="v2Trend"></p></div>
+      <div class="panel"><h2>Panel</h2><p class="how" id="v2Panel"></p></div>
+    </section>
+    <section class="panel">
+      <h2>What it does</h2>
+      <p class="how">Behaviour per training hour. These usually move before the rating does.</p>
+      <div class="multiples" id="v2Behaviour"></div>
+    </section>
+    <section class="panel">
+      <h2>Learner health</h2>
+      <p class="how">One point per update. A trip rolls the learner back to its last green checkpoint; an alarm only asks
+        for a look.</p>
+      <div class="multiples" id="v2Health"></div>
+      <div class="trips" id="v2Trips"></div>
+    </section>
+    <section class="row2">
+      <div class="panel"><h2>Games per hour</h2><p class="how">Finished games by the hour they ended in.</p><div class="chart" id="v2Games"></div></div>
+      <div class="panel"><h2>Trained decisions per hour</h2><p class="how">Rows the learner took from the inbox.</p><div class="chart" id="v2Decisions"></div></div>
+    </section>
+    <details>
+      <summary>Tables</summary>
+      <div class="tablewrap"><table id="v2BehaviourTable"></table></div>
+      <div class="tablewrap"><table id="v2EloTable"></table></div>
+    </details>
+  </div>
   <footer id="foot"></footer>
 </main>
 
@@ -183,7 +241,7 @@ footer { color: var(--muted); font-size: 12px; }
   const signed = (n) => n == null ? "–" : (n > 0 ? "+" : n < 0 ? "−" : "") + fmt(Math.abs(n));
   const pct = (x, d = 1) => x == null ? "–" : fmt(x * 100, d) + "%";
   const oppName = (id) => OPP[id] || (/^v\d+$/.test(id) ? `Version ${id.slice(1)}` : id);
-  let R = null, DATA = null, P = null, pick = 0;
+  let R = null, DATA = null, P = null, V = null, pick = 0;
   const RUNVAR = ["--s1", "--s2", "--s3", "--s4"];
 
   function el(tag, attrs = {}, parent) {
@@ -246,7 +304,7 @@ footer { color: var(--muted); font-size: 12px; }
     const W = Math.max(280, host.clientWidth), labelRoom = refs.length ? 136 : 16;
     const m = { t: 12, r: labelRoom, b: 28, l: 48 };
     const xs = [...new Set(pts.map((p) => p[0]))].sort((a, b) => a - b);
-    const ys = pts.map((p) => p[1]).concat(refs.map((r) => r.y));
+    const ys = pts.map((p) => p[1]).concat(refs.map((r) => r.y), series.flatMap((s) => (s.band || []).flatMap((b) => [b[1], b[2]])));
     let lo = Math.min(...ys), hi = Math.max(...ys);
     if (yFloor != null) lo = Math.min(lo, yFloor);
     const Y = nice(lo, hi);
@@ -272,6 +330,11 @@ footer { color: var(--muted); font-size: 12px; }
       el("text", { x: x1 + 8, y: ly, class: "dlabel" }, svg).textContent = `${r.name} ${fmt(r.y)}`;
     }
     for (const s of series) {
+      if (s.band && s.band.length) {
+        const up = s.band.map((b, i) => `${i ? "L" : "M"}${sx(b[0])},${sy(b[2])}`).join("");
+        const down = [...s.band].reverse().map((b) => `L${sx(b[0])},${sy(b[1])}`).join("");
+        el("path", { d: up + down + "Z", fill: s.color, "fill-opacity": 0.14 }, svg);
+      }
       if (s.area) {
         const d = s.points.map((p, i) => `${i ? "L" : "M"}${sx(p[0])},${sy(p[1])}`).join("") +
           `L${sx(s.points[s.points.length - 1][0])},${y0}L${sx(s.points[0][0])},${y0}Z`;
@@ -317,7 +380,7 @@ footer { color: var(--muted); font-size: 12px; }
   }
 
   // Columns per round: diverging (one value each) or stacked (parts per round).
-  function columns(host, { rounds, values = null, stacks = null, height = 140, unit = "", title }) {
+  function columns(host, { rounds, values = null, stacks = null, height = 140, unit = "", title, label = "Round", valueName = "Margin", fmtValue = signed }) {
     host.replaceChildren();
     if (!rounds.length) { html("div", "empty", "No rounds yet.", host); return; }
     const W = Math.max(220, host.clientWidth), m = { t: 8, r: 6, b: 22, l: stacks ? 30 : 44 };
@@ -347,7 +410,7 @@ footer { color: var(--muted); font-size: 12px; }
           el("path", { d: roundedBar(cx - bw / 2, top, bw, Math.max(h, 1), v >= 0), fill: css(v >= 0 ? "--pos" : "--neg") }, g);
           tipY = top;
         }
-        rows = [[null, "Margin", v == null ? "no result" : signed(v)]];
+        rows = [[null, valueName, v == null ? "no result" : fmtValue(v)]];
         if (title && values.meta && values.meta[i]) rows.push([null, "Outcome", values.meta[i]]);
       } else {
         let acc = 0;
@@ -364,7 +427,7 @@ footer { color: var(--muted); font-size: 12px; }
         rows = parts.filter((p) => p.n).map((p) => [p.color, p.name, `${p.n} (${p.wins} won)`]);
       }
       el("rect", { x: cx - band / 2, y: y1, width: band, height: y0 - y1, fill: "transparent" }, g);
-      const show = () => tip.show(cx / W * host.clientWidth, (tipY ?? y0) / height * svg.clientHeight, `Round ${r}`, rows);
+      const show = () => tip.show(cx / W * host.clientWidth, (tipY ?? y0) / height * svg.clientHeight, `${label} ${r}`, rows);
       g.addEventListener("pointerenter", show);
       g.addEventListener("focus", show);
       g.addEventListener("pointerleave", () => tip.hide());
@@ -576,14 +639,201 @@ footer { color: var(--muted); font-size: 12px; }
       "Qwen3-8B with a rank-32 LoRA adapter, policy gradient with a KL penalty to the base model. Each round: training games on the ladder and the probes (Petra 1 to 5, the previous version, and the frontier models: all four in the baseline, then one a round in turn), 30 game-minutes at 2x.";
   }
 
-  function draw() { if (!R) return; meta(); tiles(); rating(); probes(); mix(); health(); kl(); games(); tables(); }
+  // ---- post-training v2 (report.json with schema "v2", from agentenv_zeroad.train.report) ----
+  const byId = (id) => document.getElementById(id);
+  const ladderName = (m) => `${oppName(m.opponent)} at ${pct(m.threshold, 0)}`;
+  function mkTile(host, label, value, note, hero) {
+    const t = html("div", "tile" + (hero ? " hero" : ""), null, host);
+    html("div", "label", label, t);
+    html("div", "value", value, t);
+    if (note) html("div", "delta", note, t);
+  }
+  function v2Tiles() {
+    const host = byId("v2Tiles"), run = V.run, curve = V.elo.curve.filter((c) => c.label !== "v0");
+    host.replaceChildren();
+    const last = curve[curve.length - 1], base = (V.elo.board.v0 || {});
+    mkTile(host, last ? `Elo, training hour ${last.hour}` : "Elo", last ? fmt(last.elo) : "–",
+      last ? `${fmt(last.lo)} to ${fmt(last.hi)} (95%) from ${fmt(last.games)} games${base.elo != null ? `, base v0 ${fmt(base.elo)}` : ""}` : "no trained version yet", true);
+    const passed = V.milestones_passed;
+    mkTile(host, "Milestones passed", `${passed.length} of ${V.milestones.length}`,
+      passed.length ? `latest: ${passed[passed.length - 1].name.replace("petra-", "Petra ")} at hour ${fmt(passed[passed.length - 1].at)}` : "none yet");
+    const tr = V.trend;
+    mkTile(host, "Trend test, one-sided p", tr.p == null ? "–" : fmt(tr.p, 3),
+      tr.slope == null ? "needs fixed-opponent games from two or more hours"
+        : `${signed(tr.slope * 1000)} milli-log-odds per hour over ${fmt(tr.n)} games`);
+    const h = V.health;
+    mkTile(host, "Learner trips", fmt(h.tripped), h.latest && (h.latest.trips.length || h.latest.alarms.length)
+      ? [...h.latest.trips.map((t) => "trip " + t.name), ...h.latest.alarms.map((t) => "alarm " + t.name)].join(", ")
+      : `${fmt(h.updates.length)} updates, latest clean`);
+    const tp = V.throughput;
+    mkTile(host, "Games played", fmt(run.games),
+      `${fmt(tp.games_per_hour, 1)} an hour, ${fmt(tp.decisions_trained)} decisions trained, $${fmt(V.spend.games_usd + (V.spend.ledger_usd || 0), 2)} spent`);
+  }
+  function v2Elo() {
+    const curve = V.elo.curve.filter((c) => c.label !== "v0");
+    const refs = Object.entries(V.elo.board).filter(([k]) => !/^h\d+$/.test(k))
+      .map(([k, v]) => ({ name: k === "v0" ? "Base v0" : oppName(k), y: v.elo }));
+    const at = (x) => curve.find((c) => c.hour === x);
+    lineChart(byId("v2Elo"), {
+      series: [{
+        name: "Elo", color: css("--s1"), points: curve.map((c) => [c.hour, c.elo]), band: curve.map((c) => [c.hour, c.lo, c.hi]),
+        endLabel: curve.length ? fmt(curve[curve.length - 1].elo) : "",
+        fmt: (y, x) => `${fmt(y)} (${fmt(at(x).lo)} to ${fmt(at(x).hi)})`,
+      }],
+      refs, height: 340, xLabel: "Training hour", xFmt: (v) => v + " h",
+    });
+  }
+  function v2Ladder() {
+    const host = byId("v2Ladder"), rule = V.milestone_rule;
+    host.replaceChildren();
+    byId("v2LadderHow").textContent = `A milestone is passed when the one-sided ${fmt((1 - rule.alpha) * 100, 1)}% lower bound of the win rate, `
+      + `pooled over the last ${rule.pool_hours} hourly bins, clears its threshold. It is checked every ${fmt(rule.check_every_hours)} hours only, `
+      + `with the level shared across the ${V.milestones.length} milestones (Bonferroni). The bar is the latest pooled win rate and the line the threshold.`;
+    for (const m of V.milestones) {
+      const done = m.passed_at != null, latest = m.checks[m.checks.length - 1];
+      const row = html("div", "rung" + (done ? " passed" : ""), null, host);
+      html("span", null, ladderName(m), row);
+      const bar = html("span", "bar", null, row);
+      html("i", null, null, bar).style.width = pct(latest && latest.rate != null ? Math.min(1, latest.rate) : 0, 1);
+      html("b", null, null, bar).style.left = pct(m.threshold, 1);
+      html("span", "state", done ? `passed at hour ${fmt(m.passed_at)}`
+        : latest ? `lower bound ${pct(latest.lower, 0)}, ${fmt(latest.games)} games` : "not checked yet", row);
+    }
+  }
+  function v2Stats() {
+    const tr = V.trend, p = V.panel;
+    byId("v2Trend").textContent = tr.slope == null
+      ? "Needs games against fixed opponents (Petra levels, the scripted bot) from at least two training hours."
+      : `A logistic regression of the result on training hours with an intercept per opponent, on ${fmt(tr.n)} games against `
+        + `${tr.opponents.map(oppName).join(", ")}. Slope ${signed(tr.slope * 1000)} milli-log-odds an hour (SE ${fmt(tr.se * 1000, 1)}), one-sided p = ${fmt(tr.p, 3)}.`;
+    byId("v2Panel").textContent = !p ? "No panel is configured for this report."
+      : p.difference == null ? `Waiting for panel games: version ${p.other} against version ${p.base} (panels ${p.other_name} and ${p.base_name}).`
+      : `Version ${p.other} against version ${p.base} on the same opponents (${fmt(p.n_other)} and ${fmt(p.n_base)} games): `
+        + `net-worth margin ${signed(p.difference)} (SE ${fmt(p.se)}, from version ${p.base}'s own spread), one-sided p = ${fmt(p.p, 3)}.`;
+  }
+  function v2Multiples(hostId, rows, specs, xKey, xLabel, xFmt) {
+    const host = byId(hostId);
+    host.replaceChildren();
+    for (const spec of specs) {
+      const series = spec.keys.map(([key, name, color]) => ({
+        name, color: css(color), area: spec.keys.length === 1,
+        points: rows.filter((r) => r[key] != null).map((r) => [r[xKey], r[key]]),
+      })).filter((s) => s.points.length);
+      if (!series.length) continue;
+      const box = html("div", "mult", null, host);
+      html("h3", null, spec.title, box);
+      const last = series[0].points[series[0].points.length - 1][1];
+      html("p", "cap", `latest ${tickText(last, spec.unit)}`, box);
+      const chart = html("div", "chart", null, box);
+      lineChart(chart, { series, unit: spec.unit || "", height: 150, yFloor: spec.floor ?? 0, xLabel, xFmt });
+      if (series.length > 1) {
+        const legend = html("div", "legend", null, box);
+        for (const s of series) {
+          const k = html("span", null, null, legend);
+          html("i", "line", null, k).style.background = s.color;
+          k.appendChild(document.createTextNode(s.name));
+        }
+      }
+    }
+  }
+  function v2Behaviour() {
+    const kills = [["kills_home", "At home", "--s1"], ["kills_away", "Away", "--s2"]];
+    v2Multiples("v2Behaviour", V.behaviour.by_hour, [
+      { title: "Army at minute 5, 10 and 15", keys: [["army_5", "5", "--s1"], ["army_10", "10", "--s2"], ["army_15", "15", "--s3"]] },
+      { title: "First attack order (game seconds)", keys: [["first_attack_s", "First attack", "--s1"]], unit: "s" },
+      { title: "Attack and raid orders", keys: [["attack_orders", "Orders", "--s1"]] },
+      { title: "Kills at home and away", keys: kills },
+      { title: "Kills per loss", keys: [["kill_loss", "Kills per loss", "--s1"]] },
+      { title: "Villagers at minute 15", keys: [["villagers_15", "Villagers", "--s1"]] },
+      { title: "Games ended and won by conquest", keys: [["conquest", "Ended", "--s1"], ["conquest_win", "Won", "--s2"]], unit: "%" },
+      { title: "Turns that hold", keys: [["hold_share", "Hold", "--s1"]], unit: "%" },
+      { title: "Orders rejected", keys: [["rejected_share", "Rejected", "--s1"]], unit: "%" },
+    ], "hour", "Training hour", (v) => v + " h");
+  }
+  function v2Health() {
+    const u = V.health.updates;
+    v2Multiples("v2Health", u, [
+      { title: "Turns that hold", keys: [["hold_share", "Hold", "--s1"]], unit: "%" },
+      { title: "Orders rejected", keys: [["rejected_share", "Rejected", "--s1"]], unit: "%" },
+      { title: "Reply length (median tokens)", keys: [["tokens_p50", "Tokens", "--s1"]] },
+      { title: "Calls per decision", keys: [["calls_per_decision", "Calls", "--s1"]] },
+      { title: "Entropy", keys: [["entropy", "Entropy", "--s1"]] },
+      { title: "KL to base Qwen", keys: [["kl_to_base", "KL", "--s1"]] },
+      { title: "Gradient norm", keys: [["grad_norm", "Norm", "--s1"]] },
+      { title: "Clipped share", keys: [["clipped_share", "Clipped", "--s1"]], unit: "%" },
+    ], "update", "Update", (v) => "#" + v);
+    const host = byId("v2Trips");
+    host.replaceChildren();
+    for (const r of u.filter((x) => x.trips.length || x.alarms.length).slice(-8)) {
+      const line = html("div", null, null, host);
+      line.appendChild(document.createTextNode(`Update ${r.update} (hour ${fmt(r.hours, 1)}): `));
+      if (r.trips.length) html("b", null, "trip " + r.trips.join(", "), line);
+      if (r.trips.length && r.alarms.length) line.appendChild(document.createTextNode("; "));
+      if (r.alarms.length) line.appendChild(document.createTextNode("alarm " + r.alarms.join(", ")));
+    }
+  }
+  function v2Throughput() {
+    const rows = V.throughput.by_hour, hours = rows.map((r) => r.hour);
+    const one = (id, key, name) => columns(byId(id), {
+      rounds: hours, values: rows.map((r) => r[key]), label: "Hour", valueName: name, fmtValue: (v) => fmt(v), title: name,
+    });
+    one("v2Games", "games", "Games");
+    one("v2Decisions", "decisions_trained", "Decisions");
+  }
+  function v2Tables() {
+    const fill = (id, cols, rows) => {
+      const t = byId(id);
+      t.replaceChildren();
+      const tr = html("tr", null, null, html("thead", null, null, t));
+      cols.forEach(([c, , num]) => html("th", num ? "num" : null, c, tr));
+      const tb = html("tbody", null, null, t);
+      for (const r of rows) {
+        const row = html("tr", null, null, tb);
+        cols.forEach(([, f, num]) => html("td", num ? "num" : null, f(r), row));
+      }
+    };
+    fill("v2BehaviourTable", [
+      ["Hour", (r) => r.hour], ["Games", (r) => fmt(r.games), 1], ["Army 5", (r) => fmt(r.army_5, 1), 1],
+      ["Army 10", (r) => fmt(r.army_10, 1), 1], ["Army 15", (r) => fmt(r.army_15, 1), 1],
+      ["First attack", (r) => r.first_attack_s == null ? "–" : fmt(r.first_attack_s) + " s", 1], ["Attack orders", (r) => fmt(r.attack_orders, 1), 1],
+      ["Villagers 15", (r) => fmt(r.villagers_15, 1), 1], ["Conquest wins", (r) => pct(r.conquest_win, 0), 1], ["Hold", (r) => pct(r.hold_share, 0), 1],
+      ["Rejected", (r) => pct(r.rejected_share), 1],
+      ["Tools", (r) => Object.entries(r.tool_mix).map(([k, v]) => `${k} ${pct(v, 0)}`).join(", ")],
+    ], V.behaviour.by_hour);
+    fill("v2EloTable", [
+      ["Player", (r) => r[0]], ["Elo", (r) => fmt(r[1].elo), 1], ["Low", (r) => fmt(r[1].lo), 1], ["High", (r) => fmt(r[1].hi), 1],
+      ["Games", (r) => fmt(r[1].games), 1],
+    ], Object.entries(V.elo.board).sort((a, b) => b[1].elo - a[1].elo));
+  }
+  function v2() {
+    byId("pilotView").hidden = true;
+    byId("v2View").hidden = false;
+    document.title = "0 A.D. Qwen Post-training v2";
+    document.querySelector("h1").textContent = "0 A.D. Qwen Post-training v2";
+    document.querySelector(".sub").textContent = "Lockstep Climb: Qwen3-8B plays 1v1 games of 0 A.D. in lockstep and is trained "
+      + "on each game's result. Ratings put Petra at medium difficulty on 1,000.";
+    byId("example").hidden = true;
+    byId("runPick").hidden = true;
+    const m = byId("meta");
+    m.replaceChildren();
+    const chip = (label, value) => { const c = html("span", "chip", null, m); c.appendChild(document.createTextNode(label + " ")); html("b", null, value, c); };
+    chip("Training hours", fmt(V.run.hours, 1));
+    chip("Games", fmt(V.run.games));
+    chip("Versions", fmt(V.run.versions));
+    chip("Updated", new Date(V.updated).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }));
+    v2Tiles(); v2Elo(); v2Ladder(); v2Stats(); v2Behaviour(); v2Health(); v2Throughput(); v2Tables();
+    byId("foot").textContent = "Qwen3-8B with a rank-32 LoRA adapter, decoupled PPO on the game's result minus a baseline, one persistent learner. "
+      + "Games are played in lockstep, so wall-clock speed does not change the game.";
+  }
+
+  function draw() { if (V) return v2(); if (!R) return; meta(); tiles(); rating(); probes(); mix(); health(); kl(); games(); tables(); }
 
   fetch("report.json", { cache: "no-store" }).then((r) => {
     if (!r.ok) throw new Error(`report.json: ${r.status}`);
     return r.json();
   }).then((data) => {
     DATA = data;
-    if (data.runs) { P = data.pooled; R = data.runs[0]; } else { R = data; }
+    if (data.schema === "v2") { V = data; } else if (data.runs) { P = data.pooled; R = data.runs[0]; } else { R = data; }
     draw();
   }).catch((e) => {
     document.getElementById("tiles").textContent = "The pilot's report could not be loaded (" + e.message + ").";

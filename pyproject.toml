@@ -20,6 +20,10 @@ dependencies = [
     "pydantic>=2.7,<3",
 ]
 
+[project.optional-dependencies]
+# The learning side of post-training v2 (train/stats.py, train/critic.py); the base install stays unchanged.
+train = ["numpy>=1.26", "scikit-learn>=1.4"]
+
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.16,<0.17", "agentenv-framework-protocol[agent]>=0.1.275,<0.2"]
 
