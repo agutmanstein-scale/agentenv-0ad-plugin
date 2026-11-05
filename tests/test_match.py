@@ -116,7 +116,8 @@ async def test_each_executor_learns_which_opponents_the_engine_has_defeated(tmp_
 async def test_results_keep_each_logged_turn_and_a_timeline_of_every_players_score(tmp_path):
     match = make(tmp_path, time_cap_s=0.6)
     await match.setup()
-    match.record_brain_call("1", BrainCall(2.0, game_ms=1000), model="local/qwen3-8b", turn={"began_ms": 0, "user": "b"})
+    turn = {"began_ms": 0, "user": "b"}
+    match.record_brain_call("1", BrainCall(2.0, game_ms=1000), model="local/qwen3-8b", turn=turn)
     match.record_brain_call("1", BrainCall(2.0))  # an unlogged call keeps no turn
     match.start()
     await asyncio.wait_for(match.wait_end(), 10)

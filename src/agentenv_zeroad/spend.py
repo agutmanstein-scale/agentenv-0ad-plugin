@@ -9,7 +9,8 @@ bound. Each call can be appended to a JSON-lines spend log, `{"what", "model", "
 
 Prices are deliberately conservative (spec §3: the runner stops before passing the cap): LiteLLM's public price map
 (2026-10, as in agentenv-airops-plugin) with a 1.5x margin, and any model not listed at a high default, so an estimate
-errs high. A model named `local/...` is one this box serves itself (vLLM on its own GPUs) and costs nothing. The loop's ledger (`spend.jsonl`, one `{"what", "usd_est"}` per line) is checked with `check_budget` before
+errs high. A model named `local/...` is one this box serves itself (vLLM on its own GPUs) and costs nothing.
+The loop's ledger (`spend.jsonl`, one `{"what", "usd_est"}` per line) is checked with `check_budget` before
 a paid run and appended with `append_ledger` after it.
 """
 

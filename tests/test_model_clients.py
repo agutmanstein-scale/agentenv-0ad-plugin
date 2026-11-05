@@ -59,7 +59,8 @@ async def test_a_local_models_extra_body_goes_into_each_request_and_its_token_id
     fake = FakeLiteLLM(token_ids=True)
     extra = {"temperature": 1.0, "chat_template_kwargs": {"enable_thinking": False}, "return_token_ids": True}
     guard = SpendGuard("t")
-    model = StrategistModel("local/qwen3-8b", "http://172.17.0.1:8000/v1", KEY, guard, http=fake.http(), extra_body=extra)
+    url = "http://172.17.0.1:8000/v1"
+    model = StrategistModel("local/qwen3-8b", url, KEY, guard, http=fake.http(), extra_body=extra)
     reply = await model.call("system", "brief", TOOLS)
     [(_, _, body)] = fake.requests
     assert body["temperature"] == 1.0 and body["chat_template_kwargs"] == {"enable_thinking": False}
