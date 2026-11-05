@@ -209,3 +209,13 @@ async def test_kills_are_split_into_home_and_away_by_whether_enemies_were_near_t
     await match._tick()
     combat = match.results()["seats"]["1"]["combat"]
     assert (combat["kills_home"], combat["kills_away"], combat["enemy_units_killed"]) == (5, 6, 11)
+
+
+async def test_the_results_carry_each_seats_reference_text_the_same_one_its_prompt_got(tmp_path):
+    for interface in ("v1", "v2"):
+        match = make(tmp_path, interface)
+        await match.setup()
+        served = match.reference("1")
+        recorded = match.results()["seats"]["1"]["reference"]
+        assert recorded == served
+        assert (interface == "v2") is recorded.startswith("Costs for rome")

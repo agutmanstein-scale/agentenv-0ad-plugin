@@ -929,6 +929,7 @@ class LiveMatch:
                 "civ": seat.plan.civ,
                 "name": seat.plan.name,
                 "interface": seat.plan.interface,
+                "reference": self.reference(slot),  # the cost tables the policy's prompt carried (v2; "" for v1)
                 **self._petra_settings(seat.plan),
                 "state": self.states.get(slot),
                 "outcome": outcome,
