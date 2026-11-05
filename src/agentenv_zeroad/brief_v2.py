@@ -44,7 +44,7 @@ def net_worth(snapshot: Snapshot, player: int) -> int | None:
 class BriefContext:
     """What the match gathers for one seat's v2 brief, besides the snapshot and the events."""
 
-    cap_ms: int
+    cap_ms: int  # game ms until the time cap; 0 when there is none
     scores: Mapping[str, float]
     army: ArmyReport
     orders: str  # the army posture as the brain gave it: "attack player_2, waves of 8, regrouping below 40%"
@@ -205,7 +205,10 @@ def _opponents(snapshot: Snapshot, player: int) -> str:
 def text_brief_v2(snapshot: Snapshot, player: int, events: Sequence, ctx: BriefContext) -> str:
     """The seat's v2 brief: numbers for players, own score and army, what it can afford, then what happened."""
     me = snapshot.players[player]
-    left = max(0, ctx.cap_ms - snapshot.time_ms)
+    clock = clock_text(snapshot.time_ms)
+    timing = f"{clock}, {clock_text(max(0, ctx.cap_ms - snapshot.time_ms))} left" if ctx.cap_ms > 0 else (
+        f"{clock}, no time limit (the game is won by conquest)"
+    )
     res = " ".join(f"{r} {me.resources[r]}" for r in RESOURCES)
     gat = " ".join(f"{r} {me.gatherers[r]}" for r in RESOURCES)
     score = f"Score: economy {ctx.scores.get('economy', 0):.0f}, military {ctx.scores.get('military', 0):.0f}."
@@ -213,7 +216,7 @@ def text_brief_v2(snapshot: Snapshot, player: int, events: Sequence, ctx: BriefC
         score += f" Net worth {ctx.net_worth}."
     villagers = me.units.get("villager", 0)
     lines = [
-        f"Time {clock_text(snapshot.time_ms)}, {clock_text(left)} left. You are player {player} ({me.civ}), "
+        f"Time {timing}. You are player {player} ({me.civ}), "
         f"{me.state}.",
         f"Phase: {me.phase or 'none'}. Population {me.pop}/{me.pop_cap} (max {me.pop_max}).",
         f"Resources: {res}. Gatherers: {gat}.",

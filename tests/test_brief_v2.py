@@ -177,3 +177,17 @@ def test_v2_adds_no_more_than_the_gate_allows_over_v1_and_keeps_the_system_and_t
     v1 = [request_chars(p) for p in all_prompts("v1")]
     v2 = [request_chars(p) for p in all_prompts("v2")]
     assert max(v2) < 1.2 * max(v1)
+
+
+async def test_the_v2_brief_with_no_time_cap_says_there_is_no_limit_not_the_safety_cap(tmp_path):
+    seats = (SeatPlan("1", 1, "agent", "rome", "policy v3", interface="v2"), SeatPlan("2", 2, "agent", "athen", "x"))
+    match = LiveMatch(
+        Handle(ScriptedEngine(seconds=300)),
+        MatchConfig(seats=seats, time_cap_s=0),
+        out_dir=tmp_path,
+        placer=placer(),
+    )
+    await match.setup()
+    text = match.brief("1")
+    assert "no time limit (the game is won by conquest)" in text and "left." not in text.split("\n")[0]
+    assert "45:00" not in text and "44:" not in text

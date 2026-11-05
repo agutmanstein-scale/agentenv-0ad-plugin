@@ -91,6 +91,7 @@ TURNS_KEPT = 1000  # logged brain turns a seat keeps for results (a 12-hour matc
 REFLEX_RECENT = 3  # reflex and autopilot actions the strategist's brief lists
 ACTIONS_KEPT = 500
 SAFETY_CAP_S = 45 * 60  # the longest a game with no time cap runs
+NO_TIME_LIMIT = "No time limit: the game is won by conquest."
 HOLD_REPEAT_MS = 30_000  # a held default is carried out at most this often per decision
 Who = Literal["brain", "reflex", "autopilot", "bot"]
 
@@ -619,8 +620,11 @@ class LiveMatch:
         events = self.trackers[player].drain() if player in self.trackers else []
         orders = self.seats[slot].executor.book.summary() if self.seats[slot].executor else {}
         lines = [text_brief(self.snapshot, player, events, names=names)]
-        left = max(0, self.cap_ms - self.time_ms)
-        lines.append(f"Time left before the score decides: {clock_text(left)}.")
+        if self.config.time_cap_s > 0:
+            left = max(0, self.cap_ms - self.time_ms)
+            lines.append(f"Time left before the score decides: {clock_text(left)}.")
+        else:
+            lines.append(NO_TIME_LIMIT)
         if orders:
             lines.append("Standing orders: " + json.dumps(orders, separators=(", ", ": ")))
         seat = self.seats[slot]
@@ -646,7 +650,7 @@ class LiveMatch:
         view = executor.last_seat
         book = executor.book
         ctx = BriefContext(
-            cap_ms=self.cap_ms,
+            cap_ms=self.cap_ms if self.config.time_cap_s > 0 else 0,
             scores=self.scores.get(slot, {}),
             army=executor.army.report(executor, view) if view is not None else ArmyReport({}, "none"),
             orders=book.army.describe(),
@@ -697,9 +701,10 @@ class LiveMatch:
     def footer(self, slot: str) -> str:
         """One line every tool result ends with: clock, the seat's essentials, pending events, how the match ends."""
         player = self.seats[slot].plan.player
-        cap = clock_text(self.cap_ms)
+        # With no time cap the safety cap is internal bookkeeping: the seat is told there is no limit, never a countdown.
+        cap = f"/ cap {clock_text(self.cap_ms)}" if self.config.time_cap_s > 0 else "· no time limit"
         if self.snapshot is None or player not in self.snapshot.players:
-            return f"[{self.game_clock} / cap {cap}]"
+            return f"[{self.game_clock} {cap}]"
         me = self.snapshot.players[player]
         tracker = self.trackers.get(player)
         pending = tracker.peek() if tracker else []
@@ -713,7 +718,7 @@ class LiveMatch:
             line = (last.line or last.what)[:60]
             luna = f" · {n} reflex/autopilot actions, last {clock_text(last.game_ms)} {seat.label(last)}: {line}"
         return (
-            f"[{self.game_clock} / cap {cap} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
+            f"[{self.game_clock} {cap} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
             f"army {me.army} · {len(pending)} new events ({urgent} urgent){luna}: get_brief()]"
         )
 

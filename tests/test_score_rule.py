@@ -146,13 +146,15 @@ async def test_with_no_time_cap_the_game_runs_to_the_safety_cap_and_is_decided_b
     assert results["ended_by"] == "safety_cap" and results["time_cap_s"] == 0 and results["safety_cap_s"] == 1.0
 
 
-async def test_a_game_with_no_time_cap_is_not_ended_before_its_safety_cap_and_shows_that_cap(tmp_path):
+async def test_a_game_with_no_time_cap_is_not_ended_before_its_safety_cap_and_says_there_is_no_limit(tmp_path):
     match = make(tmp_path, time_cap_s=0)
     await match.setup()
     match.start()
     await asyncio.sleep(0.3)
     assert not match.over and match.config.cap_s == SAFETY_CAP_S == 45 * 60
-    assert "/ cap 45:00" in match.footer("1") and "44:5" in match.brief("1").split("score decides: ")[1]
+    footer, brief = match.footer("1"), match.brief("1")
+    assert "no time limit" in footer and "cap" not in footer and "45:00" not in footer
+    assert "No time limit: the game is won by conquest." in brief and "Time left" not in brief and "44:5" not in brief
     await match.stop()
 
 
