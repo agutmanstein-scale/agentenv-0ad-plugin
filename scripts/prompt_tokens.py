@@ -73,9 +73,11 @@ def main() -> None:
         prompts = all_prompts(interface)
         totals = [counter(p) for p in prompts]
         fixed = counter(Prompt(prompts[0].system, "x", prompts[0].tools))
+        early = [t for t, p in zip(totals, prompts, strict=True) if p.name != "midgame"]
         print(
-            f"{interface}: n={len(totals)} total tokens {totals}  p50={int(statistics.median(totals))} "
-            f"p90={percentile(totals, 0.9)}  system+tools={fixed}"
+            f"{interface}: n={len(totals)} total tokens {dict(zip((p.name for p in prompts), totals, strict=True))}\n"
+            f"  all: p50={int(statistics.median(totals))} p90={percentile(totals, 0.9)}   "
+            f"early only: p50={int(statistics.median(early))} p90={percentile(early, 0.9)}   system+tools={fixed}"
         )
 
 

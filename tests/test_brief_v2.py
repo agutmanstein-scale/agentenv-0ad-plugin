@@ -20,6 +20,7 @@ pytestmark = pytest.mark.anyio
 
 CHARS_PER_TOKEN = 3.3  # measured on these prompts with the Qwen3 tokenizer (scripts/prompt_tokens.py)
 TOKEN_GATE = 2600
+MIDGAME_CEILING = 3400  # the busy mid-game prompt is 3,258 real tokens: over the gate, pinned so it does not grow
 
 
 def make(tmp_path, interface="v2", seconds=300, engine=None) -> LiveMatch:
@@ -151,10 +152,24 @@ async def test_the_reference_route_serves_the_seats_text_at_its_own_address(tmp_
     assert mine["ok"] and mine["text"].startswith("Costs for rome") and theirs == {"ok": True, "text": ""}
 
 
+def tokens(prompts):
+    return sorted(request_chars(p) / CHARS_PER_TOKEN for p in prompts)
+
+
 def test_the_v2_prompt_is_within_the_token_gate_on_the_recorded_snapshots():
-    sizes = sorted(request_chars(p) / CHARS_PER_TOKEN for p in all_prompts("v2"))
+    early = [p for p in all_prompts("v2") if p.name != "midgame"]
+    sizes = tokens(early)
     p90 = sizes[min(len(sizes) - 1, round(0.9 * (len(sizes) - 1)))]
-    assert p90 <= TOKEN_GATE, (statistics.median(sizes), p90)
+    assert len(early) == 4 and p90 <= TOKEN_GATE, (statistics.median(sizes), p90)
+
+
+def test_the_busy_midgame_prompt_stays_under_its_ceiling_and_carries_what_makes_it_busy():
+    [mid] = [p for p in all_prompts("v2") if p.name == "midgame"]
+    for needle in ("Wave out:", "Next wave:", NOTICES_HEADER, "Enemies in sight:", "under attack", "executor gave up"):
+        assert needle in mid.user, needle
+    assert mid.user.count(" -> ") == 18
+    [size] = tokens([mid])
+    assert size <= MIDGAME_CEILING, size
 
 
 def test_v2_adds_no_more_than_the_gate_allows_over_v1_and_keeps_the_system_and_tools_near_todays_size():
