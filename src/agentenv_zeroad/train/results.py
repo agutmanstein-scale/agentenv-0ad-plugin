@@ -93,13 +93,34 @@ def behaviour(results: Mapping[str, Any], slot: str) -> str | None:
     return (spec_seats(results).get(slot) or {}).get("behaviour")
 
 
+NET_WORTH_STALE_MAX = 5  # a net worth carried over more than this many reads at the game's end is not trusted
+
+
+def fresh_net_worth(score: Mapping[str, Any]) -> float | None:
+    """A seat's final net worth, None when it was never read or was carried over more than `NET_WORTH_STALE_MAX`
+    reads (the match records `net_worth` as None until the first reading and counts `net_worth_stale`)."""
+    value = score.get("net_worth")
+    if value is None or int(score.get("net_worth_stale") or 0) > NET_WORTH_STALE_MAX:
+        return None
+    return float(value)
+
+
+def net_worth_was_stale(results: Mapping[str, Any], slot: str, opp: str) -> bool:
+    """Whether a net worth was recorded for both seats but at least one was too stale to decide a game."""
+    scores = [results["seats"][s].get("score") or {} for s in (slot, opp)]
+    return all(sc.get("net_worth") is not None for sc in scores) and any(fresh_net_worth(sc) is None for sc in scores)
+
+
 def final_margin(results: Mapping[str, Any], slot: str, opp: str) -> tuple[float | None, str | None]:
-    """(slot's final margin over opp, where it came from): the net-worth margin, else the official score's."""
+    """(slot's final margin over opp, where it came from): the net-worth margin when both seats' net worth is known and
+    fresh, else the official score's."""
     mine, theirs = (results["seats"][s].get("score") or {} for s in (slot, opp))
-    for source, key in (("net_worth", "net_worth"), ("score", "total")):
-        a, b = mine.get(key), theirs.get(key)
-        if a is not None and b is not None:
-            return float(a) - float(b), source
+    a, b = fresh_net_worth(mine), fresh_net_worth(theirs)
+    if a is not None and b is not None:
+        return a - b, "net_worth"
+    a, b = mine.get("total"), theirs.get("total")
+    if a is not None and b is not None:
+        return float(a) - float(b), "score"
     return None, None
 
 

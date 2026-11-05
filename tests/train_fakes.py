@@ -54,6 +54,7 @@ def results(
     ended_by: str = "time_cap",
     outcomes: tuple[str, str] = ("won", "lost"),
     net_worth: tuple[float | None, float | None] = (5000.0, 3000.0),
+    net_worth_stale: tuple[int, int] | None = None,
     totals: tuple[float, float] = (9000.0, 8000.0),
     turns: Mapping[str, list[dict[str, Any]]] | None = None,
     opponent: Mapping[str, Any] | None = None,
@@ -74,6 +75,8 @@ def results(
         score: dict[str, Any] = {"total": totals[i]}
         if net_worth[i] is not None:
             score["net_worth"] = net_worth[i]
+        if net_worth_stale is not None:
+            score["net_worth_stale"] = net_worth_stale[i]
         kind = "agent" if seats_spec[i]["kind"] == "llm" else seats_spec[i]["kind"]
         seats[slot] = {
             "player": i + 1, "kind": kind, "civ": seats_spec[i]["civ"], "name": f"Seat {slot}",

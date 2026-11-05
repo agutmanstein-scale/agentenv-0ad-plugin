@@ -61,6 +61,17 @@ def test_a_game_without_net_worth_falls_back_to_the_official_margin_and_is_count
     assert c.counts["margin_fallback_official_score"] == 1
 
 
+def test_a_net_worth_carried_over_too_long_is_not_trusted_and_the_game_falls_back_and_is_counted():
+    from agentenv_zeroad.train.results import NET_WORTH_STALE_MAX
+
+    c = Credit()
+    fresh = reward(c, net_worth=(5000.0, 3000.0), net_worth_stale=(NET_WORTH_STALE_MAX, 0), totals=(9000.0, 8000.0))
+    assert fresh == pytest.approx(0.5 + 0.5 * math.tanh(2000 / 2000)) and not c.counts["net_worth_stale"]
+    stale = reward(c, net_worth=(5000.0, 3000.0), net_worth_stale=(NET_WORTH_STALE_MAX + 1, 0), totals=(9000.0, 8000.0))
+    assert stale == pytest.approx(0.5 + 0.5 * math.tanh(1000 / 2000))
+    assert c.counts["margin_fallback_official_score"] == 1 and c.counts["net_worth_stale"] == 1
+
+
 def test_a_cap_margin_that_contradicts_the_recorded_winner_is_an_error_under_the_net_worth_rule():
     with pytest.raises(CreditError, match="disagrees"):
         reward(Credit(), net_worth=(5000.0, 3000.0), outcomes=("lost", "won"))

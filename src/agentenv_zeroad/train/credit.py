@@ -6,8 +6,10 @@ expected to be:
 
   R   the learner seat's reward for the game. Conquest decides first: a win is +1, a loss -1. At a cap (time_cap or
       safety_cap) R = 0.5 sign(m) + 0.5 tanh(m / s), m the final net-worth margin and s the margin's within-opponent
-      SD, so any cap win beats any cap loss and both sit inside a conquest win and loss. A game with no net_worth in its
-      score falls back to the official score margin and is counted as such. A game that did not finish, or ended any
+      SD, so any cap win beats any cap loss and both sit inside a conquest win and loss. A game whose net worth is
+      missing for either seat (never read) or stale (carried over more than `results.NET_WORTH_STALE_MAX` reads at the
+      end) falls back to the official score margin and is counted as such (`margin_fallback_official_score`, and
+      `net_worth_stale` when it was stale). A game that did not finish, or ended any
       other way, yields no rows.
   b   the baseline, a running mean of R per (opponent id, slot): an EMA over the last 64 games. With a critic
       (train/critic.py) that has earned its place, b is the critic's value at the decision's state.
@@ -174,6 +176,8 @@ class Credit:
             raise CreditError(f"seat {slot}: a game that reached the cap with no score to take a margin from")
         if source != "net_worth":
             self.counts["margin_fallback_official_score"] += 1
+            if rs.net_worth_was_stale(results, slot, opp):
+                self.counts["net_worth_stale"] += 1
         self._check_winner(results, slot, margin, source)
         return 0.5 * _sign(margin) + 0.5 * math.tanh(margin / self.cfg.margin_scale), source
 
