@@ -9,7 +9,7 @@ import pytest
 
 from agentenv_zeroad.brains import Commander, CommanderSeat, CommanderSettings, InProcessSeatLink
 from agentenv_zeroad.grading import BRAIN_TIMEOUT_S
-from agentenv_zeroad.match import MatchConfig, SeatPlan
+from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.server import tool_specs
 from agentenv_zeroad.spend import SpendCapReached
 from agentenv_zeroad.train.game import LockstepMatch
@@ -60,7 +60,7 @@ async def test_a_match_without_brains_runs_to_the_time_cap_at_engine_speed_and_t
     assert [row["t_ms"] for row in results["timeline"]][:3] == [0, 10_000, 20_000]
 
 
-async def test_a_game_without_a_time_cap_ends_at_the_safety_cap_and_its_briefs_count_down_to_it(tmp_path):
+async def test_a_game_without_a_time_cap_ends_at_the_safety_cap_and_its_briefs_say_there_is_no_limit(tmp_path):
     config = MatchConfig(seats=BOT_VS_PETRA, time_cap_s=0, safety_cap_s=20.0)
     match = LockstepMatch(Handle(), config, out_dir=tmp_path, placer=placer())
     results = await play(match)
@@ -69,7 +69,9 @@ async def test_a_game_without_a_time_cap_ends_at_the_safety_cap_and_its_briefs_c
     assert "at the safety cap" in results["detail"]
     assert match.cap_ms == 20_000
     brief = match.brief("1")
-    assert "Time left before the score decides: 00:00." in brief and " / cap 00:20 " in brief.splitlines()[-1]
+    footer = brief.splitlines()[-1]
+    assert "No time limit: the game is won by conquest." in brief and "Time left" not in brief
+    assert "no time limit" in footer and "/ cap" not in footer
 
 
 async def test_a_capped_game_still_tells_its_brief_how_long_is_left_and_ends_as_time_cap(tmp_path):
@@ -180,3 +182,31 @@ async def test_a_lockstep_match_refuses_a_luna_reflex_seat(tmp_path):
     seats = (SeatPlan("1", 1, "agent", "rome", "alice", reflex="luna"), SeatPlan("2", 2, "petra", "pers", "Petra 2"))
     with pytest.raises(ValueError, match="no Luna reflex"):
         make(tmp_path, seats)
+
+
+async def test_live_play_publishes_the_snapshot_after_the_trackers_ran_on_it_and_lockstep_at_the_read(tmp_path):
+    seen = {}
+
+    def spy(match, name):
+        tracker = next(iter(match.trackers.values()))
+        update = tracker.update
+
+        def update_and_note(snap):
+            seen[name] = match.snapshot is not snap  # not yet published while the trackers read it
+            update(snap)
+
+        tracker.update = update_and_note
+
+    live = LiveMatch(Handle(), MatchConfig(seats=BOT_VS_PETRA, time_cap_s=30.0), out_dir=tmp_path, placer=placer())
+    await live.setup()
+    spy(live, "live")
+    await live._tick()
+    assert seen["live"] is True and live.snapshot is not None
+
+    lock = make(tmp_path, BOT_VS_PETRA)
+    await lock.setup()
+    view = await lock._observe()  # lockstep's brains decide between the read and the act: the read is published
+    assert lock.snapshot is lock._read_snap
+    spy(lock, "lock")
+    await lock._act(view)
+    assert seen["lock"] is False

@@ -315,6 +315,7 @@ class LiveMatch:
         self.metrics = MatchMetrics(sorted(self.by_player))
         self.trackers: dict[int, EventTracker] = {}
         self.snapshot: Snapshot | None = None
+        self._read_snap: Snapshot | None = None  # what `_observe` last read, until `_act` has run on it
         self.scores: dict[str, dict[str, Any]] = {}  # net_worth: None until read; net_worth_stale: reads since
         self.states: dict[str, str] = {}
         self.outcomes: dict[str, grading.Outcome] | None = None
@@ -485,19 +486,24 @@ class LiveMatch:
             self._check_end(max(self.time_ms, self.clock.steps * TURN_MS))
 
     async def _tick(self) -> None:
-        view = await self._observe()
+        # Live play publishes the snapshot after the executors and trackers have run on it, as it always did: a brain
+        # reading its brief mid-tick sees the last finished tick, never a half-updated one.
+        view = await self._observe(publish=False)
         await self._act(view)
 
-    async def _observe(self) -> ExecutorView | None:
-        """Read the executors' view and the fog-limited snapshot at this moment."""
+    async def _observe(self, *, publish: bool = True) -> ExecutorView | None:
+        """Read the executors' view and the fog-limited snapshot at this moment. Lockstep publishes it here, so the
+        briefs its brains decide on are this very state; `_act` publishes it too, after the trackers have updated."""
         assert self._snapshots is not None
         view: ExecutorView | None = await self._view() if self._view is not None else None
-        self.snapshot = await self._snapshots()
+        self._read_snap = await self._snapshots()
+        if publish:
+            self.snapshot = self._read_snap
         return view
 
     async def _act(self, view: ExecutorView | None) -> None:
         """Tick every driven seat's executor and bot on what `_observe` read, then track the match and check its end."""
-        snap = self.snapshot
+        snap = self._read_snap
         assert snap is not None
         for seat in self.seats.values():
             if seat.executor is None or view is None or seat.plan.player not in view.seats:
@@ -514,6 +520,7 @@ class LiveMatch:
         self._count_kills(snap)
         for tracker in self.trackers.values():
             tracker.update(snap)
+        self.snapshot = snap
         outcome = await self.engine.evaluate(js("outcome.js"))
         self._read_outcome(outcome or {}, snap)
         self._sample_timeline(snap)
