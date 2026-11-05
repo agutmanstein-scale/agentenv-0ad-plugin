@@ -59,8 +59,16 @@ from agentenv_zeroad.orders import (
     partial,
     rejected,
 )
-from agentenv_zeroad.placement import EnginePlacer, Placer, enemy_base_guess, search_for
-from agentenv_zeroad.roles import RoleCatalog, RoleTable
+from agentenv_zeroad.placement import (
+    EnginePlacer,
+    Placement,
+    Placer,
+    Search,
+    enemy_base_guess,
+    fallback_searches,
+    search_for,
+)
+from agentenv_zeroad.roles import RoleCatalog, RoleTable, Template
 from agentenv_zeroad.state import RESOURCES, PlayerSnapshot, Snapshot
 from agentenv_zeroad.view import ExecutorView, Pos, SeatView, Structure, ViewQuery, distance
 
@@ -553,14 +561,15 @@ class Executor:
         if not builders:
             return "waiting"
         try:
-            spot = await self.placer.find(self.player, tpl.name, search)
+            spot = await self._find_spot(t.seat, tpl, req.where, search)
         except Exception as e:  # noqa: BLE001 - a failed search counts as a failed attempt, not a stuck seat
             log.warning("player %d: placement search for %s failed: %r", self.player, req.structure, e)
             self.fail_attempt(req, now, what, f"placement search failed: {e!r}")
             return "failed"
         if not spot.ok:
             log.info("player %d: no spot for %s at %s: %s", self.player, req.structure, req.where, spot.why())
-            self.fail_attempt(req, now, what, f"no valid spot at {req.where}: {spot.why()}")
+            wider = " (rings out to 60 m tried)" if self._fallbacks(t.seat, req.where, tpl) else ""
+            self.fail_attempt(req, now, what, f"no valid spot at {req.where}{wider}: {spot.why()}")
             return "failed"
         t.spend(tpl.cost)
         t.busy.update(builders)
@@ -581,6 +590,27 @@ class Executor:
         item = Issued(label, command, now, check, req, undo=undo, rejected=rejected_)
         self.expect(t, item)
         return "placed"
+
+    def _fallbacks(self, seat: SeatView, where: str, tpl: Template) -> tuple[Search, ...]:
+        """The economy floor is part of interface v2; v1 stays as the pilot ran it."""
+        return fallback_searches(seat, where, tpl.kind) if self.interface == "v2" else ()
+
+    async def _find_spot(self, seat: SeatView, tpl: Template, where: str, search: Search) -> Placement:
+        """The engine-checked spot for `tpl`: the normal search first, then (v2) the economy floor's wider ones for a
+        field or a storehouse. A miss reports every search's tries and reasons, so the give-up names what was tried."""
+        spot = await self.placer.find(self.player, tpl.name, search)
+        if spot.ok:
+            return spot
+        tried, reasons = spot.tried, dict(spot.reasons)
+        for wider in self._fallbacks(seat, where, tpl):
+            spot = await self.placer.find(self.player, tpl.name, wider)
+            if spot.ok:
+                log.info("player %d: %s at %s placed by the ring fallback", self.player, tpl.key, where)
+                return spot
+            tried += spot.tried
+            for reason, n in spot.reasons.items():
+                reasons[reason] = reasons.get(reason, 0) + n
+        return Placement(False, tried=tried, reasons=reasons)
 
     # ---- production ---------------------------------------------------------------------------------------------
     def _trainers(self, seat: SeatView, role: str, at: str | None) -> list[tuple[Structure, str]]:

@@ -7,6 +7,10 @@
 - `toward_<player>`: part-way from the base toward that player's base as this seat knows it;
 - `front`: further toward the nearest enemy, as far forward as own territory allows.
 
+Economy floor: a field or a storehouse is what keeps villagers working, so when the search above finds nothing,
+`fallback_searches` widens it before the executor gives up: rings at 15, 25 and 35 m around the farmstead or civic
+centre (fields) or the resource site (storehouses), then any free tile within 60 m.
+
 Enemy bases are what the seat has seen (enemy structures in its fog-limited snapshot); until it has seen one, the
 guess is the point opposite the own base across the map centre (exact for two players on a circle placement), for more
 players the matching point of a circle through the own base.
@@ -32,6 +36,9 @@ ANGLE = math.pi * 3 / 4
 TOWARD_DISTANCE = 45.0
 FRONT_DISTANCE = 80.0
 DROPSITE_SERVES = 35.0
+FALLBACK_KINDS = frozenset({"Field", "Storehouse"})
+FALLBACK_RINGS = (15.0, 25.0, 35.0)
+FALLBACK_ANY_WITHIN = 60.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,7 @@ class Search:
     max_r: float = 90.0
     step: float = 6.0
     spacing: float = 3.0
+    radii: tuple[float, ...] | None = None  # exact ring radii in metres; replaces min_r..max_r when set
 
 
 class Placer(Protocol):
@@ -92,6 +100,7 @@ def placement_js(player: int, template: str, search: Search, *, phase: float = 0
         "player": int(player),
         "template": template,
         "anchors": [[round(a[0], 1), round(a[1], 1)] for a in search.anchors],
+        "radii": list(search.radii) if search.radii is not None else None,
         "minR": search.min_r,
         "maxR": search.max_r,
         "step": search.step,
@@ -165,6 +174,28 @@ def search_for(seat: SeatView, where: str, enemy_bases: Mapping[int, Pos]) -> Se
         return fallback
     metres = FRONT_DISTANCE if where == "front" else TOWARD_DISTANCE
     return Search((toward(base, target, metres), toward(base, target, metres / 2), base), min_r=0.0, max_r=40.0)
+
+
+def fallback_searches(seat: SeatView, where: str, kind: str) -> tuple[Search, ...]:
+    """The wider searches to try, in order, after the normal one for `where` found no spot (empty for anything but a
+    field or a storehouse placed `near_<resource>`).
+
+    A field anchors on the own farmstead nearest the civic centre, else the civic centre; a storehouse on the
+    resource's site, else the civic centre. The rings keep the corridor spacing; the last search takes any free tile
+    within `FALLBACK_ANY_WITHIN` m (no spacing), so a cramped base still gets its field."""
+    if kind not in FALLBACK_KINDS or seat.base is None or not where.startswith("near_"):
+        return ()
+    base = seat.base
+    anchors: list[Pos] = []
+    if kind == "Field":
+        farmsteads = [s.pos for s in seat.finished("Farmstead") if s.pos is not None]
+        anchors += sorted(farmsteads, key=lambda p: distance(p, base))[:1]
+    elif (site := resource_anchor(seat, where.removeprefix("near_"))) is not None:
+        anchors.append(site)
+    anchors.append(base)
+    rings = Search(tuple(anchors), step=4.0, spacing=2.0, radii=FALLBACK_RINGS)
+    anywhere = Search(tuple(anchors), min_r=0.0, max_r=FALLBACK_ANY_WITHIN, step=4.0, spacing=0.0)
+    return (rings, anywhere)
 
 
 def _target_base(seat: SeatView, where: str, enemy_bases: Mapping[int, Pos]) -> Pos | None:
