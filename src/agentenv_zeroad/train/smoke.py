@@ -21,9 +21,10 @@ import sys
 
 import httpx
 
-from agentenv_zeroad.brains import STRATEGIST_SYSTEM
+from agentenv_zeroad.brains import offered_tools, strategist_system
 from agentenv_zeroad.llm import Reply, StrategistModel
-from agentenv_zeroad.pilot.smoke import BRIEF, ECONOMY
+from agentenv_zeroad.pilot.smoke import BRIEF
+from agentenv_zeroad.server import tool_specs
 from agentenv_zeroad.spend import SpendGuard
 from agentenv_zeroad.train.spec import DEFAULT_MAX_TOKENS, TRAIN_SAMPLING
 
@@ -59,11 +60,13 @@ def problems_in(reply: Reply) -> list[str]:
 async def check(
     url: str, model: str, key: str, *, calls: int = DEFAULT_CALLS, http: httpx.AsyncClient | None = None
 ) -> tuple[list[str], dict[str, int]]:
-    """Make `calls` concurrent training-sampled calls; returns (every problem found, a summary of the replies)."""
+    """Make `calls` concurrent training-sampled calls, with the v2 system prompt and order tools a training seat shows
+    its model; returns (every problem found, a summary of the replies)."""
+    system, tools = strategist_system("v2"), offered_tools(await tool_specs(), "v2")
     llm = StrategistModel(
         model, url, key, SpendGuard("train smoke"), max_tokens=DEFAULT_MAX_TOKENS, http=http, extra_body=training_body()
     )
-    replies = await asyncio.gather(*(llm.call(STRATEGIST_SYSTEM, BRIEF, [ECONOMY]) for _ in range(calls)))
+    replies = await asyncio.gather(*(llm.call(system, BRIEF, tools) for _ in range(calls)))
     problems = [f"call {i}: {p}" for i, reply in enumerate(replies) for p in problems_in(reply)]
     with_tools = sum(1 for reply in replies if reply.calls)
     if not with_tools:

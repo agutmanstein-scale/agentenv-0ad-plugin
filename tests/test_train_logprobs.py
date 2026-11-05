@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+from agentenv_zeroad.brains import ORDER_TOOLS_V2, STRATEGIST_SYSTEM_V2
 from agentenv_zeroad.llm import StrategistModel, ToolSpec
 from agentenv_zeroad.spend import SpendGuard
 from agentenv_zeroad.train import smoke
@@ -141,3 +142,11 @@ async def test_the_smoke_command_exits_nonzero_and_names_the_problem(monkeypatch
     assert await smoke.main("http://vllm:8000", "local/qwen-base", 1) == 1
     captured = capsys.readouterr()
     assert "FAILED: call 0: no log-probs for 2 tokens" in captured.err and '"calls": 1' in captured.out
+
+
+async def test_the_smoke_check_sends_the_v2_system_prompt_and_the_v2_order_tools():
+    http, sent = served([reply_json()])
+    await smoke.check("http://vllm:8000", "local/qwen-base", "k", calls=1, http=http)
+    messages, tools = sent[0]["messages"], sent[0]["tools"]
+    assert messages[0]["content"] == STRATEGIST_SYSTEM_V2
+    assert sorted(t["function"]["name"] for t in tools) == sorted(ORDER_TOOLS_V2)
