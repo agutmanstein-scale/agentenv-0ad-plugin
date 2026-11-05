@@ -2,7 +2,7 @@
 fed and the run inside its budget, from a run config (`train/config.py`).
 
     python -m agentenv_zeroad.train.orchestrate run --config run.toml [--play-only]
-    python -m agentenv_zeroad.train.orchestrate tools            # the order tool names, for the learner's --known-tools
+    python -m agentenv_zeroad.train.orchestrate tools            # the policy's v2 order tools, for --known-tools
 
 What it does, each on its own interval:
 
@@ -1087,16 +1087,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument("--play-only", action="store_true", help="credit nothing: play and keep games, train nothing")
     run.add_argument("--mode", choices=("docker", "local"), default="docker")
     run.add_argument("--image", default=None, help="the engine image (docker mode)")
-    sub.add_parser("tools", help="print the order tool names, comma-separated")
+    sub.add_parser("tools", help="print the order tools the policy is offered (interface v2), comma-separated")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.cmd == "tools":
+        from agentenv_zeroad.brains import offered_tools
         from agentenv_zeroad.server import tool_specs
 
-        print(",".join(t.name for t in asyncio.run(tool_specs())))
+        # the order tools the policy is offered on its interface (v2), not every tool the env has (get_brief, ...)
+        print(",".join(t.name for t in offered_tools(asyncio.run(tool_specs()), "v2")))
         return 0
     reason = asyncio.run(serve(args))
     log.info("orchestrator done: %s", reason)

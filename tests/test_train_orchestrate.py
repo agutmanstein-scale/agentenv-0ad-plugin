@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from agentenv_zeroad import spend
+from agentenv_zeroad.brains import ORDER_TOOLS_V2
 from agentenv_zeroad.train import budget, orchestrate
 from agentenv_zeroad.train.config import RunConfig, load_config
 from agentenv_zeroad.train.control import ControlWriter, TripWatch
@@ -958,10 +959,11 @@ def test_only_complete_version_directories_count(tmp_path):
     assert adapters.wanted(10) == {2, 10}
 
 
-def test_the_tools_command_prints_the_order_tool_names(capsys):
+def test_the_tools_command_prints_the_order_tools_the_policy_is_offered_on_v2_and_no_other_env_tool(capsys):
     assert orchestrate.main(["tools"]) == 0
     names = capsys.readouterr().out.strip().split(",")
-    assert "set_economy" in names and "army" in names and re.fullmatch(r"[a-z_,]+", ",".join(names))
+    assert re.fullmatch(r"[a-z_,]+", ",".join(names))
+    assert sorted(names) == sorted(ORDER_TOOLS_V2) and "hold" in names and "get_brief" not in names
 
 
 # ---- a restarted orchestrator ----------------------------------------------------------------------------------
