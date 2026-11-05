@@ -15,12 +15,13 @@ label sits on the same prompt the policy will meet.
 The teacher gets the policy's system prompt and tools for the brief's interface (`default_policy`: `brains.
 strategist_system(interface)` and `server.tool_specs()` as `brains.offered_tools` offers it to that interface; the
 CLI's `--system` and `--tools` override them), and the seat's own per-civ cost tables (the `reference` its game
-recorded) after the prompt, as `Commander.system` composes it, through the same client the strategist uses
-(`llm.py`), under a `SpendGuard` cap. Each call reserves the most it could cost, under a lock, before it is sent, so
-the calls in flight together never take spend past the cap; labelling stops at the first call that does not fit, with what it has. Its tool
-calls become the completion in Qwen's tool-call format, `<tool_call>\\n{"name": ..., "arguments": ...}\\n</tool_call>`
-for each call, then `<|im_end|>`, tokenized with the model's tokenizer. A teacher call that names a tool the policy
-does not have, or whose arguments are not a JSON object, is left out; a brief left with no call is dropped.
+recorded) after the prompt, as `Commander.system` composes it, through the same client the strategist uses (`llm.py`),
+under a `SpendGuard` cap. Each call reserves the most it could cost, under a lock, before it is sent, so the calls in
+flight together never take spend past the cap; labelling stops at the first call that does not fit, with what it has.
+Its tool calls become the completion in Qwen's tool-call format, `<tool_call>\\n{"name": ..., "arguments":
+...}\\n</tool_call>` for each call, then `<|im_end|>`, tokenized with the model's tokenizer. A teacher call that names
+a tool the policy does not have, or whose arguments are not a JSON object, is left out; a brief left with no call is
+dropped.
 
 The label-noise check sends a random subset, an equal share from each stratum, to a second teacher too and reports the
 Jaccard similarity of the two tool sets per brief, overall and per stratum: if two frontier models disagree on which
