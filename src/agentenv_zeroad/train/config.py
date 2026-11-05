@@ -11,7 +11,7 @@
     urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
     keep_versions = [12]                        # snapshots that stay loaded; version 0 is the base model, always served
 
-    [games]                                     # time_cap_minutes, no_cap_share, size, interface, civs, maps ...
+    [games]                                     # time_cap_minutes, no_cap_share, interface, score_rule, civs, maps ...
     [mix]                                       # opponent weights: bot, petra-1 .. petra-5, base (the frozen v0)
     [held_out]                                  # civ_pairs, maps, seeds: never in a training game
     [s3]
@@ -48,7 +48,9 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from agentenv_zeroad import grading
 from agentenv_zeroad.clock import DEFAULT_LATENCY_MS
+from agentenv_zeroad.interface import INTERFACES, Interface
 from agentenv_zeroad.pilot.games import CIVS
 
 RUN1_MIX = {"bot": 0.10, "petra-1": 0.35, "petra-2": 0.35, "petra-3": 0.10, "base": 0.10}
@@ -84,7 +86,8 @@ class GameConfig:
     biome: str = "generic/temperate"
     placement: str = "circle"
     latency_ms: int = DEFAULT_LATENCY_MS
-    interface: str = "v1"
+    interface: Interface = "v2"  # what the LLM seats (the policy and the frozen base) play
+    score_rule: grading.ScoreRule | None = None  # None: the interface's own rule, net_worth on v2
     civs: tuple[str, ...] = CIVS
     maps: tuple[str, ...] = ("mainland",)
     seed_low: int = 1
@@ -95,6 +98,11 @@ class GameConfig:
             raise ValueError("games.seed_low must be below games.seed_high")
         if not 0 <= self.no_cap_share < 1:
             raise ValueError("games.no_cap_share is a share from 0 up to (not including) 1")
+        if self.interface not in INTERFACES:
+            raise ValueError(f"games.interface must be one of {', '.join(INTERFACES)}, not {self.interface!r}")
+        if self.score_rule is not None and self.score_rule not in grading.SCORE_KEYS:
+            raise ValueError(f"games.score_rule must be one of {', '.join(grading.SCORE_KEYS)}")
+        grading.resolve_score_rule(self.score_rule, [self.interface])
         if not self.maps or not self.civs:
             raise ValueError("games.maps and games.civs can't be empty")
         unknown = set(self.civs) - set(CIVS)

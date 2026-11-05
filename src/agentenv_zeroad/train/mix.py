@@ -8,8 +8,10 @@
   straddles two blocks can be off by a few) holds the configured shares and a rating or a milestone never waits on a
   lucky streak. Whether a game has no time cap (it ends by conquest or at the safety cap) is dealt from its own bag the
   same way, independently of the opponent;
-- Petra's behaviour is random over balanced, aggressive and defensive, the map seed and the AI's seed are separate
-  draws, the policy's slot is random, and civs are drawn from every ordered pair the config allows;
+- Petra's behaviour is drawn here from balanced, aggressive and defensive (never Petra's own `random`, so the spec
+  records the one it played), the map seed and the AI's seed are separate draws, the policy's slot is random, and
+  civs are drawn from every ordered pair the config allows;
+- both LLM seats (the policy and the frozen base) play `games.interface`, and `games.score_rule` decides at the cap;
 - nothing held out ever appears: no civ pair in `held_out.civ_pairs` (in either order), no map in `held_out.maps`
   (the config refuses overlap with the training maps) and no seed in `held_out.seeds`.
 
@@ -26,11 +28,13 @@ from dataclasses import replace
 from typing import Any
 
 from agentenv_zeroad.pilot.games import version_model
+from agentenv_zeroad.scenario import AI_BEHAVIORS
 from agentenv_zeroad.spend import LOCAL_PREFIX
 from agentenv_zeroad.train.config import RunConfig
-from agentenv_zeroad.train.spec import AI_BEHAVIORS, DEFAULT_MAX_TOKENS, TRAIN_SAMPLING, GameSpec, SeatSpec
+from agentenv_zeroad.train.spec import DEFAULT_MAX_TOKENS, TRAIN_SAMPLING, GameSpec, SeatSpec
 
 BLOCK = 100
+PETRA_BEHAVIORS = tuple(b for b in AI_BEHAVIORS if b != "random")
 EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
@@ -74,7 +78,7 @@ class GameFactory:
             placement=g.placement,
             time_cap_minutes=None if self._draw_uncapped() else g.time_cap_minutes,
             latency_ms=g.latency_ms,
-            interface=g.interface,
+            score_rule=g.score_rule,
         )
 
     def _draw_opponent(self) -> str:
@@ -124,6 +128,7 @@ class GameFactory:
             extra_body=dict(EXTRA_BODY),
             max_tokens=DEFAULT_MAX_TOKENS,
             trainable=trainable,
+            interface=self.cfg.games.interface,
         )
 
     def _opponent_seat(self, opponent: str, civ: str, url: str) -> SeatSpec:
@@ -131,7 +136,7 @@ class GameFactory:
             return SeatSpec(kind="bot", civ=civ)
         if opponent == "base":
             return self._llm_seat(civ, 0, url)
-        level, behaviour = int(opponent.removeprefix("petra-")), self.rng.choice(AI_BEHAVIORS)
+        level, behaviour = int(opponent.removeprefix("petra-")), self.rng.choice(PETRA_BEHAVIORS)
         return SeatSpec(kind="petra", civ=civ, difficulty=level, behaviour=behaviour)
 
 

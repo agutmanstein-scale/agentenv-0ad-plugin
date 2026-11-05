@@ -8,7 +8,14 @@ import json
 import httpx
 import pytest
 
-from agentenv_zeroad.brains import Commander, CommanderSeat, CommanderSettings, InProcessSeatLink, decision_due
+from agentenv_zeroad.brains import (
+    Commander,
+    CommanderSeat,
+    CommanderSettings,
+    InProcessSeatLink,
+    decision_due,
+    strategist_system,
+)
 from agentenv_zeroad.brains import seat_link as mcp_link
 from agentenv_zeroad.clock import LockstepClock
 from agentenv_zeroad.engine import FakeEngine
@@ -146,22 +153,30 @@ async def env(tmp_path):
         await e.live.stop()
 
 
-async def open_match(http, base) -> None:
+async def open_match(http, base, interface="v1") -> None:
     lobby = f"{base}/agentenv/ext/lobby"
     assert (await http.post(f"{lobby}/open", json={"game_settings": SETTINGS})).status_code == 200
-    seat = {"player_id": "1", "player_kind": "agent", "player_name": "alice", "game_settings": {"civ": "rome"}}
+    mine = {"civ": "rome", "interface": interface}
+    seat = {"player_id": "1", "player_kind": "agent", "player_name": "alice", "game_settings": mine}
     assert (await http.post(f"{lobby}/fill", json=seat)).status_code == 200
     await http.post(f"{lobby}/fill", json={"player_id": "2", "player_kind": "ai", "game_settings": {"civ": "pers"}})
     assert (await http.post(f"{lobby}/close", json={})).json()["status"] == "closed"
 
 
-async def test_the_model_sees_the_same_system_prompt_tools_and_user_message_over_both_links(env):
+@pytest.mark.parametrize(
+    ("interface", "offered"),
+    [
+        ("v1", ["advance_phase", "army", "build", "research", "say", "set_economy", "train"]),
+        ("v2", ["advance_phase", "army", "build", "hold", "research", "say", "set_economy", "train"]),
+    ],
+)
+async def test_the_model_sees_the_same_system_prompt_tools_and_user_message_over_both_links(env, interface, offered):
     async with served(env) as base, httpx.AsyncClient(base_url=base, timeout=30) as http:
-        await open_match(http, base)
+        await open_match(http, base, interface)
         live = env.live
         live.start = lambda: None  # the match stays at its first snapshot, so both links read one state
         bodies = {}
-        async with mcp_link({"url": f"{base}/players/1/mcp"}) as over_mcp:
+        async with mcp_link({"url": f"{base}/players/1/mcp"}, interface) as over_mcp:
             in_process = InProcessSeatLink(live, "1", await tool_specs())
             await in_process.brief()  # drains the opening events, as the MCP link's first brief did
             for name, link in (("mcp", over_mcp), ("in_process", in_process)):
@@ -169,8 +184,9 @@ async def test_the_model_sees_the_same_system_prompt_tools_and_user_message_over
                 model = StrategistModel(
                     "anthropic/claude-opus-5-5", "https://p.example", KEY, SpendGuard("m"), http=fake.http()
                 )
-                commander = Commander(model, CommanderSettings(opening="Win.", game_clock=True))
-                tools = await link.tools()
+                settings = CommanderSettings(opening="Win.", game_clock=True, interface=interface)
+                commander = Commander(model, settings)
+                tools = await commander.offered(link)
                 user = await commander.prepare(link, False)
                 await commander.ask(user, tools)
                 bodies[name] = fake.bodies("/v1/chat/completions")[0]
@@ -178,8 +194,11 @@ async def test_the_model_sees_the_same_system_prompt_tools_and_user_message_over
 
     assert bodies["mcp"] == bodies["in_process"]
     assert json.dumps(bodies["mcp"], sort_keys=True) == json.dumps(bodies["in_process"], sort_keys=True)
-    sent_tools = [t["function"]["name"] for t in bodies["mcp"]["tools"]]
-    assert sent_tools == ["advance_phase", "army", "build", "research", "say", "set_economy", "train"]
+    assert sorted(t["function"]["name"] for t in bodies["mcp"]["tools"]) == offered
+    system = bodies["mcp"]["messages"][0]["content"]
+    assert system.startswith(strategist_system(interface)) and (system != strategist_system(interface)) == (
+        interface == "v2"
+    )
 
 
 async def test_an_order_gets_the_same_result_text_over_both_links_when_its_arguments_are_refused(env):

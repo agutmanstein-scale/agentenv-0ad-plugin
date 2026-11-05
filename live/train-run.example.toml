@@ -29,7 +29,8 @@ base = 0.10
 [games]
 time_cap_minutes = 30
 no_cap_share = 0.15          # these end by conquest or at the 45-minute safety cap
-interface = "v1"             # v2 once the interface switch is merged
+interface = "v2"             # what the LLM seats play (the policy and the frozen base); v1 is allowed
+score_rule = "net_worth"     # decides a game at its cap; it must be the rule the interface's prompt names
 maps = ["mainland"]
 
 # None of these ever appears in a training game; the pre-registered panels use them.

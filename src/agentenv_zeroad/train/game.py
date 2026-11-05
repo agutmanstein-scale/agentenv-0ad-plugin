@@ -11,7 +11,11 @@ Everything else is the live match's, so results.json has the schema the pilot re
   was missed;
 - `sampler`: per LLM seat, what its model did (`StrategistModel.sampler_stats()`: calls, failed calls, and how many
   replies had log-probs aligned with their token ids, misaligned or missing);
-- `spec`: the game spec (without keys), and `interface`, the one it played on.
+- `spec`: the game spec (without keys).
+
+Each LLM seat's commander plays the seat's interface (`SeatSpec.interface`): its system prompt
+(`brains.strategist_system`), with the seat's cost tables appended on v2, its opening (the pilot's, per interface)
+and the tools the interface offers; the seat's plan gets the same interface, so its briefs and executor match.
 """
 
 from __future__ import annotations
@@ -25,12 +29,12 @@ from typing import Any
 
 import httpx
 
-from agentenv_zeroad.brains import STRATEGIST_SYSTEM, Commander, CommanderSeat, CommanderSettings, InProcessSeatLink
+from agentenv_zeroad.brains import Commander, CommanderSeat, CommanderSettings, InProcessSeatLink
 from agentenv_zeroad.clock import DEFAULT_LATENCY_MS, LockstepClock
 from agentenv_zeroad.grading import BRAIN_TIMEOUT_S
 from agentenv_zeroad.llm import StrategistModel, ToolSpec
 from agentenv_zeroad.match import EngineHandle, LiveMatch, MatchConfig
-from agentenv_zeroad.pilot.games import PROMPT
+from agentenv_zeroad.pilot.games import PROMPT, PROMPT_V2
 from agentenv_zeroad.spend import SpendGuard
 from agentenv_zeroad.train.spec import GameSpec, SeatSpec
 from agentenv_zeroad.view import ExecutorView
@@ -167,7 +171,6 @@ async def play_game(
         **dict(match_options or {}),
     )
     match.extra["spec"] = spec.to_json()
-    match.extra["interface"] = spec.interface
     brains: list[CommanderSeat] = []
     try:
         await match.setup()
@@ -189,13 +192,15 @@ async def play_game(
 async def _commander_seat(
     match: LockstepMatch, slot: str, seat: SeatSpec, model: StrategistModel, tools: Sequence[ToolSpec]
 ) -> CommanderSeat:
+    assert seat.interface is not None
     settings = CommanderSettings(
         interval_s=seat.interval_s,
         min_gap_s=seat.min_gap_s,
-        system_prompt=STRATEGIST_SYSTEM,
-        opening=seat.opening if seat.opening is not None else PROMPT,
+        opening=seat.opening if seat.opening is not None else PROMPT if seat.interface == "v1" else PROMPT_V2,
         game_clock=True,
         log_turns=True,
+        interface=seat.interface,
     )
+    commander = Commander(model, settings)
     link = InProcessSeatLink(match, slot, tools)
-    return CommanderSeat(Commander(model, settings), link, slot, await link.tools())
+    return CommanderSeat(commander, link, slot, await commander.offered(link))

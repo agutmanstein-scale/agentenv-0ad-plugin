@@ -932,9 +932,10 @@ def test_the_training_env_example_is_a_g6e_box_with_its_own_rate_and_a_stop_not_
 
 def test_the_training_env_example_matches_the_run_example_and_leaves_two_hours_after_the_run():
     env = dict(line.split("=", 1) for line in TRAIN_ENV.read_text().splitlines() if re.match(r"^[A-Z_]+=", line))
-    from agentenv_zeroad.train.config import load_config
+    from agentenv_zeroad.train.config import check_run, load_config
 
     cfg = load_config(TRAIN_CONFIG)
+    assert (cfg.games.interface, cfg.games.score_rule) == ("v2", "net_worth") and check_run(cfg) == []
     assert float(env["LIVE_BOX_USD_PER_HOUR"]) == cfg.box_usd_per_hour
     assert int(env["LIVE_MAX_HOURS"]) == cfg.duration_hours + 2
     assert env["LIVE_REQUIRE_RATE"] == "1" and env["LIVE_SHUTDOWN_BEHAVIOR"] == "stop"

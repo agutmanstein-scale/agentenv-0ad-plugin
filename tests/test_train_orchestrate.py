@@ -83,6 +83,9 @@ def test_the_amounts_that_stop_a_run_have_no_defaults(tmp_path, missing):
         ({"s3": {"uri": "https://x"}}, "s3://"),
         ({"servers": {}}, "at least one vLLM"),
         ({"box_usd_per_hour": 0}, "must be positive"),
+        ({"games": {"interface": "v3"}}, "games.interface must be one of v1, v2"),
+        ({"games": {"score_rule": "kills"}}, "games.score_rule must be one of"),
+        ({"games": {"interface": "v1", "score_rule": "net_worth"}}, "contradicts the agents' prompt"),
     ],
 )
 def test_a_config_that_could_not_run_as_intended_is_refused(tmp_path, change, message):
@@ -188,6 +191,16 @@ def test_the_policy_seat_is_pinned_and_trainable_and_the_frozen_base_is_not(tmp_
     assert policy.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
     assert spec.game_id == "r1-g000005" and policy_version(spec) == 7
     assert policy_version(factory.next(0, HOSTS[0])) == 0
+
+
+def test_the_llm_seats_play_the_configured_interface_and_its_score_rule_decides_at_the_cap(tmp_path):
+    spec = GameFactory(config(tmp_path, mix={"base": 1.0}), start_index=0).next(1, HOSTS[0])
+    assert [s.interface for s in spec.seats] == ["v2", "v2"] and spec.match_config().score_rule == "net_worth"
+    bot = GameFactory(config(tmp_path, mix={"bot": 1.0}), start_index=0).next(1, HOSTS[0])
+    assert sorted(s.interface for s in bot.seats) == ["v1", "v2"]  # the scripted bot keeps its own interface
+    cfg = config(tmp_path, games={"interface": "v1"}, mix={"base": 1.0})
+    v1 = GameFactory(cfg, start_index=0).next(1, HOSTS[0])
+    assert {s.interface for s in v1.seats} == {"v1"} and v1.match_config().score_rule == "official"
 
 
 def test_repin_moves_the_policy_and_local_seats_and_leaves_a_frontier_seat_alone(tmp_path):

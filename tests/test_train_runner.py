@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from agentenv_zeroad.brains import STRATEGIST_SYSTEM_V2
 from agentenv_zeroad.llm import StrategistModel
 from agentenv_zeroad.match import SAFETY_CAP_S
 from agentenv_zeroad.pilot import scoring
+from agentenv_zeroad.pilot.games import PROMPT_V2, petra
 from agentenv_zeroad.pilot.games import GameSpec as PilotSpec
-from agentenv_zeroad.pilot.games import petra
 from agentenv_zeroad.pool import EnginePool
 from agentenv_zeroad.server import tool_specs
 from agentenv_zeroad.spend import SpendGuard
@@ -65,10 +66,43 @@ def test_a_game_without_a_time_cap_has_no_cap_in_its_config_and_the_safety_cap_b
     assert GameSpec.from_json(spec_json()).match_config().cap_s == 30.0
 
 
-def test_the_interface_is_v1_until_the_interface_switch_is_merged():
-    assert GameSpec.from_json(spec_json()).interface == "v1"
-    with pytest.raises(ValueError, match="interface must be v1"):
-        GameSpec.from_json(spec_json(interface="v2"))
+def test_an_llm_seat_plays_v2_unless_it_asks_for_v1_and_the_score_rule_follows_its_prompt():
+    spec = GameSpec.from_json(spec_json(seats=[QWEN, {"kind": "bot", "civ": "cart"}]))
+    assert [s.interface for s in spec.seats] == ["v2", "v1"]
+    config = spec.match_config()
+    assert [s.interface for s in config.seats] == ["v2", "v1"] and config.score_rule == "net_worth"
+    v1 = GameSpec.from_json(spec_json(seats=[{**QWEN, "interface": "v1"}, {"kind": "petra", "civ": "pers"}]))
+    assert v1.seats[0].interface == "v1" and v1.match_config().score_rule == "official"
+    assert GameSpec.from_json(json.loads(json.dumps(spec.to_json()))) == spec
+    with pytest.raises(ValueError, match="contradicts the agents' prompt"):
+        GameSpec.from_json(spec_json(score_rule="official"))
+    with pytest.raises(ValueError, match="interface must be one of v1, v2"):
+        GameSpec.from_json(spec_json(seats=[{**QWEN, "interface": "v9"}, {"kind": "bot", "civ": "cart"}]))
+
+
+def test_the_game_knobs_and_handicaps_reach_the_match_config_and_the_scenario():
+    petra = {"kind": "petra", "civ": "pers", "behaviour": "random", "experimental_resources": 900}
+    petra["experimental_population_limit"] = 80
+    spec = GameSpec.from_json(
+        spec_json(seats=[QWEN, petra], ai_seed=3, ceasefire_minutes=2, experimental_starting_resources=500)
+    )
+    config = spec.match_config()
+    assert (config.ai_seed, config.ceasefire_minutes, config.starting_resources) == (3, 2, 500)
+    plan = config.seats[1]
+    assert (plan.ai_behavior, plan.starting_resources, plan.population_limit) == ("random", 900, 80)
+    settings = config.scenario()["settings"]
+    assert settings["Ceasefire"] == 2 and settings["StartingResources"] == 500
+    assert settings["PlayerData"][1]["PopulationLimit"] == 80
+
+
+def test_a_replay_seat_names_its_spec_and_plays_through_the_executor(tmp_path):
+    replay = {"kind": "replay", "civ": "pers", "replay": str(tmp_path / "s1.json"), "interface": "v2"}
+    plan = GameSpec.from_json(spec_json(seats=[QWEN, replay])).match_config().seats[1]
+    assert (plan.kind, plan.name, plan.replay, plan.interface) == ("replay", "Replay 2", replay["replay"], "v2")
+    with pytest.raises(ValueError, match="only a replay seat"):
+        GameSpec.from_json(spec_json(seats=[QWEN, {"kind": "replay", "civ": "pers"}]))
+    with pytest.raises(ValueError, match="only a replay seat"):
+        GameSpec.from_json(spec_json(seats=[QWEN, {"kind": "bot", "civ": "pers", "replay": "x.json"}]))
 
 
 def test_a_seat_can_be_marked_trainable_and_the_flag_survives_the_results_spec():
@@ -96,6 +130,10 @@ def test_a_spec_round_trips_through_json_without_a_key():
         ({"seats": [QWEN, {"kind": "petra", "civ": "pers", "difficulty": 9}]}, "difficulty is 0 to 5"),
         ({"seats": [QWEN, {"kind": "petra", "civ": "pers", "level": 2}]}, "unknown seat keys"),
         ({"seats": [QWEN, {"kind": "wizard", "civ": "pers"}]}, "seat kind must be"),
+        ({"seats": [QWEN, {"kind": "petra", "civ": "pers", "behaviour": "sneaky"}]}, "behaviour must be one of"),
+        ({"ceasefire_minutes": -1}, "ceasefire_minutes must be >= 0"),
+        ({"score_rule": "kills"}, "score_rule must be one of"),
+        ({"interface": "v2"}, "unknown game spec keys"),
     ],
 )
 def test_a_bad_spec_is_refused_with_the_reason(change, message):
@@ -149,7 +187,8 @@ def pilot_spec(game_id: str) -> PilotSpec:
 async def test_a_batch_of_games_writes_results_the_pilots_scoring_reads_with_logprobs_and_applied_commands(tmp_path):
     fake = FakeLiteLLM(token_ids=True, delay_s=0.01)
     starter = FakeStarter()
-    specs = [GameSpec.from_json(spec_json(f"g{i}", seed=i)) for i in range(3)]
+    v1 = [{**QWEN, "interface": "v1"}, spec_json()["seats"][1]]  # the pilot's scoring reads v1 games
+    specs = [GameSpec.from_json(spec_json(f"g{i}", seed=i, seats=v1)) for i in range(3)]
     async with EnginePool(2, start_one=starter, mode="local", base_port=23_000) as pool:
         outcomes = await runner.run_games(
             specs,
@@ -168,7 +207,7 @@ async def test_a_batch_of_games_writes_results_the_pilots_scoring_reads_with_log
         results = json.loads((tmp_path / spec.game_id / "results.json").read_text())
         assert results["spec"]["game_id"] == spec.game_id and "commands" in results
         assert results["lockstep"]["latency_ms"] == 5000 and results["clock"]["lockstep"] is True
-        assert results["interface"] == "v1" and results["score_rule"] == "official"
+        assert results["seats"]["1"]["interface"] == "v1" and results["score_rule"] == "official"
         assert results["sampler"]["1"]["calls"] == 2 and results["sampler"]["1"]["failed_calls"] == 0
         assert "2" not in results["sampler"]
         record = scoring.record(pilot_spec(spec.game_id), results)
@@ -181,6 +220,25 @@ async def test_a_batch_of_games_writes_results_the_pilots_scoring_reads_with_log
         assert len(found) == 2 and found[0].prompt_token_ids == [1, 2, 3] and found[0].token_ids == [7, 8]
         assert found[0].began_ms == 0 and found[1].began_ms == 25_000
         assert not (tmp_path / spec.game_id / "commands.txt").exists()
+
+
+async def test_a_v2_seat_plays_on_the_v2_prompt_tools_and_score_rule_and_its_cost_tables(tmp_path):
+    fake = FakeLiteLLM(token_ids=True, tool_calls=[("hold", {}), ("say", {"text": "a"}), ("say", {"text": "b"})])
+    spec = GameSpec.from_json(spec_json("v2"))
+    async with EnginePool(1, start_one=FakeStarter(), mode="local", base_port=23_050) as pool:
+        [outcome] = await runner.run_games(
+            [spec], pool, tmp_path, concurrency=1, model_for=fake_model(fake), match_options={"placer": placer()}
+        )
+    assert outcome.status == "finished"
+    results = json.loads((tmp_path / "v2" / "results.json").read_text())
+    assert results["seats"]["1"]["interface"] == "v2" and results["score_rule"] == "net_worth"
+    first = fake.bodies("/v1/chat/completions")[0]
+    system, user = (m["content"] for m in first["messages"])
+    assert system.startswith(STRATEGIST_SYSTEM_V2 + "\n\n") and len(system) > len(STRATEGIST_SYSTEM_V2) + 100
+    assert user.startswith(PROMPT_V2) and "player 2" in user
+    assert "hold" in [t["function"]["name"] for t in first["tools"]]
+    [turn, *_] = results["seats"]["1"]["turns"]
+    assert [o["status"] for o in turn["orders"]] == ["accepted", "accepted", "rejected"]  # one say() a turn
 
 
 async def test_games_run_at_most_concurrency_at_a_time_on_a_bigger_pool(tmp_path):
