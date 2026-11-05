@@ -66,6 +66,12 @@ async def test_a_local_models_extra_body_goes_into_each_request_and_its_token_id
     assert body["temperature"] == 1.0 and body["chat_template_kwargs"] == {"enable_thinking": False}
     assert body["return_token_ids"] is True and body["max_tokens"] == 2000
     assert reply.prompt_token_ids == [1, 2, 3] and reply.token_ids == [7, 8] and guard.spent_usd == 0
+    assert reply.logprobs == [-0.5, -1.25]
+
+
+async def test_a_reply_without_logprobs_has_none():
+    model = StrategistModel("local/qwen3-8b", "http://h:8000", KEY, SpendGuard("t"), http=FakeLiteLLM().http())
+    assert (await model.call("system", "brief", TOOLS)).logprobs is None
 
 
 async def test_no_model_request_is_sent_once_it_could_pass_the_cap_and_a_failed_call_is_charged():

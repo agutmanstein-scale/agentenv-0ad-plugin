@@ -20,13 +20,14 @@ while [ $# -gt 0 ]; do
 done
 case $CMD in check|show|tick) ;; *) echo "usage: budget.sh check|show [--planned-usd USD --planned-hours H] --budget USD | tick" >&2; exit 2 ;; esac
 [ "$CMD" != check ] || [ -n "$BUDGET" ] || die "budget.sh check needs --budget (LIVE_BUDGET_USD)"
+[ -n "${ZEROAD_BOX_USD_PER_HOUR:-}" ] || die "ZEROAD_BOX_USD_PER_HOUR is not set: the box's rate comes from its /etc/zeroad-live.conf (LIVE_BOX_USD_PER_HOUR); there is no default"
 NOW=${ZEROAD_NOW_EPOCH:-$(date +%s)}
 if [ -n "${ZEROAD_BOOT_EPOCH:-}" ]; then BOOT=$ZEROAD_BOOT_EPOCH
 elif [ "$DRY_RUN" = 1 ]; then BOOT=$NOW; echo "(dry run: as on a box booted now)"
 else BOOT=$(awk '/^btime/ {print $2}' /proc/stat); fi
 if [ "$CMD" = tick ] && [ "$DRY_RUN" = 1 ]; then say "+ record boot $BOOT up to $NOW in $STATE/boxtime.json"; exit 0; fi
 [ "$DRY_RUN" = 1 ] || mkdir -p "$STATE"
-python3 - "$CMD" "$LEDGER" "$PLANNED_USD" "$PLANNED_HOURS" "${BUDGET:-}" "${ZEROAD_BOX_USD_PER_HOUR:-1.32}" "$BOOT" "$NOW" \
+python3 - "$CMD" "$LEDGER" "$PLANNED_USD" "$PLANNED_HOURS" "${BUDGET:-}" "$ZEROAD_BOX_USD_PER_HOUR" "$BOOT" "$NOW" \
   "$STATE/boxtime.json" "$DRY_RUN" <<'PY'
 import json, math, os, pathlib, sys
 
