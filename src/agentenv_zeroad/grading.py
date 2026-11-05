@@ -1,9 +1,11 @@
 """How a 0 A.D. match is decided and graded (spec §4.7): conquest, a time cap with the engine score, draws, forfeits.
 
 The engine decides conquest itself (its conquest victory condition marks the last player standing `won` and the others
-`defeated`). At the time cap the highest engine score among the players still standing wins (a player already
-defeated stays lost, whatever its score); players tied on top (within `draw_margin` points) draw, and everyone else
-loses. Grading follows agentenv-game-env's convention through its
+`defeated`). At the time cap the highest score among the players still standing wins (a player already defeated stays
+lost, whatever its score); players tied on top (within `draw_margin`) draw, and everyone else loses. The score is the
+engine's official total (`official`, the default) or each player's net worth (`net_worth`: what its living units and
+finished structures cost plus its banked resources), per the match's `score_rule`; `draw_margin` is in that measure's
+own units. Grading follows agentenv-game-env's convention through its
 `grade_match`: a win 1, a draw 0.5, a loss 0.
 
 The forfeit rule is about brains, not orders: a brain call that errors or runs past `BRAIN_TIMEOUT_S` counts as
@@ -25,6 +27,8 @@ FORFEIT_SHARE = 0.5
 POINTS = {"won": 1.0, "drawn": 0.5, "lost": 0.0}
 
 Outcome = Literal["won", "lost", "drawn"]
+ScoreRule = Literal["official", "net_worth"]
+SCORE_KEYS: dict[ScoreRule, str] = {"official": "total", "net_worth": "net_worth"}
 
 
 @dataclass(frozen=True)

@@ -7,7 +7,6 @@ import statistics
 import httpx
 import pytest
 
-import agentenv_zeroad.match as match_module
 from agentenv_zeroad.brief_v2 import NOTICES_HEADER, net_worth, notices_in, reference_text
 from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.orders import Army, Hold
@@ -82,11 +81,13 @@ async def test_losses_and_kills_are_counted_since_the_last_brief(tmp_path):
     assert "killed 0 enemy units, lost 0 units" in match.brief("1")
 
 
-async def test_the_net_worth_hook_is_shown_once_the_net_worth_stream_returns_a_number(tmp_path, monkeypatch):
+async def test_the_brief_shows_the_net_worth_the_snapshot_carries_and_leaves_the_line_out_without_one(tmp_path):
     match = make(tmp_path)
     await match.setup()
-    assert net_worth(match.snapshot, 1) is None
-    monkeypatch.setattr(match_module, "net_worth", lambda snapshot, player: 4321)
+    assert net_worth(match.snapshot, 1) is None and "Net worth" not in match.brief("1")
+    match.engine.net_worth = {"1": 4321}
+    await match._tick()
+    assert net_worth(match.snapshot, 1) == 4321
     assert "Score: economy 100, military 0. Net worth 4321." in match.brief("1")
 
 

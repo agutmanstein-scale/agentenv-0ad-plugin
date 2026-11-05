@@ -30,14 +30,22 @@ reflex seat). Before a paid run, check the loop's ledger and after it add the ru
 
 ## Settings
 Lobby (`open_lobby.game_settings`): `map` (mainland), `size` (192), `seed` (7), `biome`, `placement`, `speed`
-(1.0-2.0; 1.0 is real time), `time_cap_minutes` (40), `draw_margin` (0 score points), `fog` (true),
-`start_grace_seconds` (30), `render` (false: render, direct and record the match; needs the live env and speed
-1.0), `rtmp` (false: with render, also push to the RTMP URL in the env's `ZEROAD_RTMP_URL`).
+(1.0-2.0; 1.0 is real time), `time_cap_minutes` (40; 0 is no cap), `safety_cap_minutes` (45: where a game with no
+time cap is decided anyway), `score_rule` (`official`, the engine's score total, or `net_worth`: the cost of a
+player's living units and finished structures plus its banked resources; it decides the game at the time cap or safety
+cap, conquest first), `draw_margin` (0 points of the rule's own measure), `ai_seed` (Petra's seed; the map seed by
+default), `ceasefire_minutes` (0), `fog` (true), `start_grace_seconds` (30), `render` (false: render, direct and
+record the match; needs the live env and speed 1.0), `rtmp` (false: with render, also push to the RTMP URL in the
+env's `ZEROAD_RTMP_URL`). Experimental, names not yet checked against a running 0.28 engine:
+`experimental_starting_resources`.
 
 Player slot (`add_player_slot`): `player_id` is the engine's player number, `"1"` to `"8"`, without gaps.
 `player_kind` is `agent` (a brain playing at `/players/<id>/mcp`) or `ai` with `game_settings.controller` `petra`
-(default) or `bot` (the scripted bot). Also `civ`, `ai_difficulty` (Petra, 0-5), `label`, and for agent and bot seats
-`reflex: "luna"` (GPT-6 Luna reflexes in the env, Setup A) with `reflex_max_usd`.
+(default), `bot` (the scripted bot) or `replay` (a logged order stream: `replay_spec` is the path of a spec from
+`scripts/s1_specs.py`). Also `civ`, `ai_difficulty` (Petra, 0-5), `ai_behavior` (Petra: `random`, `balanced`,
+`aggressive` or `defensive`), `label`, `interface` (`v1` or `v2`), and for agent and bot seats `reflex: "luna"`
+(GPT-6 Luna reflexes in the env, Setup A) with `reflex_max_usd`. Experimental, names not yet checked against a
+running 0.28 engine: `experimental_resources` and `experimental_population_limit`.
 
 ## An agent seat (for model tasks)
 ```json

@@ -154,8 +154,8 @@ def overlay_state(live: LiveMatch) -> dict[str, Any]:
     return {
         "clock": live.game_clock,
         "game_ms": live.time_ms,
-        "cap": clock_text(int(live.config.time_cap_s * 1000)),
-        "time_cap_ms": int(live.config.time_cap_s * 1000),
+        "cap": clock_text(live.cap_ms),
+        "time_cap_ms": live.cap_ms,
         "status": "over" if live.over else "playing" if live.started else "starting",
         "detail": live.detail(),
         "seats": seats,
@@ -164,7 +164,7 @@ def overlay_state(live: LiveMatch) -> dict[str, Any]:
 
 
 def _model_label(kind: str) -> str:
-    return {"petra": "Petra (0 A.D. AI)", "bot": "scripted bot"}.get(kind, "agent")
+    return {"petra": "Petra (0 A.D. AI)", "bot": "scripted bot", "replay": "order replay"}.get(kind, "agent")
 
 
 def overlay_html() -> str:

@@ -76,3 +76,34 @@ def test_scenario_json_round_trips():
 def test_invalid_scenarios_are_rejected(seats, kwargs):
     with pytest.raises(ValueError):
         build_scenario(seats, **kwargs)
+
+
+def test_the_ai_seed_ceasefire_and_per_seat_behaviour_are_separate_knobs():
+    seats = [Seat("Ext", "rome"), Seat("P", "pers", controller="petra", ai_behavior="defensive")]
+    s = build_scenario(seats, seed=5, ai_seed=9, ceasefire_minutes=6)["settings"]
+    assert (s["Seed"], s["AISeed"], s["Ceasefire"]) == (5, 9, 6) and s["PlayerData"][1]["AIBehavior"] == "defensive"
+    assert build_scenario(seats, seed=5)["settings"]["AISeed"] == 5
+
+
+@pytest.mark.parametrize("behavior", ["random", "balanced", "aggressive", "defensive"])
+def test_every_petra_behaviour_the_design_names_is_accepted(behavior):
+    seat = Seat("P", "pers", controller="petra", ai_behavior=behavior)
+    assert build_scenario([seat])["settings"]["PlayerData"][0]["AIBehavior"] == behavior
+
+
+def test_an_unknown_behaviour_or_negative_starting_resources_is_refused():
+    with pytest.raises(ValueError, match="ai_behavior"):
+        build_scenario([Seat("P", "pers", controller="petra", ai_behavior="sneaky")])
+    with pytest.raises(ValueError, match="starting_resources"):
+        build_scenario([Seat("P", "pers")], starting_resources=-1)
+
+
+def test_the_experimental_resources_and_population_limit_are_written_only_when_asked_for():
+    plain = build_scenario([Seat("A", "rome"), Seat("B", "pers")])["settings"]
+    assert "StartingResources" not in plain
+    assert all(not {"Resources", "PopulationLimit"} & set(p) for p in plain["PlayerData"])
+    seats = [Seat("A", "rome", starting_resources=250, population_limit=75), Seat("B", "pers")]
+    s = build_scenario(seats, starting_resources=400)["settings"]
+    assert s["StartingResources"] == 400
+    assert s["PlayerData"][0]["Resources"] == {"food": 250, "wood": 250, "stone": 250, "metal": 250}
+    assert s["PlayerData"][0]["PopulationLimit"] == 75 and "Resources" not in s["PlayerData"][1]

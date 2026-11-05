@@ -22,6 +22,7 @@ class ScriptedEngine(FakeEngine):
             "1": {"state": "active", "total": 120, "economy": 100, "military": 0, "exploration": 20},
             "2": {"state": "active", "total": 90, "economy": 70, "military": 0, "exploration": 20},
         }
+        self.net_worth: dict[str, int] = {}  # player -> net worth the snapshot reports (none: the recorded one's)
         self.fog_calls = 0
         self.saved_replay: bool | None = None
 
@@ -37,7 +38,10 @@ class ScriptedEngine(FakeEngine):
             self.fog_calls += 1
             return {"global": False, "own": [False] * (self.players + 1), "observer": True}
         if '"baseRadius"' in code:
-            return {**copy.deepcopy(self.raw["snapshot"]), "time_ms": self.time_ms}
+            snapshot = {**copy.deepcopy(self.raw["snapshot"]), "time_ms": self.time_ms}
+            for player, worth in self.net_worth.items():
+                snapshot["players"][player]["net_worth"] = worth
+            return snapshot
         if '"resourceRadius"' in code:
             return {**copy.deepcopy(self.raw["view"]), "time_ms": self.time_ms}
         return await super().evaluate(code)

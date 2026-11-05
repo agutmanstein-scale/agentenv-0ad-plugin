@@ -9,8 +9,9 @@ Two texts replace v1's single brief:
   gathering against `min_size`) and what it can afford now. Exploration and the total score are left out: they are not
   what decides the match.
 
-`net_worth` is the hook for the net-worth stream: the time cap is decided by net worth, so once that stream returns
-a number the brief shows it; until then it returns None and the line is left out.
+`net_worth` reads the seat's net worth from its snapshot (`js/snapshot.js`): the cost of its living units and finished
+structures plus its banked resources, which decides a time-capped match under the `net_worth` score rule. A snapshot
+without the number (an older recording) leaves the line out.
 """
 
 from __future__ import annotations
@@ -34,9 +35,9 @@ RESOURCE_LETTER = {"food": "f", "wood": "w", "stone": "s", "metal": "m"}
 
 
 def net_worth(snapshot: Snapshot, player: int) -> int | None:
-    """The seat's net worth: the cost value of its living units and buildings plus its banked resources. The
-    net-worth stream replaces this; the brief leaves the line out while it is None."""
-    return None
+    """The seat's net worth: the cost value of its living units and finished structures plus its banked resources,
+    or None when the snapshot carries none."""
+    return snapshot.players[player].net_worth
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,7 @@ import pytest
 from agentenv_zeroad.grading import BrainCall
 from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.orders import SetEconomy
+from agentenv_zeroad.state import Snapshot
 from tests.zeroad_fakes import Handle, placer
 
 pytestmark = pytest.mark.anyio
@@ -189,7 +190,7 @@ THREE_PETRAS = tuple(
 async def test_a_player_conquered_before_the_time_cap_stays_lost_even_with_the_top_score(tmp_path):
     match = make(tmp_path, THREE_PETRAS, time_cap_s=60)
     totals = {"1": ("defeated", 900), "2": ("active", 500), "3": ("active", 400)}
-    match._read_outcome({p: {"state": s, "total": t} for p, (s, t) in totals.items()})
+    match._read_outcome({p: {"state": s, "total": t} for p, (s, t) in totals.items()}, Snapshot(0, {}))
     match._check_end(60_000)
     assert match.ended_by == "time_cap" and match.outcomes == {"1": "lost", "2": "won", "3": "lost"}
     assert match.detail().startswith("Petra 2 won on score")
@@ -198,7 +199,7 @@ async def test_a_player_conquered_before_the_time_cap_stays_lost_even_with_the_t
 async def test_a_tie_among_the_players_still_standing_at_the_time_cap_is_their_draw(tmp_path):
     match = make(tmp_path, THREE_PETRAS, time_cap_s=60)
     totals = {"1": ("defeated", 900), "2": ("active", 500), "3": ("active", 500)}
-    match._read_outcome({p: {"state": s, "total": t} for p, (s, t) in totals.items()})
+    match._read_outcome({p: {"state": s, "total": t} for p, (s, t) in totals.items()}, Snapshot(0, {}))
     match._check_end(60_000)
     assert match.outcomes == {"1": "lost", "2": "drawn", "3": "drawn"}
 
