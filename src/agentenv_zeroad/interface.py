@@ -9,6 +9,11 @@ The default is `v1` everywhere, so nothing changes unless a seat asks. The seat'
 slot's `interface` setting (`SeatPlan.interface`: the brief, the executor and the order checks) and its brain side from
 `ZEROAD_INTERFACE` (`CommanderSettings.interface`: the prompt, the tool list and the memory). Both must name the same
 version; the pilot's task builder sets both from one `PilotSettings.interface`.
+
+The env's MCP tool list is the same for every seat: it always carries `hold` and the v2 parameters (`min_size`,
+`regroup_below`, `villagers`), and a v1 seat that calls them gets a `not_in_v1` rejection. Only the commander, the one
+brain in this repo, trims the list to its seat's interface (`SeatLink.tools`), so a v1 seat's model sees exactly
+v1's tools. A different MCP client on a v1 seat would be offered the v2 ones.
 """
 
 from __future__ import annotations
