@@ -204,8 +204,7 @@ async def test_finish_plays_the_match_out_and_its_files_are_the_results_and_the_
         "economy",
         "military",
         "exploration",
-        "net_worth",
-    ]
+    ]  # no net_worth: this engine never reported one
     late = json.loads(await call(env, "1", "advance_phase"))
     assert late["code"] in ("match_over", "no_match") or late["status"] == "rejected"
     listed = await env.list_match_files()

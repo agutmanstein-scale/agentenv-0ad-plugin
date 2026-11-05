@@ -126,14 +126,19 @@ async def test_results_record_the_rule_both_measures_and_each_timeline_rows_net_
     assert results["seats"]["2"]["ai_difficulty"] == 3 and "ai_difficulty" not in results["seats"]["1"]
 
 
-async def test_a_net_worth_the_snapshot_did_not_carry_keeps_the_last_known_one(tmp_path):
+async def test_a_net_worth_the_snapshot_did_not_carry_keeps_the_last_known_one_and_counts_it_stale(tmp_path):
     match = make(tmp_path, time_cap_s=60)
     match.engine.net_worth = {"1": 700}
     await match.setup()
-    assert match.scores["1"]["net_worth"] == 700 and match.scores["2"]["net_worth"] == 0
+    assert match.scores["1"]["net_worth"] == 700 and match.scores["2"]["net_worth"] is None
+    assert match.scores["1"]["net_worth_stale"] == 0 and match.scores["2"]["net_worth_stale"] == 1
     match.engine.net_worth = {}
     await match._tick()
-    assert match.scores["1"]["net_worth"] == 700
+    assert match.scores["1"]["net_worth"] == 700 and match.scores["1"]["net_worth_stale"] == 1
+    assert match.scores["2"]["net_worth"] is None and match.scores["2"]["net_worth_stale"] == 2
+    match.engine.net_worth = {"1": 710}
+    await match._tick()
+    assert match.scores["1"]["net_worth"] == 710 and match.scores["1"]["net_worth_stale"] == 0
 
 
 async def test_with_no_time_cap_the_game_runs_to_the_safety_cap_and_is_decided_by_the_rule(tmp_path):

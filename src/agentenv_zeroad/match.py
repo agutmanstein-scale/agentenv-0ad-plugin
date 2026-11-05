@@ -308,7 +308,7 @@ class LiveMatch:
         self.metrics = MatchMetrics(sorted(self.by_player))
         self.trackers: dict[int, EventTracker] = {}
         self.snapshot: Snapshot | None = None
-        self.scores: dict[str, dict[str, float]] = {}
+        self.scores: dict[str, dict[str, Any]] = {}  # net_worth: None until read; net_worth_stale: reads since
         self.states: dict[str, str] = {}
         self.outcomes: dict[str, grading.Outcome] | None = None
         self.ended_by: str | None = None
@@ -506,8 +506,12 @@ class LiveMatch:
             self.states[slot] = str(row.get("state", "active"))
             scores = {k: float(row.get(k, 0)) for k in ("total", "economy", "military", "exploration")}
             seen = snap.players.get(int(p))
-            kept = self.scores.get(slot, {}).get("net_worth", 0.0)
-            scores["net_worth"] = float(seen.net_worth) if seen is not None and seen.net_worth is not None else kept
+            before = self.scores.get(slot, {})
+            if seen is not None and seen.net_worth is not None:
+                scores["net_worth"], scores["net_worth_stale"] = float(seen.net_worth), 0
+            else:  # carried forward, and counted: None until the first reading, then `net_worth_stale` reads missed
+                scores["net_worth"] = before.get("net_worth")
+                scores["net_worth_stale"] = int(before.get("net_worth_stale", 0)) + 1
             self.scores[slot] = scores
         fallen = frozenset(s.plan.player for s in self.seats.values() if self.states.get(s.plan.slot) == "defeated")
         for seat in self.seats.values():
@@ -549,7 +553,7 @@ class LiveMatch:
         elif time_ms >= self.cap_ms:
             key = grading.SCORE_KEYS[self.config.score_rule]
             standing = [slot for slot in self.seats if self.states.get(slot) != "defeated"]
-            measure = {slot: self.scores.get(slot, {}).get(key, 0.0) for slot in standing}
+            measure = {slot: self.scores.get(slot, {}).get(key) or 0.0 for slot in standing}
             outcomes: dict[str, grading.Outcome] = dict.fromkeys(self.seats, "lost")
             outcomes |= grading.time_cap_outcomes(measure, draw_margin=self.config.draw_margin)
             self._end(outcomes, "time_cap" if self.config.time_cap_s > 0 else "safety_cap")

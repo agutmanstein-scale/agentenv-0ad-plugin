@@ -486,7 +486,11 @@ class ZeroADEnv(AgentEnvGameEnv):
                 Score(name="economy", value=sc["economy"], better="higher", unit="points"),
                 Score(name="military", value=sc["military"], better="higher", unit="points"),
                 Score(name="exploration", value=sc["exploration"], better="higher", unit="points"),
-                Score(name="net_worth", value=sc["net_worth"], better="higher", unit="resources"),
+                *(
+                    [Score(name="net_worth", value=sc["net_worth"], better="higher", unit="resources")]
+                    if sc.get("net_worth") is not None
+                    else []
+                ),
             ]
             for slot, sc in live.scores.items()
         }
