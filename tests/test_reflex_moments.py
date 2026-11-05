@@ -444,7 +444,14 @@ async def test_reflex_actions_show_in_the_footer_the_brief_and_results_with_comb
     match.submit("1", Army(action="attack", target="player_2"))
     seat = match.results()["seats"]["1"]
     assert seat["reflex"]["by_kind"] == {"threat:defend": 1}
-    assert set(seat["combat"]) == {"units_lost", "enemy_units_killed", "buildings_lost", "units_trained"}
+    assert set(seat["combat"]) == {
+        "units_lost",
+        "enemy_units_killed",
+        "buildings_lost",
+        "units_trained",
+        "kills_home",
+        "kills_away",
+    }
     reflexes, ordered = seat["actions"]
     assert reflexes["by"] == "reflex" and reflexes["t"] == "01:04" and reflexes["line"] == line
     assert ordered["by"] == "brain" and ordered["what"] == "army(action='attack', target='player_2')"

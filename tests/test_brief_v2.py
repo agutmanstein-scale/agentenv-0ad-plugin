@@ -191,3 +191,21 @@ async def test_the_v2_brief_with_no_time_cap_says_there_is_no_limit_not_the_safe
     text = match.brief("1")
     assert "no time limit (the game is won by conquest)" in text and "left." not in text.split("\n")[0]
     assert "45:00" not in text and "44:" not in text
+
+
+async def test_kills_are_split_into_home_and_away_by_whether_enemies_were_near_the_base(tmp_path):
+    engine = ScriptedEngine(seconds=300)
+    mine = engine.raw["snapshot"]["players"]["1"]
+    mine.setdefault("stats", {})["enemy_units_killed"] = 0
+    match = make(tmp_path, engine=engine)
+    await match.setup()
+    mine["enemies_near_base"] = 3
+    mine["stats"]["enemy_units_killed"] = 4  # a defence
+    await match._tick()
+    mine["enemies_near_base"] = 0
+    mine["stats"]["enemy_units_killed"] = 5  # the last of them, still within the defence's tick
+    await match._tick()
+    mine["stats"]["enemy_units_killed"] = 11  # an attack far from home
+    await match._tick()
+    combat = match.results()["seats"]["1"]["combat"]
+    assert (combat["kills_home"], combat["kills_away"], combat["enemy_units_killed"]) == (5, 6, 11)

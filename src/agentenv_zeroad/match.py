@@ -222,6 +222,10 @@ class SeatState:
     turns: list[dict[str, Any]] = field(default_factory=list)
     brief_stats: dict[str, int] = field(default_factory=dict)  # the combat totals at the last v2 brief
     reference: str | None = None  # the v2 cost tables, written once so every ask gets the same text
+    kills_seen: int = 0  # the engine's enemy_units_killed at the last tick
+    kills_home: int = 0  # kills made while enemy soldiers were within reach of the seat's base
+    kills_away: int = 0  # every other kill
+    enemies_near: bool = False  # enemy soldiers were within reach of the base at the last tick
 
     @property
     def brain_is_luna(self) -> bool:
@@ -488,6 +492,7 @@ class LiveMatch:
                 self.tick_errors += 1
                 log.exception("seat %s: tick failed", seat.plan.slot)
         self.metrics.observe(snap)
+        self._count_kills(snap)
         for tracker in self.trackers.values():
             tracker.update(snap)
         self.snapshot = snap
@@ -496,6 +501,24 @@ class LiveMatch:
         self._sample_timeline(snap)
         self.ticks += 1
         self._check_end(snap.time_ms)
+
+    def _count_kills(self, snap: Snapshot) -> None:
+        """Split each seat's new kills into home and away. The engine counts kills without saying where, so a kill is
+        'home' when enemy soldiers were within reach of the seat's base (`enemies_near_base`) at this tick or the last
+        one, which is when a defence fights; anything else is 'away'."""
+        for seat in self.seats.values():
+            me = snap.players.get(seat.plan.player)
+            if me is None:
+                continue
+            total = int(me.stats.get("enemy_units_killed", 0))
+            new, seat.kills_seen = max(0, total - seat.kills_seen), total
+            near = bool(me.enemies_near_base)
+            if new:
+                if near or seat.enemies_near:
+                    seat.kills_home += new
+                else:
+                    seat.kills_away += new
+            seat.enemies_near = near
 
     def _read_outcome(self, raw: Mapping[str, Any], snap: Snapshot) -> None:
         """Each player's state and score: the engine's parts and total, and the net worth the snapshot read."""
@@ -887,7 +910,9 @@ class LiveMatch:
         if me is None or not me.stats:
             return None
         keys = ("units_lost", "enemy_units_killed", "buildings_lost", "units_trained")
-        return {k: int(me.stats.get(k, 0)) for k in keys}
+        seat = next((s for s in self.seats.values() if s.plan.player == player), None)
+        split = {"kills_home": seat.kills_home, "kills_away": seat.kills_away} if seat is not None else {}
+        return {**{k: int(me.stats.get(k, 0)) for k in keys}, **split}
 
     def results(self) -> dict[str, Any]:
         clock = self.clock.metrics()
