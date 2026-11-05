@@ -206,8 +206,10 @@ def text_brief_v2(snapshot: Snapshot, player: int, events: Sequence, ctx: BriefC
     """The seat's v2 brief: numbers for players, own score and army, what it can afford, then what happened."""
     me = snapshot.players[player]
     clock = clock_text(snapshot.time_ms)
-    timing = f"{clock}, {clock_text(max(0, ctx.cap_ms - snapshot.time_ms))} left" if ctx.cap_ms > 0 else (
-        f"{clock}, no time limit (the game is won by conquest)"
+    timing = (
+        f"{clock}, {clock_text(max(0, ctx.cap_ms - snapshot.time_ms))} left"
+        if ctx.cap_ms > 0
+        else (f"{clock}, no time limit (the game is won by conquest)")
     )
     res = " ".join(f"{r} {me.resources[r]}" for r in RESOURCES)
     gat = " ".join(f"{r} {me.gatherers[r]}" for r in RESOURCES)
@@ -216,8 +218,7 @@ def text_brief_v2(snapshot: Snapshot, player: int, events: Sequence, ctx: BriefC
         score += f" Net worth {ctx.net_worth}."
     villagers = me.units.get("villager", 0)
     lines = [
-        f"Time {timing}. You are player {player} ({me.civ}), "
-        f"{me.state}.",
+        f"Time {timing}. You are player {player} ({me.civ}), {me.state}.",
         f"Phase: {me.phase or 'none'}. Population {me.pop}/{me.pop_cap} (max {me.pop_max}).",
         f"Resources: {res}. Gatherers: {gat}.",
         f"Villagers {villagers} (target {ctx.villager_target}); idle: {len(me.idle_villagers)} villagers, "

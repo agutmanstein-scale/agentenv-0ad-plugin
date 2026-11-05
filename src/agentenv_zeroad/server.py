@@ -670,11 +670,9 @@ class ZeroADEnv(AgentEnvGameEnv):
     ):
         """Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or
         scout."""
-        wave = {
-            "min_size": None if min_size == DEFAULT_MIN_SIZE else min_size,
-            "regroup_below": None if regroup_below == DEFAULT_REGROUP_BELOW else regroup_below,
-        }
-        return await self._order("army", lambda: Army(action=action, target=target, **wave))
+        return await self._order(
+            "army", lambda: Army(action=action, target=target, min_size=min_size, regroup_below=regroup_below)
+        )
 
     @tool()
     async def hold(self):

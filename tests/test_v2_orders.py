@@ -11,7 +11,7 @@ from agentenv_zeroad.brains import MEMORY_MESSAGE_CHARS, STRATEGIST_SYSTEM_V2, _
 from agentenv_zeroad.brief_v2 import NOTICES_HEADER, notices_in, notices_lines
 from agentenv_zeroad.executor import Failure
 from agentenv_zeroad.llm import ToolSpec
-from agentenv_zeroad.orders import BuildRequest, Hold, SetEconomy, Train
+from agentenv_zeroad.orders import DEFAULT_MIN_SIZE, DEFAULT_REGROUP_BELOW, Army, BuildRequest, Hold, SetEconomy, Train
 from tests.executor_fixtures import load, make_executor
 from tests.fake_models import FakeLiteLLM
 from tests.test_brain_loops import Clock, FakeLink, commander
@@ -222,3 +222,11 @@ async def test_a_v1_commander_never_asks_for_the_reference_and_keeps_its_old_mem
     await c.play(link)
     assert c.system == c.settings.system_prompt
     assert c._memory[-1] == 'army({"action":"attack","target":"player_4"}) -> rejected; say({"text":"a"}) -> accepted'
+
+
+def test_an_explicit_default_army_wave_setting_is_recorded_as_unset():
+    explicit = Army(action="attack", target="player_2", min_size=DEFAULT_MIN_SIZE, regroup_below=DEFAULT_REGROUP_BELOW)
+    assert explicit == Army(action="attack", target="player_2")
+    assert (explicit.min_size, explicit.regroup_below) == (None, None)
+    kept = Army(action="attack", target="player_2", min_size=12, regroup_below=0.2)
+    assert (kept.min_size, kept.regroup_below) == (12, 0.2)

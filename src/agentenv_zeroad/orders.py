@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationInfo, field_validator, model_validator
 
 from agentenv_zeroad.state import RESOURCES
 
@@ -120,6 +120,14 @@ class Army(_Order):
         if not TARGET_RE.match(value):
             raise ValueError("target must be home, center, front or a player (player_<n>)")
         return value
+
+    @field_validator("min_size", "regroup_below")
+    @classmethod
+    def _defaults_are_unset(cls, value: float | None, info: ValidationInfo) -> float | None:
+        """An explicit default is the same order as an unset one, whichever way it arrives (MCP or in-process): it is
+        recorded as None, and a v1 seat that passes it is not using a v2 setting."""
+        default = DEFAULT_MIN_SIZE if info.field_name == "min_size" else DEFAULT_REGROUP_BELOW
+        return None if value == default else value
 
     @property
     def target_player(self) -> int | None:
