@@ -774,5 +774,9 @@
     "top_p": 1.0
    }
   }
+ },
+ "mcp": {
+  "get_brief": "Time 00:00. You are Bot (rome), player 1, active.\nPhase: village. Population 18/30 (max 300).\nResources: food 10 wood 20 stone 300 metal 300.\nGatherers: food 5 wood 4 stone 0 metal 0.\nResources left near base: food 1561 metal 5000 stone 5000 wood 6300.\nArmy by role: 12 villager, 2 infantry_melee, 2 infantry_ranged, 1 cavalry (fighting strength 5).\nIdle: 0 villagers; idle units 1 cavalry; 0 production buildings with empty queues.\nBuildings:\n  CivCentre: 1 (ids 150)\n  Farmstead: 0, 1 under construction\n  House: 1 (ids 1946)\n  Storehouse: 1 (ids 1930)\nResearched: soldier_ranged_experience, unit_advanced, unit_elite, upgrade_rank_advanced_mercenary\nResearching: nothing\nCombat so far: killed 0 enemy units; lost 0 units and 0 buildings.\nOpponents: Petra 2 (player 2) standing.\nEnemies in sight: none\nSince last brief: nothing notable.\nTime left before the score decides: 60:00.\nStanding orders: {\"economy\": {\"food\": 55, \"wood\": 40, \"stone\": 0, \"metal\": 5}, \"villager_target\": 45, \"train\": {}, \"build\": [], \"research\": [], \"advance_phase\": false, \"army\": \"gather home\"}\n[00:00 / cap 60:00 \u00b7 playing \u00b7 pop 18/30 \u00b7 f10 w20 s300 m300 \u00b7 village \u00b7 army 5 \u00b7 0 new events (0 urgent): get_brief()]",
+  "train": "{\"status\": \"accepted\", \"message\": \"Queued 5 villager; production starts as resources and houses allow.\", \"footer\": \"[00:00 / cap 60:00 \\u00b7 playing \\u00b7 pop 18/30 \\u00b7 f10 w20 s300 m300 \\u00b7 village \\u00b7 army 5 \\u00b7 0 new events (0 urgent): get_brief()]\"}"
  }
 }

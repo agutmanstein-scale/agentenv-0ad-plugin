@@ -12,9 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from agentenv_game import SlotRequest
+from agentenv_game.routing import PLAYER
 
 from agentenv_zeroad.brains import Commander, SeatLink
 from agentenv_zeroad.llm import StrategistModel, ToolSpec
@@ -111,12 +115,53 @@ def _specs(tools: list[dict[str, Any]]) -> list[ToolSpec]:
     return [ToolSpec(t["name"], t["description"], t["parameters"]) for t in tools]
 
 
+@contextmanager
+def _playing(player_id: str) -> Any:
+    token = PLAYER.set(player_id)
+    try:
+        yield
+    finally:
+        PLAYER.reset(token)
+
+
+async def _mcp_call(env: ZeroADEnv, tool: str, **args: Any) -> str:
+    with _playing("1"):
+        result = await env.mcp.call_tool(tool, args)
+    content = result[0] if isinstance(result, tuple) else result
+    return content[0].text
+
+
+async def mcp_path() -> dict[str, str]:
+    """The same calls over the MCP tool path a deployed agent uses: `get_brief` and an order's result text (with the
+    footer), against a lobby of one agent and Petra on the scripted engine."""
+    with tempfile.TemporaryDirectory() as out:
+
+        async def start() -> Handle:
+            return Handle()
+
+        env = ZeroADEnv(start, Path(out), tick_s=0.05, match_options={"placer": placer()})
+        env.create_app()
+        env.new_lobby({"speed": 2.0, "time_cap_minutes": 60, "start_grace_seconds": 30})
+        env.fill_slot(
+            SlotRequest(player_id="1", player_kind="agent", player_name="alice", game_settings={"civ": "rome"})
+        )
+        env.fill_slot(SlotRequest(player_id="2", player_kind="ai", game_settings={"civ": "pers"}))
+        await env.close_lobby()
+        try:
+            brief = await _mcp_call(env, "get_brief")
+            order = await _mcp_call(env, "train", role="villager", count=5)
+        finally:
+            if env.live is not None:
+                await env.live.stop()
+    return {"get_brief": brief, "train": order}
+
+
 def capture() -> dict[str, Any]:
     async def run() -> dict[str, Any]:
         tools = await _tools()
         snaps = {str(s): await _snapshot(s, tools) for s in SNAPSHOT_SECONDS}
         system = Commander(StrategistModel("local/qwen-base", "http://vllm", KEY, SpendGuard("baseline"))).system
-        return {"system": system, "opening": PROMPT, "tools": tools, "snapshots": snaps}
+        return {"system": system, "opening": PROMPT, "tools": tools, "snapshots": snaps, "mcp": await mcp_path()}
 
     return json.loads(json.dumps(asyncio.run(run())))
 

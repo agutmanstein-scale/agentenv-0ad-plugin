@@ -55,6 +55,7 @@ def test_v1_prompt_tool_schemas_briefs_results_and_requests_are_byte_identical_t
         for key in ("results", "brief", "compact_brief", "user"):
             assert got[key] == frozen[key], (seconds, key)
         assert json.dumps(got["request"]) == json.dumps(frozen["request"]), seconds
+    assert now["mcp"] == FROZEN["mcp"]  # get_brief and an order's result text over the MCP tool path
 
 
 def test_the_frozen_v1_tools_are_the_seven_order_tools_without_v2s_parameters():
