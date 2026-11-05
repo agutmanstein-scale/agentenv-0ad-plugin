@@ -100,10 +100,26 @@ def test_a_wave_that_loses_most_of_its_soldiers_falls_back_to_the_rally_point_an
     out = at(soldiers(seat, around(enemy, ids[:5]), doing="move"), 30_000)
     assert kind(tick(executor, out), "attack-walk") == []  # 5 of 10 is above the 0.4 line: it presses on
     spent = at(soldiers(seat, around(enemy, ids[:3]), doing="fight"), 40_000)
-    back = kind(tick(executor, spent), "attack-walk")
+    commands = tick(executor, spent)
+    back = kind(commands, "walk")
     assert set(back[0]["entities"]) == set(ids[:3]) and near(destination(back), rally)
+    assert kind(commands, "attack-walk") == []  # an attack-walk would re-engage whatever they meet on the way
     report = executor.army.report(executor, spent)
     assert report.waves == () and report.forming == 3
+
+
+def test_survivors_still_fighting_are_walked_out_until_they_reach_the_rally_point():
+    executor, seat, rally = setup(10)
+    ids = list(SOLDIER_IDS)[:10]
+    tick(executor, soldiers(seat, around(rally, ids)))
+    enemy = executor.enemy_bases(seat)[2]
+    tick(executor, at(soldiers(seat, around(enemy, ids[:3]), doing="fight"), 40_000))
+    stuck = at(soldiers(seat, around(enemy, ids[:3]), doing="fight"), 40_000 + 9_000)
+    again = tick(executor, stuck)
+    assert set(kind(again, "walk")[0]["entities"]) == set(ids[:3]) and kind(again, "attack-walk") == []
+    home = at(soldiers(seat, around(rally, ids[:3])), 40_000 + 20_000)
+    assert kind(tick(executor, home), "walk") == []
+    assert executor.army.report(executor, home).forming == 3
 
 
 def test_a_regrouped_survivor_group_launches_again_once_it_is_gathered_or_has_waited():
@@ -230,3 +246,31 @@ def test_with_no_soldiers_at_the_order_the_wait_starts_with_the_first_one_not_th
     assert kind(tick(executor, lone), "attack-walk") == []  # 200 s after the order, but one soldier is no wave
     assert kind(tick(executor, at(lone, WAVE_WAIT_MS - 1_000)), "attack-walk") == []
     assert kind(tick(executor, at(lone, WAVE_WAIT_MS)), "attack-walk")
+
+
+def test_a_raid_with_only_melee_infantry_leaves_no_stale_timer_for_the_first_cavalryman():
+    seat, _ = load(300)
+    executor, _, _ = make_executor(interface="v2")
+    melee = soldiers(seat, around(seat.base, list(SOLDIER_IDS)[:6]))
+    executor.last_seat = melee
+    executor.submit(Army(action="raid", target="player_2"))
+    tick(executor, melee)
+    rally = executor.army.point(executor, melee, "front")
+    cavalry = Unit(8000, "cavalry", rally, "idle", None, "")
+    late = at(replace(melee, units=melee.units + (cavalry,)), WAVE_WAIT_MS + 30_000)
+    assert kind(tick(executor, late), "attack-walk") == []  # 120 s after the order, but one rider is no wave
+    assert kind(tick(executor, at(late, WAVE_WAIT_MS)), "attack-walk")
+
+
+def test_a_forming_group_killed_at_the_rally_point_leaves_the_next_recruit_waiting_the_full_90_seconds():
+    executor, seat, rally = setup(8)
+    wave = list(SOLDIER_IDS)[:8]
+    enemy = executor.enemy_bases(seat)[2]
+    assert kind(tick(executor, soldiers(seat, around(rally, wave))), "attack-walk")
+    out = around(enemy, wave)
+    tick(executor, at(soldiers(seat, out + around(rally, [9100, 9101])), 10_000))
+    tick(executor, at(soldiers(seat, out), 60_000))  # the two recruits die; the wave out is still alive
+    lone = at(soldiers(seat, out + around(rally, [9102])), 105_000)
+    assert [c for c in kind(tick(executor, lone), "attack-walk") if 9102 in c["entities"]] == []
+    launch = kind(tick(executor, at(lone, WAVE_WAIT_MS)), "attack-walk")
+    assert any(9102 in c["entities"] and near(destination([c]), enemy, 3) for c in launch)

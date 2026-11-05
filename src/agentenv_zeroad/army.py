@@ -16,10 +16,11 @@ walking or fighting) or a cooldown passed, so a standing posture doesn't flood t
 Interface v2 sends attacks and raids in waves instead (`_waves`; every other posture is unchanged):
 - soldiers not in a wave gather at the rally point, `point("front")`, and the group launches once `min_size` of them
   stand within `GATHER_M` of it, or `WAVE_WAIT_MS` after the order (or after the last launch, for the next wave),
-  with whoever there is;
+  with whoever there is; the wait runs only while someone is gathering, so an empty group never leaves a stale timer;
 - a launched wave walks to the target as one attack-walk like v1's, and keeps its members: a wave whose survivors
-  fall below `regroup_below` of its launch strength is dissolved and they walk back to the rally point, where they
-  form the next wave with soldiers trained since;
+  fall below `regroup_below` of its launch strength is dissolved and they walk back to the rally point with a plain
+  walk (an attack-walk would re-engage whatever they meet, and a unit mid-fight is walked out of it again until it
+  arrives), where they form the next wave with soldiers trained since;
 - soldiers trained after a launch are never sent alone: they gather for the next wave;
 - an identical army order is not a new order (the executor keeps `seq`), so the wave state and its timer survive the
   brain re-issuing the posture every turn; a changed order bumps `seq` and starts over.
@@ -73,6 +74,7 @@ class WaveState:
     seq: int | None = None
     waves: list[Wave] = field(default_factory=list)
     forming_since: int | None = None
+    regrouping: set[int] = field(default_factory=set)  # survivors of a spent wave still walking back to the rally
 
 
 class ArmyDriver:
@@ -100,9 +102,8 @@ class ArmyDriver:
         posture = ex.book.army
         seat = t.seat
         soldiers = [u for u in seat.soldiers if u.pos is not None]
-        if ex.interface == "v2" and posture.action in ("attack", "raid") and not soldiers:
-            self._state(posture).forming_since = None  # nobody is gathering: the wait starts with the first soldier
-        if posture.action == "gather" or not soldiers:
+        waves = ex.interface == "v2" and posture.action in ("attack", "raid")
+        if posture.action == "gather" or not (soldiers or waves):
             return
         now = seat.time_ms
         fallen = Army(action="attack", target=posture.target).target_player in ex.fallen
@@ -161,23 +162,28 @@ class ArmyDriver:
         spent = [w for w in state.waves if not w.members or len(w.members) < posture.regroup_below * w.launched]
         state.waves = [w for w in state.waves if w not in spent]
         rally = self.point(ex, seat, "front")
-        fallen_back = [alive[i] for w in spent for i in w.members]
-        if fallen_back:
-            self._send(ex, t, fallen_back, rally, ATTACK_CLASSES, fight=True, force=True)
+        state.regrouping = {i for i in state.regrouping | {i for w in spent for i in w.members} if i in alive}
+        state.regrouping = {i for i in state.regrouping if distance(alive[i].pos, rally) > GATHER_M}
+        if state.regrouping:
+            self._send(ex, t, [alive[i] for i in state.regrouping], rally, None, fight=False, force=True)
         out = {i for w in state.waves for i in w.members}
         forming = [u for u in group if u.id not in out]
-        if forming and state.forming_since is None:
+        if not forming:
+            state.forming_since = None
+        elif state.forming_since is None:
             state.forming_since = now
         waited = 0 if state.forming_since is None else now - state.forming_since
         if forming and (len(_gathered(forming, rally)) >= posture.min_size or waited >= WAVE_WAIT_MS):
             state.waves.append(Wave({u.id for u in forming}, len(forming)))
+            state.regrouping -= {u.id for u in forming}
             state.forming_since, forming = None, []
         for wave in state.waves:
             members = [alive[i] for i in wave.members]
             point, wave_classes = self._aim(ex, seat, posture, members, self.point(ex, seat, posture.target), classes)
             self._send(ex, t, members, point, wave_classes, fight=True)
-        if forming:
-            self._send(ex, t, forming, rally, ATTACK_CLASSES, fight=True)
+        gathering = [u for u in forming if u.id not in state.regrouping]
+        if gathering:
+            self._send(ex, t, gathering, rally, ATTACK_CLASSES, fight=True)
 
     def _state(self, posture: ArmyPosture) -> WaveState:
         """The waves of the standing order: a new order (its `seq` changed) starts over, its 90 s from the order."""
