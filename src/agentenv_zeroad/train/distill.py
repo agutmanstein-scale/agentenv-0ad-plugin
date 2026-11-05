@@ -4,15 +4,16 @@ The question (docs/post-training-v2.md): is Qwen's gap to the frontier models a 
 supervised data can fix, or of finding out through play, which needs RL? The probe puts the teacher's answers to about
 3,000 briefs in front of the learner's SFT mode (`trainer/learner.py --sft`) and plays the result on the panel.
 
-Briefs come from finished v2 games the policy already played (a game whose recorded interface is not v2 is skipped:
-v1's prompt has no hold or waves, and a label written under it would not fit the v2 prompt ids it is trained on),
+Briefs come from finished v2 games the policy already played (a game whose policy seat's recorded interface is not v2
+is skipped: v1's prompt has no hold or waves, and a label written under it would not fit the v2 prompt ids it is
+trained on),
 chosen where a good answer is worth most: turns where the policy was behind on net worth in minutes 8 to 12, turns
 after minute 20, and turns where one of its orders was rejected, a third each by default, at most `per_game` from any
 game. A turn is one brief: the user message the policy saw, with the exact prompt token ids it was sampled from, so the
 label sits on the same prompt the policy will meet.
 
 The teacher gets the policy's system prompt and tools for the brief's interface (`default_policy`: `brains.
-strategist_system(interface)` and the env's own tool list trimmed to the order tools that interface offers; the
+strategist_system(interface)` and the env's own tool list as `brains.offered_tools` offers it to that interface; the
 CLI's `--system` and `--tools` override them) through the same client the strategist uses (`llm.py`), under a
 `SpendGuard` cap. Each call reserves the most it could cost, under a lock, before it is sent, so the calls in flight
 together never take spend past the cap; labelling stops at the first call that does not fit, with what it has. Its tool
@@ -48,13 +49,14 @@ from typing import Any, Protocol
 
 import httpx
 
-from agentenv_zeroad import spend
+from agentenv_zeroad import brains, spend
+from agentenv_zeroad.interface import Interface
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, Reply, StrategistModel, ToolSpec
 from agentenv_zeroad.spend import SpendCapReached, SpendGuard
 from agentenv_zeroad.train import results as rs
 
 IM_END = "<|im_end|>"
-INTERFACE = "v2"
+INTERFACE: Interface = "v2"
 STRATA = ("rejected", "behind", "late", "other")
 BEHIND_WINDOW_MIN = (8.0, 12.0)
 LATE_MIN = 20.0
@@ -106,11 +108,11 @@ def candidates(games: Path, learners: Sequence[str] | None = None) -> list[Brief
     out: list[Brief] = []
     for path in sorted(games.glob("*/results.json")):
         results = json.loads(path.read_text())
-        if results.get("status") != "finished" or results.get("interface") != INTERFACE:
+        if results.get("status") != "finished":
             continue
         slot = rs.policy_slot(results, learners)
         opp = rs.other_slot(results, slot) if slot else None
-        if slot is None or opp is None:
+        if slot is None or opp is None or results["seats"][slot].get("interface") != INTERFACE:
             continue
         game_id = str((results.get("spec") or {}).get("game_id") or path.parent.name)
         for turn in results["seats"][slot].get("turns") or []:
@@ -221,23 +223,9 @@ def env_tool_specs() -> list[ToolSpec]:
     return out
 
 
-def default_policy(interface: str) -> Policy:
-    """The system prompt and order tools a seat of `interface` plays with (the env's own, not a hand-kept copy).
-
-    `brains.strategist_system` and `ORDER_TOOLS_V2` come with the v2 tools; before they are merged the v1 prompt and
-    tool list stand in, so this still imports, and the v2 ones are used as soon as they exist."""
-    from agentenv_zeroad import brains
-
-    system = getattr(brains, "strategist_system", None)
-    v2_tools = getattr(brains, "ORDER_TOOLS_V2", (*brains.ORDER_TOOLS, "hold"))
-    offered = v2_tools if interface == "v2" else brains.ORDER_TOOLS
-    compact = getattr(brains, "compact_schema", None) if interface == "v2" else None
-    tools = tuple(
-        ToolSpec(t.name, t.description, compact(t.parameters) if compact else t.parameters)
-        for t in env_tool_specs()
-        if t.name in offered
-    )
-    return Policy(system(interface) if system else brains.STRATEGIST_SYSTEM, tools)
+def default_policy(interface: Interface) -> Policy:
+    """The system prompt and order tools a seat of `interface` plays with (the env's own, not a hand-kept copy)."""
+    return Policy(brains.strategist_system(interface), tuple(brains.offered_tools(env_tool_specs(), interface)))
 
 
 async def label(

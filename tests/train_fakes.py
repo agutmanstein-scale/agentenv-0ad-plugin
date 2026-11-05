@@ -78,13 +78,12 @@ def results(
         seats[slot] = {
             "player": i + 1, "kind": kind, "civ": seats_spec[i]["civ"], "name": f"Seat {slot}",
             "outcome": outcomes[i], "score": score, "turns": (turns or {}).get(slot, []),
-            "model": seats_spec[i].get("model"),
+            "model": seats_spec[i].get("model"), "interface": "v2" if kind == "agent" else "v1",
         }  # fmt: skip
     out: dict[str, Any] = {
         "status": status, "ended_by": ended_by, "game_time_s": 1800.0, "wall_s": 400.0, "map": {"name": "mainland"},
         "seats": seats, "timeline": rows if rows is not None else timeline(),
         "spec": {"game_id": game_id, "seats": seats_spec}, "lockstep": {"latency_ms": 5000},
-        "interface": "v2",
     }  # fmt: skip
     if score_rule is not None:
         out["score_rule"] = score_rule

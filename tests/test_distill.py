@@ -39,7 +39,7 @@ def save_game(
     nw = (50, 100) if behind else (100, 50)
     turns = [brief_turn(m, status="rejected" if m == rejected_at else "accepted") for m in minutes]
     r = results(game_id, turns={"1": turns}, rows=timeline(minutes=30, net_worth=nw), status=status)
-    r["interface"] = interface
+    r["seats"]["1"]["interface"] = interface
     (games / game_id).mkdir(parents=True)
     (games / game_id / "results.json").write_text(json.dumps(r))
 
@@ -265,25 +265,16 @@ async def test_the_second_teacher_labels_only_the_check_subset_and_the_report_ha
 # --- the policy the teacher sees ---
 
 
-def test_the_default_policy_is_the_interfaces_prompt_and_its_order_tools_from_the_env(monkeypatch):
+@pytest.mark.parametrize("interface", ["v1", "v2"])
+def test_the_default_policy_is_the_interfaces_prompt_and_the_tools_a_seat_of_it_is_offered(interface):
     from agentenv_zeroad import brains
 
-    monkeypatch.setattr(
-        D, "env_tool_specs", lambda: [*TOOLS, ToolSpec("status", "not an order tool", {"type": "object"})]
-    )
-    monkeypatch.setattr(brains, "ORDER_TOOLS_V2", ("army", "hold"), raising=False)
-    monkeypatch.setattr(brains, "strategist_system", lambda interface: f"system {interface}", raising=False)
-    policy = D.default_policy("v2")
-    assert policy.system == "system v2" and [t.name for t in policy.tools] == ["army", "hold"]
-
-
-def test_the_default_policy_falls_back_to_the_v1_prompt_where_the_v2_one_is_not_merged_yet(monkeypatch):
-    from agentenv_zeroad import brains
-
-    monkeypatch.delattr(brains, "strategist_system", raising=False)
-    monkeypatch.delattr(brains, "ORDER_TOOLS_V2", raising=False)
-    monkeypatch.setattr(D, "env_tool_specs", lambda: list(TOOLS))
-    assert D.default_policy("v2").system == brains.STRATEGIST_SYSTEM
+    policy = D.default_policy(interface)
+    assert policy.system == brains.strategist_system(interface)
+    assert list(policy.tools) == brains.offered_tools(D.env_tool_specs(), interface)
+    by_name = {t.name: t for t in policy.tools}
+    assert ("hold" in by_name) == (interface == "v2") and "get_brief" not in by_name
+    assert ("min_size" in by_name["army"].parameters["properties"]) == (interface == "v2")
 
 
 def test_the_env_tool_list_comes_from_the_class_without_a_running_server():
