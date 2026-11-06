@@ -10,7 +10,9 @@ under another name (say x.jsonl.tmp) and renames it to a unique x.jsonl, so the 
 game_id, version (the adapter version that sampled it, 0 = the base model), prompt_token_ids, token_ids, logprobs (the
 sampler's log-prob of each completion token, same length as token_ids), advantage (already centred upstream), and
 optionally loss_mask (one number per completion token) and is_hold. A row that fails validation is counted by reason
-and dropped. Read files move to inbox/consumed/.
+and dropped. Read files move to inbox/consumed/. A row flagged `"sft": true` is a teacher label, not a sample: it needs
+only game_id, prompt_token_ids and token_ids (and optionally loss_mask), carries no advantage, and is trained on by the
+auxiliary cross-entropy term below; with that term off (aux_alpha0 = 0) such rows are dropped and counted.
 
 Updates. 256 decisions per update, in 2 minibatches of 128, one epoch. Rows more than `max_staleness` versions older
 than the learner's current version are dropped. When more than 256 valid rows are waiting the freshest go first: the
@@ -28,6 +30,22 @@ loss_mask, or, when it has none, zero on exactly the tokens of say() tool calls.
 KL(pi_after || pi_prox) over minibatch 2's trained tokens is above `kl_stop`, minibatch 2 is skipped. KL is
 estimated on the sampled tokens as r log r - r + 1, which is non-negative and unbiased for data drawn from pi_prox.
 The LM head and log-softmax run in fp32 whatever the model's dtype.
+
+Two terms are added to the minibatch's loss, each over the same trained tokens (the masks) and divided by the same
+B x 128, so a weight reads as "per token, relative to the policy-gradient term":
+  anchor   + beta_t sum_i sum_t m_it k3_it, the KL to a frozen reference policy held on the sampled tokens by the k3
+           estimator r - 1 - log r, r = pi_anchor / pi_theta (non-negative, unbiased for KL(pi_theta || pi_anchor) on
+           tokens drawn from pi_theta). The reference is the adapter given with --anchor (the frozen distilled SFT
+           adapter: RL's pull back to the imitation policy, which made imitation pay off in AlphaStar and VPT), or the
+           base model when none is given. beta_t = beta0 x decay^update, beta0 0.1 and decay 0.999 by default, 0 turns
+           it off. The update count is what a checkpoint and a rollback restore, so the schedule comes back with them.
+           The anchor's log-probs are computed once per update, with no gradient, before the first step; the health
+           record logs kl_to_anchor (its mean over the update's rows) and anchor_beta. kl_to_base, the alarm, stays.
+  aux      + alpha_t sum_i sum_t m_it (-log pi_theta) over the sft-flagged rows, up to aux_rows_per_update beside
+           an update's 256 policy-gradient rows, split over the minibatches. alpha_t = alpha0 x decay^update, alpha0 0.2
+           and decay 0.995 by default. These rows are never in the PG term (no advantage, no ratio, no KL stop or
+           tripwire statistics); they are the teacher's answer on states the policy lost from (the orchestrator's hard-
+           state labels), added only where RL has no signal. The health record logs aux_alpha, aux_rows and aux_ce.
 
 State. LoRA r32 alpha 64 on every linear layer, fp32 master parameters, one AdamW for the whole run, gradient clip 1.0,
 lr constant after a linear warmup. The lr changes only through set_lr() and rollback(), which halves it. With torchrun
@@ -70,11 +88,18 @@ a long reply is not rewarded or punished for its length. Rows need only game_id,
 optionally loss_mask); version, logprobs and advantage are ignored, nothing is dropped as stale, there is no proximal
 pass, no KL stop and no tripwires (the records carry empty ones), and a checkpoint remembers its mode and refuses to
 resume the other. It writes its own adapters, so give it its own --root; a typical SFT lr is higher than the RL one.
+It trains `sft_epochs` passes over the dataset (default 2, reshuffled each pass; the dataset is complete once the
+inbox has gone quiet, so drop it as one file). After each pass it publishes ROOT/epochs/epoch{N}/ (the adapter and a
+manifest with the version and the mean token entropy of the checkpoint and of the base model on a fixed sample of the
+teacher's tokens). Pick the checkpoint to keep by held-out win rate and that entropy ratio, never by the SFT loss:
+`select_sft_checkpoint` in train/stats.py. The epoch count is not saved in a checkpoint: a restart begins a pass again.
 
 Run in the trainer image (vLLM's image with PEFT), after training starts:
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 [--init ADAPTER] --known-tools a,b,c
       [--baseline baseline.json]
-  torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /sft1 --sft --lr 1e-4
+  torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /sft1 --sft --lr 1e-4 [--sft-epochs 2]
+  torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 --init /sft1/epochs/epoch1
+      --anchor /sft1/epochs/epoch1 --known-tools a,b,c
 """
 
 from __future__ import annotations
@@ -101,7 +126,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from peft import LoraConfig, PeftModel, get_peft_model, get_peft_model_state_dict
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 log = logging.getLogger("learner")
@@ -142,6 +167,14 @@ class LearnerConfig:
     gradient_checkpointing: bool = True
     seed: int = 0
     sft: bool = False
+    anchor: str = ""  # a frozen PEFT adapter the policy is held near; "" anchors to the base model
+    anchor_beta0: float = 0.1  # KL-to-anchor weight at update 0; 0 turns the anchor off
+    anchor_decay: float = 0.999  # beta_t = anchor_beta0 * anchor_decay ** update
+    aux_alpha0: float = 0.2  # weight of the cross-entropy on sft-flagged rows at update 0; 0 drops those rows
+    aux_decay: float = 0.995  # alpha_t = aux_alpha0 * aux_decay ** update
+    aux_rows_per_update: int = 32  # most sft-flagged rows trained on beside one update's policy-gradient rows
+    sft_epochs: int = 2  # SFT mode: passes over the dataset; a checkpoint is published after each
+    sft_entropy_rows: int = 128  # SFT mode: rows the epoch-end entropy is measured on
 
     @property
     def inbox(self) -> Path:
@@ -163,6 +196,10 @@ class LearnerConfig:
     def health(self) -> Path:
         return self.root / "health.jsonl"
 
+    @property
+    def epochs(self) -> Path:
+        return self.root / "epochs"
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -183,6 +220,7 @@ class Decision:
     is_hold: bool = False
     mask: list[float] = field(default_factory=list)  # the resolved per-token loss mask (see annotate)
     calls: tuple[ToolCall, ...] = ()
+    aux: bool = False  # an sft-flagged row in an RL run: a teacher label, trained on by cross-entropy, no advantage
 
 
 class RowRejected(ValueError):
@@ -192,24 +230,27 @@ class RowRejected(ValueError):
 
 
 def parse_row(obj: Any, max_len: int, *, sft: bool = False) -> Decision:
-    """A Decision from one JSON row, or RowRejected with the reason it is unusable. An SFT row needs only the ids."""
+    """A Decision from one JSON row, or RowRejected with the reason it is unusable. An SFT row needs only the ids, and
+    so does a row flagged `"sft": true` in an RL run (an auxiliary teacher label: `aux`)."""
     if not isinstance(obj, dict):
         raise RowRejected("not_an_object")
+    aux = not sft and obj.get("sft") is True
+    ids_only = sft or aux
     try:
         prompt, completion = list(obj["prompt_token_ids"]), list(obj["token_ids"])
         game_id = str(obj["game_id"])
         logprobs, advantage, version = (
-            ([], 0.0, 0) if sft else (list(obj["logprobs"]), float(obj["advantage"]), obj["version"])
+            ([], 0.0, 0) if ids_only else (list(obj["logprobs"]), float(obj["advantage"]), obj["version"])
         )
     except (KeyError, TypeError, ValueError) as e:
         raise RowRejected("missing_field") from e
     if not prompt or not completion:
         raise RowRejected("empty")
-    if not sft and len(logprobs) != len(completion):
+    if not ids_only and len(logprobs) != len(completion):
         raise RowRejected("logprobs_length")
     if len(prompt) + len(completion) > max_len:
         raise RowRejected("too_long")
-    if not sft and (not isinstance(version, int) or isinstance(version, bool) or version < 0):
+    if not ids_only and (not isinstance(version, int) or isinstance(version, bool) or version < 0):
         raise RowRejected("bad_version")
     if not math.isfinite(advantage):
         raise RowRejected("bad_advantage")
@@ -227,7 +268,9 @@ def parse_row(obj: Any, max_len: int, *, sft: bool = False) -> Decision:
             raise RowRejected("bad_loss_mask") from e
         if len(loss_mask) != len(completion) or not all(math.isfinite(x) for x in loss_mask):
             raise RowRejected("bad_loss_mask")
-    return Decision(game_id, version, prompt, completion, logprobs, advantage, loss_mask, bool(obj.get("is_hold")))
+    return Decision(
+        game_id, version, prompt, completion, logprobs, advantage, loss_mask, bool(obj.get("is_hold")), aux=aux
+    )
 
 
 _NAME = re.compile(r'"name"\s*:\s*"([^"]*)"')
@@ -276,6 +319,9 @@ class Inbox:
     def __init__(self, cfg: LearnerConfig):
         self.cfg = cfg
         self.pool: list[Decision] = []
+        self.aux: list[Decision] = []  # sft-flagged teacher labels, oldest first
+        self.dataset: list[Decision] = []  # SFT mode: every row accepted, replayed by each further epoch
+        self.epoch, self.epoch_trained, self.finished = 1, 0, False
         self.counts: Counter[str] = Counter()
         cfg.inbox.mkdir(parents=True, exist_ok=True)
         (cfg.inbox / "consumed").mkdir(exist_ok=True)
@@ -288,15 +334,32 @@ class Inbox:
                 if not line.strip():
                     continue
                 try:
-                    self.pool.append(parse_row(json.loads(line), self.cfg.max_len, sft=self.cfg.sft))
-                    accepted += 1
-                    self.counts["accepted"] += 1
+                    row = parse_row(json.loads(line), self.cfg.max_len, sft=self.cfg.sft)
                 except json.JSONDecodeError:
                     self.counts["rejected:bad_json"] += 1
+                    continue
                 except RowRejected as e:
                     self.counts[f"rejected:{e.reason}"] += 1
+                    continue
+                if row.aux:
+                    self._keep_aux(row)
+                    continue
+                self.pool.append(row)
+                if self.cfg.sft:
+                    self.dataset.append(row)
+                accepted += 1
+                self.counts["accepted"] += 1
             os.replace(path, self.cfg.inbox / "consumed" / path.name)
         return accepted
+
+    def _keep_aux(self, row: Decision) -> None:
+        """An sft-flagged row waits for take_aux; with the auxiliary term off it is dropped, and counted apart from the
+        policy-gradient rows so it never shows in the rejected share."""
+        if self.cfg.aux_alpha0 > 0:
+            self.aux.append(row)
+            self.counts["aux_accepted"] += 1
+        else:
+            self.counts["aux_dropped"] += 1
 
     def take(self, current_version: int, *, flush: bool = False) -> list[Decision] | None:
         """The next batch, freshest first, or None while fewer than decisions_per_update valid rows are waiting.
@@ -324,7 +387,35 @@ class Inbox:
         chosen = set(order[:n])
         batch = [self.pool[i] for i in sorted(chosen)]
         self.pool = [row for i, row in enumerate(self.pool) if i not in chosen]
+        if self.cfg.sft:
+            self.epoch_trained += len(batch)
         return batch
+
+    def take_aux(self) -> list[Decision]:
+        """Up to aux_rows_per_update waiting sft-flagged rows, oldest first (a label does not go stale)."""
+        n = self.cfg.aux_rows_per_update
+        batch, self.aux = self.aux[:n], self.aux[n:]
+        return batch
+
+    def epoch_done(self) -> bool:
+        """SFT only, to be asked once the inbox is quiet: the epoch in progress has trained on all its rows."""
+        return self.cfg.sft and not self.finished and self.epoch_trained > 0 and not self.pool
+
+    def entropy_sample(self) -> list[Decision]:
+        """A fixed sample of the dataset for the epoch-end entropy, the same rows at every epoch."""
+        rows = list(self.dataset)
+        random.Random(self.cfg.seed).shuffle(rows)
+        return rows[: self.cfg.sft_entropy_rows]
+
+    def next_epoch(self) -> None:
+        """Close the epoch just published: refill the pool with the dataset reshuffled, or finish after the last."""
+        if self.epoch >= self.cfg.sft_epochs:
+            self.finished = True
+            return
+        self.epoch += 1
+        self.epoch_trained = 0
+        self.pool = list(self.dataset)
+        random.Random(self.cfg.seed * 1_000_003 + self.epoch).shuffle(self.pool)
 
     def drain_counts(self) -> dict[str, int]:
         """What was accepted, rejected (by reason) and dropped as stale since the last call."""
@@ -411,11 +502,26 @@ def sft_terms(logp: torch.Tensor, mask: torch.Tensor) -> TokenTerms:
     return TokenTerms(loss=-(mask * logp).sum(), clipped=0.0, truncated=0.0, tokens=float(mask.sum()))
 
 
+def anchor_k3(logp: torch.Tensor, logp_anchor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """sum_t m_t (r_t - 1 - log r_t), r_t = pi_anchor / pi_theta on the sampled tokens: the k3 estimator, non-negative
+    and unbiased for KL(pi_theta || pi_anchor) on tokens drawn from pi_theta. The anchor's log-probs carry no grad."""
+    delta = logp_anchor.detach() - logp
+    return ((torch.exp(delta) - delta - 1) * mask).sum()
+
+
 def kl_estimate(logp_after: torch.Tensor, logp_before: torch.Tensor, mask: torch.Tensor) -> tuple[float, float]:
     """(sum, count) of r log r - r + 1 over the trained tokens, r = pi_after / pi_before."""
     log_r = logp_after - logp_before
     per_token = torch.exp(log_r) * log_r - torch.exp(log_r) + 1
     return float((per_token * mask).sum()), float(mask.sum())
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """The weights one update uses: beta on the KL to the anchor, alpha on the cross-entropy of sft-flagged rows."""
+
+    beta: float
+    alpha: float
 
 
 class Comm:
@@ -524,6 +630,11 @@ class Learner:
         "entropy_n",
         "base_kl_sum",
         "base_kl_n",
+        "anchor_kl_sum",
+        "anchor_kl_n",
+        "aux_loss",
+        "aux_ce_sum",
+        "aux_tokens",
         "nonfinite_steps",
     )
 
@@ -558,7 +669,33 @@ class Learner:
         backbone = model.get_base_model()
         self.backbone = backbone.model
         self.head_weight = backbone.lm_head.weight.detach().float()
+        self.anchor_weights = self._load_anchor() if cfg.anchor and self.anchor_enabled else {}
         cfg.checkpoints.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def anchor_enabled(self) -> bool:
+        return not self.cfg.sft and self.cfg.anchor_beta0 > 0
+
+    def anchor_beta(self) -> float:
+        """beta_t = beta0 * decay ** update: the weight of the KL to the anchor in the update about to run. It is a
+        function of the update count, which a checkpoint and a rollback restore."""
+        return self.cfg.anchor_beta0 * self.cfg.anchor_decay**self.updates if self.anchor_enabled else 0.0
+
+    def aux_alpha(self) -> float:
+        """alpha_t = alpha0 * decay ** update: the weight of the cross-entropy on sft-flagged rows in this update."""
+        return self.cfg.aux_alpha0 * self.cfg.aux_decay**self.updates if not self.cfg.sft else 0.0
+
+    def _load_anchor(self) -> dict[str, torch.Tensor]:
+        """The frozen anchor adapter's weights, by the trainable parameters' names. They are swapped in for a no-grad
+        pass (anchor_logps), never trained and never published; the adapter must have the learner's shapes."""
+        state = load_file(str(Path(self.cfg.anchor) / "adapter_model.safetensors"), device=str(self.device))
+        weights = {}
+        for name, p in self.params:
+            key = name.replace(".default", "")
+            if key not in state or state[key].shape != p.shape:
+                raise ValueError(f"anchor adapter {self.cfg.anchor} does not fit the learner's LoRA at {key}")
+            weights[name] = state[key].float().contiguous()
+        return weights
 
     def effective_lr(self) -> float:
         return self.lr * min(1.0, (self.updates + 1) / self.cfg.warmup_updates)
@@ -584,22 +721,51 @@ class Learner:
             ent = -(log_probs.exp() * log_probs).sum(-1) if entropy else None
         return logp, ent
 
-    def update(self, rows: list[Decision], intake: dict[str, int] | None = None) -> dict[str, Any]:
-        """One update on `rows`: publishes the next version and returns its health record."""
+    def anchor_logps(self, row: Decision) -> torch.Tensor:
+        """No-grad log-probs of the row's tokens under the anchor: the anchor adapter's weights swapped into the LoRA
+        for the pass, or the base model (adapter off) when no anchor adapter was given."""
+        if not self.anchor_weights:
+            return self.logps(row, grad=False, adapter=False)[0]
+        held = {n: p.detach().clone() for n, p in self.params}
+        with torch.no_grad():
+            for n, p in self.params:
+                p.copy_(self.anchor_weights[n])
+        try:
+            return self.logps(row, grad=False)[0]
+        finally:
+            with torch.no_grad():
+                for n, p in self.params:
+                    p.copy_(held[n])
+
+    def update(
+        self, rows: list[Decision], intake: dict[str, int] | None = None, aux: Sequence[Decision] = ()
+    ) -> dict[str, Any]:
+        """One update on `rows` (and the sft-flagged `aux` rows beside them): publishes the next version and returns its
+        health record."""
         cfg, comm = self.cfg, self.comm
         started, base_version, lr_used = time.time(), self.version, self.effective_lr()
         rows = [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in rows]
         batches = self._minibatches(rows)
         owned = [[r for i, r in enumerate(mb) if i % comm.world == comm.rank] for mb in batches]
+        schedule = Schedule(self.anchor_beta(), self.aux_alpha())
+        aux_rows = (
+            [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in aux] if schedule.alpha else []
+        )
+        m = len(batches)
+        n_aux = len(aux_rows)
+        aux_owned = [
+            [r for i, r in enumerate(aux_rows[k * n_aux // m : (k + 1) * n_aux // m]) if i % comm.world == comm.rank]
+            for k in range(m)
+        ]
         totals: Counter[str] = Counter()
-        prox = {} if cfg.sft else self._prox_pass(rows, owned, totals)
+        prox, anchor = ({}, {}) if cfg.sft else self._prox_pass(rows, owned, totals, schedule.beta > 0)
         stepped, grad_norms, kl_check = 0, [], None
         for j, mb in enumerate(owned):
             if j > 0 and not cfg.sft:
                 kl_check = self._kl_after(mb, prox)
                 if kl_check > cfg.kl_stop:
                     break
-            grad_norms.append(self._train_minibatch(mb, len(batches[j]), prox, totals))
+            grad_norms.append(self._train_minibatch(mb, len(batches[j]), prox, totals, anchor, aux_owned[j], schedule))
             stepped += 1
         reduced = self._reduce(totals)
         self.updates += 1
@@ -609,6 +775,7 @@ class Learner:
         health = self._health(
             rows, reduced, (stepped, trained, grad_norms, kl_check), intake or {}, (started, base_version, lr_used)
         )
+        health |= self._aux_health(reduced, schedule, len(aux_rows))
         health["tripwires"] = self._tripwires(health)
         self._persist(health)
         return health
@@ -628,18 +795,24 @@ class Learner:
         return [order[bounds[k] : bounds[k + 1]] for k in range(m)]
 
     def _prox_pass(
-        self, rows: list[Decision], owned: list[list[Decision]], totals: Counter[str]
-    ) -> dict[int, torch.Tensor]:
-        """log pi_prox of every owned row, before any step, plus the entropy and KL-to-base health samples."""
+        self, rows: list[Decision], owned: list[list[Decision]], totals: Counter[str], with_anchor: bool = False
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """log pi_prox of every owned row, before any step, plus the entropy and KL-to-base health samples; with
+        `with_anchor` also the anchor's log-prob of every owned row (and the KL to it, over all of them)."""
         sample = set(random.Random(self.cfg.seed + self.version).sample(
             range(len(rows)), max(1, math.ceil(self.cfg.base_kl_fraction * len(rows)))
         ))  # fmt: skip
         position = {id(r): i for i, r in enumerate(rows)}
         prox: dict[int, torch.Tensor] = {}
+        anchor: dict[int, torch.Tensor] = {}
         for row in (r for mb in owned for r in mb):
             logp, ent = self.logps(row, grad=False, entropy=not row.is_hold)
             prox[id(row)] = logp
             mask = torch.tensor(row.mask, device=self.device)
+            if with_anchor:
+                anchor[id(row)] = self.anchor_logps(row)
+                totals["anchor_kl_sum"] += float(anchor_k3(logp, anchor[id(row)], mask))
+                totals["anchor_kl_n"] += float(mask.sum())
             if ent is not None:
                 totals["entropy_sum"] += float((ent * mask).sum())
                 totals["entropy_n"] += float(mask.sum())
@@ -648,7 +821,7 @@ class Learner:
                 delta = base_logp - logp
                 totals["base_kl_sum"] += float(((torch.exp(delta) - delta - 1) * mask).sum())
                 totals["base_kl_n"] += float(mask.sum())
-        return prox
+        return prox, anchor
 
     def _kl_after(self, mb: list[Decision], prox: dict[int, torch.Tensor]) -> float:
         """Mean KL(pi_after || pi_prox) over the trained tokens of every rank's share of the minibatch."""
@@ -661,10 +834,21 @@ class Learner:
         return total / max(count, 1.0)
 
     def _train_minibatch(
-        self, mb: list[Decision], size: int, prox: dict[int, torch.Tensor], totals: Counter[str]
+        self,
+        mb: list[Decision],
+        size: int,
+        prox: dict[int, torch.Tensor],
+        totals: Counter[str],
+        anchor: dict[int, torch.Tensor] | None = None,
+        aux: Sequence[Decision] = (),
+        schedule: Schedule | None = None,
     ) -> float:
-        """Accumulate the loss gradient over this rank's rows, sum it across ranks, clip, step. Returns the norm."""
+        """Accumulate the loss gradient over this rank's rows, sum it across ranks, clip, step. Returns the norm.
+
+        `size` is the minibatch's policy-gradient row count and the divisor of every term, so beta and alpha weigh the
+        anchor and the auxiliary cross-entropy against the PG term token for token."""
         cfg = self.cfg
+        schedule = schedule or Schedule(0.0, 0.0)
         self.optimizer.zero_grad(set_to_none=True)
         for row in mb:
             logp, _ = self.logps(row, grad=True)
@@ -675,12 +859,23 @@ class Learner:
                 terms = ppo_terms(
                     logp, prox[id(row)], torch.tensor(row.logprobs, device=self.device), row.advantage, mask, cfg
                 )
-            scaled = terms.loss / (size * cfg.token_divisor)
+            loss = terms.loss
+            if schedule.beta > 0 and anchor:
+                loss = loss + schedule.beta * anchor_k3(logp, anchor[id(row)], mask)
+            scaled = loss / (size * cfg.token_divisor)
             scaled.backward()
             totals["loss"] += float(scaled.detach())
             totals["clipped"] += terms.clipped
             totals["truncated"] += terms.truncated
             totals["tokens"] += terms.tokens
+        for row in aux:
+            logp, _ = self.logps(row, grad=True)
+            terms = sft_terms(logp, torch.tensor(row.mask, device=self.device))
+            scaled = schedule.alpha * terms.loss / (size * cfg.token_divisor)
+            scaled.backward()
+            totals["aux_loss"] += float(scaled.detach())
+            totals["aux_ce_sum"] += float(terms.loss.detach())
+            totals["aux_tokens"] += terms.tokens
         self._sum_grads()
         norm = float(torch.nn.utils.clip_grad_norm_([p for _, p in self.params], cfg.max_grad_norm))
         if not math.isfinite(norm):
@@ -742,6 +937,18 @@ class Learner:
             "intake": intake,
         }
 
+    @staticmethod
+    def _aux_health(t: dict[str, float], schedule: Schedule, aux_rows: int) -> dict[str, Any]:
+        """The anchor's and the auxiliary term's numbers: the KL to the anchor over the update's rows (measured before
+        its first step) and the beta, alpha and mean per-token cross-entropy they were weighed with."""
+        return {
+            "kl_to_anchor": t["anchor_kl_sum"] / t["anchor_kl_n"] if t["anchor_kl_n"] else None,
+            "anchor_beta": schedule.beta,
+            "aux_alpha": schedule.alpha,
+            "aux_rows": aux_rows,
+            "aux_ce": t["aux_ce_sum"] / t["aux_tokens"] if t["aux_tokens"] else None,
+        }
+
     def _persist(self, health: dict[str, Any]) -> None:
         """Checkpoint, publish and log the update just made (rank 0 writes, everyone waits)."""
         if self.comm.rank == 0:
@@ -755,10 +962,6 @@ class Learner:
 
     def publish(self, health: dict[str, Any]) -> Path:
         """Write adapters/v{version}/: the master weights rounded to bf16, the adapter config and manifest.json."""
-        state = {
-            k: v.detach().to(torch.bfloat16).contiguous().cpu()
-            for k, v in get_peft_model_state_dict(self.model).items()
-        }
         manifest = {
             "mode": self.mode,
             "version": self.version,
@@ -769,13 +972,56 @@ class Learner:
             "time": time.time(),
             "health": health,
         }
+        return self._publish_adapter(self.cfg.adapters, f"v{self.version}", manifest)
+
+    def _publish_adapter(self, parent: Path, name: str, manifest: dict[str, Any]) -> Path:
+        state = {
+            k: v.detach().to(torch.bfloat16).contiguous().cpu()
+            for k, v in get_peft_model_state_dict(self.model).items()
+        }
 
         def populate(tmp: Path) -> None:
             self.model.peft_config["default"].save_pretrained(str(tmp))
             save_file(state, str(tmp / "adapter_model.safetensors"), metadata={"format": "pt"})
             (tmp / "manifest.json").write_text(json.dumps(manifest, indent=1))
 
-        return publish_dir(self.cfg.adapters, f"v{self.version}", populate)
+        return publish_dir(parent, name, populate)
+
+    def finish_epoch(self, epoch: int, sample: Sequence[Decision]) -> dict[str, Any]:
+        """SFT mode, after the last update of an epoch: publish epochs/epoch{N}/ (the adapter and a manifest with the
+        epoch's version and the mean token entropy over `sample`, with the adapter and with the base model alone).
+
+        The entropy is measured on the teacher's tokens at every completion position, so the pair says how much
+        sharper than the base the checkpoint has become on that text; `select_sft_checkpoint` (train/stats.py) reads it.
+        Every rank measures its share and the sums are reduced; rank 0 writes."""
+        rows = [annotate(r, self.decode, self.cfg.tool_call_open, self.cfg.tool_call_close) for r in sample]
+        acc = torch.zeros(4, dtype=torch.float64, device=self.device)
+        for row in (r for i, r in enumerate(rows) if i % self.comm.world == self.comm.rank):
+            mask = torch.tensor(row.mask, device=self.device)
+            for k, adapter in ((0, True), (2, False)):
+                _, ent = self.logps(row, grad=False, adapter=adapter, entropy=True)
+                assert ent is not None
+                acc[k] += float((ent * mask).sum())
+                acc[k + 1] += float(mask.sum())
+        total = self.comm.sum(acc).tolist()
+        entropy = total[0] / total[1] if total[1] else None
+        base = total[2] / total[3] if total[3] else None
+        record = {
+            "mode": self.mode,
+            "epoch": epoch,
+            "version": self.version,
+            "update": self.updates,
+            "decisions_total": self.decisions_total,
+            "entropy": entropy,
+            "base_entropy": base,
+            "entropy_ratio": entropy / base if entropy is not None and base else None,
+            "entropy_rows": len(rows),
+            "time": time.time(),
+        }
+        if self.comm.rank == 0:
+            self._publish_adapter(self.cfg.epochs, f"epoch{epoch}", record)
+        self.comm.barrier()
+        return record
 
     def checkpoint_versions(self) -> list[int]:
         return sorted(int(p.stem.removeprefix("ckpt-")) for p in self.cfg.checkpoints.glob("ckpt-*.pt"))
@@ -1022,27 +1268,45 @@ def baseline_from(records: Sequence[dict[str, Any]], window: int = 10) -> dict[s
     return baseline
 
 
-def serve(learner: Learner, inbox: Inbox | None, *, poll: float = 2.0, max_updates: int | None = None) -> None:
-    """Run until a stop command (or max_updates): rank 0 decides each step and every rank carries it out."""
+def serve(
+    learner: Learner,
+    inbox: Inbox | None,
+    *,
+    poll: float = 2.0,
+    max_updates: int | None = None,
+    stop_when: Callable[[], bool] | None = None,
+) -> None:
+    """Run until a stop command (or max_updates, or `stop_when()` on rank 0): rank 0 decides each step and every rank
+    carries it out. In SFT mode, once the inbox has gone quiet and an epoch has trained on all its rows, the epoch's
+    checkpoint is published and the next epoch's pass over the dataset begins, up to `sft_epochs`."""
     done = quiet = 0
     while True:
         action: dict[str, Any] = {"op": "idle"}
         if learner.comm.rank == 0:
             command = learner.pop_command()
+            if command is None and stop_when is not None and stop_when():
+                command = {"op": "stop"}
             if command is not None:
                 action = {"op": "command", "command": command}
             elif inbox is not None:
                 quiet = 0 if inbox.poll() else quiet + 1
                 batch = inbox.take(learner.version, flush=quiet >= 2)
                 if batch is not None:
-                    action = {"op": "update", "rows": batch, "intake": inbox.drain_counts()}
+                    action = {"op": "update", "rows": batch, "intake": inbox.drain_counts(), "aux": inbox.take_aux()}
+                elif quiet >= 2 and inbox.epoch_done():
+                    action = {"op": "epoch_end", "epoch": inbox.epoch, "sample": inbox.entropy_sample()}
         action = learner.comm.broadcast(action)
         if action["op"] == "command":
             if action["command"].get("op") == "stop":
                 return
             learner.apply(action["command"])
+        elif action["op"] == "epoch_end":
+            record = learner.finish_epoch(action["epoch"], action["sample"])
+            log.info("sft epoch %d done: %s", record["epoch"], {k: record[k] for k in ("version", "entropy_ratio")})
+            if inbox is not None:
+                inbox.next_epoch()
         elif action["op"] == "update":
-            health = learner.update(action["rows"], action["intake"])
+            health = learner.update(action["rows"], action["intake"], action["aux"])
             done += 1
             log.info(
                 "version %d: %s", health["version"], {k: health[k] for k in ("trained", "kl_after_mb", "grad_norm")}
@@ -1065,6 +1329,18 @@ def parse() -> argparse.Namespace:
     )
     p.add_argument("--baseline", default="", help="the base model's tripwire baseline (JSON from baseline_from)")
     p.add_argument("--sft", action="store_true", help="cross-entropy on completion tokens; write adapters to --root")
+    p.add_argument("--sft-epochs", type=int, default=2, help="SFT: passes over the dataset, a checkpoint after each")
+    p.add_argument(
+        "--anchor",
+        default="",
+        help="RL: the frozen adapter (the distilled SFT one) the KL penalty holds the policy near; none: the base",
+    )
+    p.add_argument(
+        "--anchor-beta0", type=float, default=0.1, help="RL: KL-to-anchor weight at update 0; 0 turns it off"
+    )
+    p.add_argument("--anchor-decay", type=float, default=0.999, help="RL: beta_t = beta0 * decay ** update")
+    p.add_argument("--aux-alpha0", type=float, default=0.2, help="RL: weight of the CE on sft rows; 0 drops those rows")
+    p.add_argument("--aux-decay", type=float, default=0.995, help="RL: alpha_t = alpha0 * decay ** update")
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", default="bfloat16")
@@ -1086,7 +1362,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     cfg = LearnerConfig(
         base=args.base, root=Path(args.root), init=args.init, lr=args.lr, seed=args.seed, dtype=args.dtype,
-        known_tools=known_tools, sft=args.sft,
+        known_tools=known_tools, sft=args.sft, sft_epochs=args.sft_epochs, anchor=args.anchor,
+        anchor_beta0=args.anchor_beta0, anchor_decay=args.anchor_decay, aux_alpha0=args.aux_alpha0,
+        aux_decay=args.aux_decay,
     )  # fmt: skip
     model = build_model(cfg, device)
     comm.sync_params([p for p in model.parameters() if p.requires_grad])

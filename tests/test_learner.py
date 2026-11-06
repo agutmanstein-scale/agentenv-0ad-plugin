@@ -48,7 +48,7 @@ def config(tmp_path: Path, **overrides) -> L.LearnerConfig:
     values = dict(
         base=str(tmp_path / "base"), root=tmp_path / "run", dtype="float32", rank=4, alpha=8, decisions_per_update=4,
         tool_call_open=OPEN, tool_call_close=CLOSE, known_tools=("army", "hold", "say"), lr=1e-2, warmup_updates=1,
-        kl_stop=1e9, gradient_checkpointing=False,
+        kl_stop=1e9, gradient_checkpointing=False, anchor_beta0=0.0,
     )  # fmt: skip
     return L.LearnerConfig(**{**values, **overrides})
 
