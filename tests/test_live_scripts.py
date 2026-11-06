@@ -164,6 +164,7 @@ CHANGE_SCRIPTS = [
     ("s1.sh", ID, "start"),
     ("s1.sh", ID, "start", "--n", "10", "--replays", "5", "--wall-hours", "1.5", "--engines", "20"),
     ("s1.sh", ID, "fetch"),
+    ("s1.sh", ID, "stop"),
 ]
 
 
@@ -263,6 +264,7 @@ def test_launch_tries_the_next_subnet_when_one_has_no_capacity(stubs):
         ("s1.sh", ID, "start", "--bogus"),
         ("s1.sh", ID, "status", "1", "2"),
         ("s1.sh", ID, "fetch", "extra"),
+        ("s1.sh", ID, "stop", "now"),
         ("s1.sh", "not-an-id", "start"),
     ],
     ids=" ".join,
@@ -1484,7 +1486,7 @@ def test_an_s1_launch_that_falls_back_to_the_next_cpu_type_is_tagged_with_that_t
     out = run(s1_stubs(stubs), "launch.sh", "--yes", extra={"STUB_AWS_RULES": rules})
     assert out.returncode == 0, out.stderr
     runs = [c["argv"] for c in aws_calls(stubs) if "run-instances" in c["argv"]]
-    assert [a[a.index("--instance-type") + 1] for a in runs] == ["c7i.12xlarge", "c6a.12xlarge"]
+    assert [a[a.index("--instance-type") + 1] for a in runs] == ["c7i.12xlarge"] * 2 + ["c6a.12xlarge"]  # per subnet
     tags = runs[-1][runs[-1].index("--tag-specifications") + 1]
     assert "Key=zeroad-box-usd-per-hour,Value=1.836" in tags and "Key=zeroad-instance-type,Value=c6a.12xlarge" in tags
     assert "costs $1.836/h, not the $2.142/h" in out.stderr
@@ -1611,6 +1613,8 @@ import json, shutil, sys
 argv = sys.argv[1:]
 if argv[:2] == ["s3", "cp"]:
     shutil.copy("{archive}", argv[3] + argv[2].rsplit("/", 1)[1])
+elif argv[:2] == ["sts", "get-caller-identity"]:
+    print("123456789012")
 elif "send-command" in argv:
     print("cmd-1")
 elif "get-command-invocation" in argv:

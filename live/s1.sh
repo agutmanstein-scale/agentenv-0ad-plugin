@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s1.sh ID start [--n N] [--replays K] [--wall-hours H] [--engines E] | status [LINES] | fetch  [--yes|--dry-run]
+# s1.sh ID start [--n N] [--replays K] [--wall-hours H] [--engines E] | status [LINES] | fetch | stop  [--yes|--dry-run]
 # The S1 tool check (docs/post-training-v2.md, docs/s1-tool-check.md) on CPU box ID (bootstrapped with bootstrap.sh
 # --cpu), through box/s1.sh. No game has a model seat; the batch is the scripted bot against Petra 1, 2 and 3 on
 # interface v1 and v2 (N games per interface and level, LIVE_S1_PER_CELL, default 100), K pilot games replayed under v1
@@ -11,11 +11,12 @@
 # itself H hours (LIVE_S1_WALL_HOURS, default 2.5) after it started; it is refused when LIVE_BUDGET_USD would be passed
 # or when H leaves LIVE_MAX_HOURS less than an hour for the bootstrap and the fetch. `status` shows the phase, the games
 # done, the load, the memory and the spend. `fetch` copies the results (s1/out, the ledger) back to
-# live/fetched/s1-<time>/ with fetch.sh's mechanism and prints the summary. start and fetch are dry runs unless --yes;
-# status runs unless --dry-run.
+# live/fetched/s1-<time>/ with fetch.sh's mechanism and prints the summary. `stop` ends the batch early (the games
+# done stay in s1/out; no summary is written). start, fetch and stop are dry runs unless --yes; status runs unless
+# --dry-run.
 # shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
-case ${2:-} in status) KIND=read ;; start|fetch) KIND=change ;; *) echo "s1.sh ID start|status|fetch: not '${2:-}'" >&2; usage ;; esac
+case ${2:-} in status) KIND=read ;; start|fetch|stop) KIND=change ;; *) echo "s1.sh ID start|status|fetch|stop: not '${2:-}'" >&2; usage ;; esac
 parse_mode "$KIND" "$@"
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 ID=${1:-}; SUB=$2; shift 2
@@ -62,6 +63,9 @@ case $SUB in
   status)
     [ $# -le 1 ] || die "status takes at most LINES"
     ssm_box "$ID" 120 s1.sh status "$@" ;;
+  stop)
+    [ $# -eq 0 ] || die "stop takes no argument"
+    ssm_box "$ID" 600 s1.sh stop ;;
   fetch)
     [ $# -eq 0 ] || die "fetch takes no argument"
     "$LIVE_DIR/fetch.sh" "$ID" --only s1/out $([ "$DRY_RUN" = 1 ] || echo --yes)
