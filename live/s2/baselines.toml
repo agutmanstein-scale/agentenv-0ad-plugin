@@ -1,0 +1,81 @@
+# The baselines: play-only v0 (the base model on interface v2), through `train-run.sh --play-only`. Its panels go first
+# (the engines then play ordinary training-mix games, weighted to Petra-2 and Petra-3, where v0 loses and a teacher's
+# labels are worth most) until the games hold brief_target distillation briefs. The run ends, reason "complete", when
+# the panels are played and the briefs are there; duration_hours is its backstop.
+stop_when_done = true
+brief_target = 3000
+brief_per_game = 8
+run_id = "s2-baselines"
+root = "/var/lib/zeroad-live/train/s2/baselines"
+duration_hours = 3.5
+budget_usd = 350            # LIVE_BUDGET_USD: the box's hours (counted once, whatever the step) plus frontier spend
+box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false            # the sequence powers the box off itself, once, after the final upload
+engines = 24
+concurrency = 24
+seed = 1
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+bot = 0.05
+petra-1 = 0.10
+petra-2 = 0.50
+petra-3 = 0.35
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.15
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+# None of these appears in a training game; the panels draw from them. No held-out map yet: one that passes the bot
+# smoke test goes in `maps`; until then the panels take the training map with held-out seeds and civ pairs.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+# Teacher calibration: Astra and Opus against Petra-3 and Petra-4 at the policy's latency, 16 games in all.
+[[panels]]
+name = "teacher-calibration"
+kind = "teacher_calibration"
+at_hours = 0
+games = 16
+rungs = [3, 4]
+teachers = [
+  { name = "astra", model = "openai/gpt-6-astra" },
+  { name = "opus", model = "anthropic/claude-opus-5-5" },
+]
+
+# The frontier baseline: 8 Opus, 8 Sonnet and 4 Astra games against v0 at equal latency.
+[[panels]]
+name = "frontier"
+kind = "frontier"
+at_hours = 0
+teachers = [
+  { name = "opus", model = "anthropic/claude-opus-5-5", games = 8 },
+  { name = "sonnet", model = "anthropic/claude-sonnet-5-5", games = 8 },
+  { name = "astra", model = "openai/gpt-6-astra", games = 4 },
+]
+
+# The held-out panel v0 plays, the pre-registered endpoint's baseline: Petra-1/2/3, the bot and a frozen-v0 mirror.
+[[panels]]
+name = "heldout"
+kind = "heldout"
+at_hours = 0
+games = 384
+
+# The pilot's interface on the first held-out positions: base-v1 against v0 on v2 is the interface delta.
+[[panels]]
+name = "heldout-v1"
+kind = "heldout"
+at_hours = 0
+games = 48
+interface = "v1"
+opponents = { "petra-1" = 1, "petra-2" = 1, "petra-3" = 1 }
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-baselines"
