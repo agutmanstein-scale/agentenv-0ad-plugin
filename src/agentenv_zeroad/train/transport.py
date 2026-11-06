@@ -24,16 +24,17 @@ or corrupt object is refused rather than trained on.
 `Store` is the one interface to the prefix: `LocalStore` (a directory, for tests) and `S3Store` (`aws s3` subprocess
 calls with the instance role, like `sync.py`, with an injectable runner).
 
-The learner side (`LearnerSide`, inside the orchestrator when `role = "learner"`) publishes each new current version off
-the main loop, ingests the actors' games through the same credit path as local ones (so the per-opponent baselines,
-strata centring and critic stay single and global), drops games pinned to a version more than `max_version_lag`
-behind, remembers what it has ingested in ROOT/orchestrator/ingested.json, reads the heartbeats into status.json's
-`actors` block and the budget (every actor's box hours at its rate plus its frontier spend count toward `budget_usd`;
-an actor that went quiet without a final heartbeat is counted for at most `actor_stale_minutes` more), and writes
-stop.json at a final stop (complete, duration, budget, tripwire; not for a crash or a restart). The actor side (`ActorSide`, `role = "actor"`) pulls each new version into ROOT/adapters
-atomically, plays the usual game loop with no learner, credit, inbox or panels, ships every finished game with retries
-and backoff, beats, and stops on a stop.json of the learner epoch it follows, on a stale learner pulse, on a games config that differs from
-the learner's, or on its own budget or duration. `transport flush` ships what an actor could not, after it has ended.
+The learner side (`LearnerSide`, inside the orchestrator when `role = "learner"`) publishes each new current version
+off the main loop, ingests the actors' games through the same credit path as local ones (so the per-opponent
+baselines, strata centring and critic stay single and global), drops games pinned to a version more than
+`max_version_lag` behind, remembers what it has ingested in ROOT/orchestrator/ingested.json, reads the heartbeats into
+status.json's `actors` block and the budget (every actor's box hours at its rate plus its frontier spend count toward
+`budget_usd`; an actor that went quiet without a final heartbeat is counted for at most `actor_stale_minutes` more),
+and writes stop.json at a final stop (complete, duration, budget, tripwire; not for a crash or a restart). The actor
+side (`ActorSide`, `role = "actor"`) pulls each new version into ROOT/adapters atomically, plays the usual game loop
+with no learner, credit, inbox or panels, ships every finished game with retries and backoff, beats, and stops on a
+stop.json of the learner epoch it follows, on a stale learner pulse, on a games config that differs from the
+learner's, or on its own budget or duration. `transport flush` ships what an actor could not, after it has ended.
 
 `python -m agentenv_zeroad.train.transport status|stop --uri URI` reads the prefix or writes stop.json by hand.
 """
