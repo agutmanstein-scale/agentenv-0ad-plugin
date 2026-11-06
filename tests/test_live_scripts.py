@@ -511,6 +511,13 @@ def test_the_docker_shim_gives_only_the_live_env_container_the_gpu_the_display_a
     assert run_shim(stubs, "ps", "-a") == ["ps", "-a"]
 
 
+def test_every_script_outside_lib_is_executable():
+    """systemd units and SSM run box scripts by path, so a script committed without its exec bit fails on the box."""
+    scripts = [p for d in (LIVE, LIVE / "box") for p in sorted(d.glob("*.sh"))]
+    assert scripts
+    assert [p.relative_to(LIVE).as_posix() for p in scripts if not os.access(p, os.X_OK)] == []
+
+
 WRONG_TAGS = ["running zeroad-live-onair someone-elses\n", "running other-box zeroad-live\n"]
 
 
