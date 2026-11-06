@@ -143,6 +143,7 @@ CHANGE_SCRIPTS = [
     ("repair.sh", ID),
     ("stop-box.sh", ID),
     ("teardown.sh", ID),
+    ("grow-disk.sh", ID, "500"),
     ("fetch.sh", ID),
     ("fetch.sh", ID, "livestream-1"),
     ("fetch.sh", ID, "--only", "rec/zeroad/2026-10-29_01-00-00-000000.mp4"),
@@ -542,6 +543,30 @@ def test_teardown_terminates_a_box_with_both_tags(stubs):
         "describe-instances", "describe-instances", "terminate-instances", "wait"
     ]
     assert "aws ssm delete-parameters" in out.stderr
+
+
+def test_grow_disk_resizes_the_root_volume_then_the_filesystem_and_never_shrinks(stubs):
+    rules = [
+        ["describe-instances&&BlockDeviceMappings", "vol-0abc\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["describe-volumes-modifications", "optimizing\n", 0],
+        ["describe-volumes", "200\n", 0],
+        ["modify-volume", "modifying\n", 0],
+        ["send-command", "cmd-1\n", 0],
+        ["get-command-invocation&&Status", "Success\n", 0],
+        ["get-command-invocation", '{"StandardOutputContent": "grown\\n"}', 0],
+    ]
+    out = run(stubs, "grow-disk.sh", ID, "500", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"})
+    assert out.returncode == 0, out.stderr
+    calls = [c["argv"] for c in aws_calls(stubs)]
+    modify = [c for c in calls if c[1] == "modify-volume"]
+    assert len(modify) == 1 and "vol-0abc" in modify[0] and "500" in modify[0]
+    assert [c[1] for c in calls].index("modify-volume") < [c[1] for c in calls].index("send-command")
+    rules[3] = ["describe-volumes", "500\n", 0]
+    stubs["log"].unlink()
+    out = run(stubs, "grow-disk.sh", ID, "400", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
+    assert out.returncode != 0 and "only grows" in out.stderr
+    assert not [c for c in aws_calls(stubs) if c["argv"][1] == "modify-volume"]
 
 
 def test_teardown_cancels_a_spot_boxs_persistent_request_before_terminating_it(stubs):
