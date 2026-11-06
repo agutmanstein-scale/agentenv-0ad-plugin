@@ -546,7 +546,7 @@ async def test_a_budget_or_tripwire_stop_cancels_the_actors_games_at_once(tmp_pa
     assert w.learner.credit.games == []
 
 
-@pytest.mark.parametrize("reason", ["signal SIGTERM", "crash: ValueError: x", "cancelled", "learner stalled: 300 rows"])
+@pytest.mark.parametrize("reason", ["signal SIGTERM", "crash: ValueError: x", "cancelled"])
 async def test_only_a_final_stop_writes_stop_json_so_actors_survive_a_learner_restart(world, reason):
     await bring_up(world)
     await world.learner.orch.finish(reason)
@@ -555,7 +555,18 @@ async def test_only_a_final_stop_writes_stop_json_so_actors_survive_a_learner_re
     assert world.actors["a1"].orch.stop_reason is None
 
 
-@pytest.mark.parametrize("reason", ["complete", "duration", "budget: x", "tripwire: [rollback]"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "complete",
+        "duration",
+        "budget: x",
+        "tripwire: [rollback]",
+        "learner stalled: 300 rows",
+        "adapter loads keep failing (v3): is /train mounted at the run's root?",
+        "the budget check keeps failing: the run is not being watched",
+    ],
+)
 async def test_the_final_stops_write_stop_json(world, reason):
     await bring_up(world)
     await world.learner.orch.finish(reason)

@@ -693,7 +693,13 @@ class _Side:
 
 
 STOPS_FOR_ACTORS = ("complete", "duration")  # the learner ending of its own accord: actors drain their games first
-STOP_PREFIXES = ("budget:", "tripwire:")  # final too, but nothing will ingest what an actor would drain
+STOP_PREFIXES = (  # final too, but nothing will ingest what an actor would drain
+    "budget:",
+    "tripwire:",
+    "learner stalled:",
+    "adapter loads keep failing",
+    "the budget check keeps failing",
+)
 
 
 class LearnerSide(_Side):
