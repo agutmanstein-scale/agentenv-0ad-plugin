@@ -2003,7 +2003,7 @@ def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_i
         return base64.b64encode(buffer.getvalue()).decode()
 
     def put(b64: str, **extra):
-        return run_box(box_stubs, "s2.sh", "put-config", b64, DRY_RUN="0", STUB_UNITS="{}", **extra)
+        return run_box(box_stubs, "s2.sh", "put-config", b64, DRY_RUN="0", **{"STUB_UNITS": "{}", **extra})
 
     config = box_stubs["tmp"] / "state" / "train" / "s2-config"
     (config / "old.toml").write_text("old")
