@@ -6,11 +6,18 @@ supervised data can fix, or of finding out through play, which needs RL? The pro
 
 Briefs come from finished v2 games the policy already played (a game whose policy seat's recorded interface is not v2
 is skipped: v1's prompt has no hold or waves, and a label written under it would not fit the v2 prompt ids it is
-trained on; so is one with no recorded reference text, whose policy prompt can't be rebuilt),
-chosen where a good answer is worth most: turns where the policy was behind on net worth in minutes 8 to 12, turns
-after minute 20, and turns where one of its orders was rejected, a third each by default, at most `per_game` from any
-game. A turn is one brief: the user message the policy saw, with the exact prompt token ids it was sampled from, so the
-label sits on the same prompt the policy will meet.
+trained on; so is one with no recorded reference text, whose policy prompt can't be rebuilt). They are chosen on the
+student's own states, DAgger-style (the teacher labels what the student reached, not what the teacher would have
+reached: the literature finds that beats SFT on the teacher's games), weighted to where a good answer is worth most:
+  losing    the policy was behind on net worth at decision time in a game it went on to lose to Petra-2 or Petra-3
+            (`losing_opponents`): 60% by default
+  late      turns from minute 20 on: 20%
+  rejected  turns where one of its orders was rejected: 20%
+at most `per_game` from any game; a stratum that cannot fill its share hands the rest on, and what is left over is
+`other`. A turn goes in the first of the strata above that it fits. `--weights losing=0.5,late=0.25,rejected=0.25`
+changes the shares, and the default is 3,000 labels. A turn is one brief: the user message the policy saw, with the
+exact prompt token ids it was sampled from, so the label sits on the same prompt the policy will meet. The same
+labelling path labels the orchestrator's hard-state turns during RL (`hardstate.py`).
 
 The teacher gets the policy's system prompt and tools for the brief's interface (`default_policy`: `brains.
 strategist_system(interface)` and `server.tool_specs()` as `brains.offered_tools` offers it to that interface; the
@@ -27,10 +34,17 @@ The label-noise check sends a random subset, an equal share from each stratum, t
 Jaccard similarity of the two tool sets per brief, overall and per stratum: if two frontier models disagree on which
 tools to call, the labels are noisier than the SFT can resolve.
 
-SFT rows are `{game_id, version: 0, prompt_token_ids, token_ids, teacher, stratum, interface}`: the ids the learner's
-SFT mode reads (the extra fields are ignored), one JSON object per line. `write_inbox` shuffles them into one inbox
-file per epoch, so the learner takes them epoch by epoch.
+SFT rows are `{game_id, version: 0, sft: true, prompt_token_ids, token_ids, teacher, stratum, interface}`: the ids the
+learner reads (the extra fields are ignored; `sft: true` is what makes an RL learner treat the row as an auxiliary
+teacher label), one JSON object per line. `write_inbox` writes them as one inbox file; the SFT learner makes its own
+epochs over them (`learner.py --sft-epochs`).
 
+The teacher is named with `--teacher`, or picked from the teacher calibration panel with `--calibration DIR` (its
+folder under ROOT/panels): the frontier model with the best win rate against Petra-3, ties broken by Petra-4
+(`stats.pick_teacher`), and the runner-up as the label-noise check's second teacher.
+
+  python -m agentenv_zeroad.train.distill --games DIR --out DIR --tokenizer Qwen/Qwen3-8B \\
+      --calibration ROOT/panels/teacher-calibration --base-url URL --api-key-env VAR --cap-usd 60
   python -m agentenv_zeroad.train.distill --games DIR --out DIR --tokenizer Qwen/Qwen3-8B \\
       --teacher anthropic/claude-opus-5-5 --second-teacher openai/gpt-6-astra --base-url URL --api-key-env VAR
 """
@@ -44,7 +58,7 @@ import os
 import random
 import statistics
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -56,13 +70,15 @@ from agentenv_zeroad.interface import Interface
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, Reply, StrategistModel, ToolSpec
 from agentenv_zeroad.spend import SpendCapReached, SpendGuard
 from agentenv_zeroad.train import results as rs
+from agentenv_zeroad.train import stats
 
 IM_END = "<|im_end|>"
 INTERFACE: Interface = "v2"
-STRATA = ("rejected", "behind", "late", "other")
-BEHIND_WINDOW_MIN = (8.0, 12.0)
+STRATA = ("losing", "rejected", "late", "other")
 LATE_MIN = 20.0
-DEFAULT_WEIGHTS = {"rejected": 1 / 3, "behind": 1 / 3, "late": 1 / 3}
+LOSING_OPPONENTS = ("petra-2", "petra-3")
+DEFAULT_WEIGHTS = {"losing": 0.6, "rejected": 0.2, "late": 0.2}
+DEFAULT_LABELS = 3000
 
 
 class Teacher(Protocol):
@@ -99,6 +115,7 @@ class Brief:
     stratum: str
     interface: str = INTERFACE
     reference: str = ""  # the seat's cost tables, which its system prompt carried after the prompt text
+    opponent: str = ""  # the opponent's id (petra-3, v0, ...)
 
     @property
     def key(self) -> str:
@@ -106,51 +123,90 @@ class Brief:
 
 
 # ---- choosing the briefs ----------------------------------------------------------------------------------------
-def candidates(games: Path, learners: Sequence[str] | None = None) -> list[Brief]:
+def candidates(
+    games: Path, learners: Sequence[str] | None = None, losing_opponents: Collection[str] | None = LOSING_OPPONENTS
+) -> list[Brief]:
     """Every usable turn of every finished v2 game's policy seat, each tagged with its stratum."""
     out: list[Brief] = []
     for path in sorted(games.glob("*/results.json")):
-        results = json.loads(path.read_text())
-        if results.get("status") != "finished":
-            continue
-        slot = rs.policy_slot(results, learners)
-        opp = rs.other_slot(results, slot) if slot else None
-        if slot is None or opp is None or results["seats"][slot].get("interface") != INTERFACE:
-            continue
-        reference = str(results["seats"][slot].get("reference") or "")
-        if not reference:
-            continue
-        game_id = str((results.get("spec") or {}).get("game_id") or path.parent.name)
-        for turn in results["seats"][slot].get("turns") or []:
-            if not (turn.get("user") and turn.get("prompt_token_ids") and turn.get("began_ms") is not None):
-                continue
-            stratum = _stratum(results, slot, opp, turn)
-            out.append(
-                Brief(
-                    game_id,
-                    slot,
-                    int(turn["began_ms"]),
-                    turn["user"],
-                    tuple(turn["prompt_token_ids"]),
-                    stratum,
-                    reference=reference,
-                )
-            )
+        out += briefs_of(json.loads(path.read_text()), path.parent.name, learners, losing_opponents)
     return out
 
 
-def _stratum(results: Mapping[str, Any], slot: str, opp: str, turn: Mapping[str, Any]) -> str:
-    """rejected, else behind (net worth, in minutes 8 to 12), else late (from minute 20), else other."""
+def briefs_of(
+    results: Mapping[str, Any],
+    name: str,
+    learners: Sequence[str] | None = None,
+    losing_opponents: Collection[str] | None = LOSING_OPPONENTS,
+) -> list[Brief]:
+    """The usable turns of one game's results (`name` is its id when the spec has none); none for a game that did not
+    finish, was not played on v2 or recorded no reference text."""
+    if results.get("status") != "finished":
+        return []
+    slot = rs.policy_slot(results, learners)
+    opp = rs.other_slot(results, slot) if slot else None
+    if slot is None or opp is None or results["seats"][slot].get("interface") != INTERFACE:
+        return []
+    reference = str(results["seats"][slot].get("reference") or "")
+    if not reference:
+        return []
+    game_id = str((results.get("spec") or {}).get("game_id") or name)
+    out = []
+    for turn in results["seats"][slot].get("turns") or []:
+        if not (turn.get("user") and turn.get("prompt_token_ids") and turn.get("began_ms") is not None):
+            continue
+        stratum = _stratum(results, slot, opp, turn, losing_opponents)
+        out.append(
+            Brief(
+                game_id,
+                slot,
+                int(turn["began_ms"]),
+                turn["user"],
+                tuple(turn["prompt_token_ids"]),
+                stratum,
+                reference=reference,
+                opponent=rs.player_id(results, opp),
+            )
+        )
+    return out
+
+
+def _stratum(
+    results: Mapping[str, Any],
+    slot: str,
+    opp: str,
+    turn: Mapping[str, Any],
+    losing_opponents: Collection[str] | None = LOSING_OPPONENTS,
+) -> str:
+    """losing, else rejected, else late (from minute 20), else other.
+
+    Losing is the DAgger stratum: the policy's net worth was below its opponent's when it decided (the official score
+    when a net worth was not read) in a game it went on to lose against one of `losing_opponents` (None: any)."""
+    began = turn["began_ms"]
+    if results["seats"][slot].get("outcome") == "lost" and (
+        losing_opponents is None or rs.player_id(results, opp) in losing_opponents
+    ):
+        players = (rs.timeline_at(results, began) or {}).get("players") or {}
+        mine, theirs = players.get(slot) or {}, players.get(opp) or {}
+        key = "net_worth" if mine.get("net_worth") is not None and theirs.get("net_worth") is not None else "total"
+        if (mine.get(key) or 0) < (theirs.get(key) or 0):
+            return "losing"
     if any(o.get("status") == "rejected" for o in turn.get("orders") or []):
         return "rejected"
-    minute = turn["began_ms"] / 60_000
-    row = rs.timeline_at(results, turn["began_ms"])
-    players = (row or {}).get("players") or {}
-    mine, theirs = players.get(slot) or {}, players.get(opp) or {}
-    key = "net_worth" if mine.get("net_worth") is not None and theirs.get("net_worth") is not None else "total"
-    if BEHIND_WINDOW_MIN[0] <= minute <= BEHIND_WINDOW_MIN[1] and (mine.get(key) or 0) < (theirs.get(key) or 0):
-        return "behind"
-    return "late" if minute >= LATE_MIN else "other"
+    return "late" if began / 60_000 >= LATE_MIN else "other"
+
+
+def parse_weights(text: str) -> dict[str, float]:
+    """`losing=0.5,late=0.25,rejected=0.25` as stratum weights (any positive numbers: they are shares of their sum)."""
+    weights: dict[str, float] = {}
+    for part in filter(None, (p.strip() for p in text.split(","))):
+        name, _, value = part.partition("=")
+        if name not in STRATA[:-1] or not value:
+            raise ValueError(f"a weight is STRATUM=NUMBER with STRATUM one of {', '.join(STRATA[:-1])}: {part!r}")
+        weights[name] = float(value)
+    if not weights or any(w < 0 for w in weights.values()) or sum(weights.values()) <= 0:
+        raise ValueError("weights must be non-negative and not all zero")
+    return weights
 
 
 def select(
@@ -306,11 +362,13 @@ def sft_rows(labels: Sequence[Label], tokenizer: Tokenizer, teacher: str) -> lis
             {
                 "game_id": item.brief.key,
                 "version": 0,
+                "sft": True,
                 "prompt_token_ids": list(item.brief.prompt_token_ids),
                 "token_ids": list(tokenizer.encode(completion_text(item.calls), add_special_tokens=False)),
                 "teacher": teacher,
                 "stratum": item.brief.stratum,
                 "interface": item.brief.interface,
+                "opponent": item.brief.opponent,
             }
         )
     return rows
@@ -384,22 +442,32 @@ def write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
 
-def write_inbox(rows: Sequence[Mapping[str, Any]], inbox: Path, *, epochs: int = 1, seed: int = 0) -> list[Path]:
-    """One learner inbox file per epoch (rows reshuffled each time), written as *.tmp and renamed into place."""
+def write_inbox(rows: Sequence[Mapping[str, Any]], inbox: Path, *, seed: int = 0, name: str = "sft") -> Path:
+    """The rows, shuffled, as one learner inbox file `name.jsonl`, written as *.tmp and renamed into place. The SFT
+    learner reads a dataset that arrives whole and makes its own epochs over it."""
     inbox.mkdir(parents=True, exist_ok=True)
-    written = []
-    for epoch in range(epochs):
-        order = list(rows)
-        random.Random(seed + epoch).shuffle(order)
-        final = inbox / f"sft-epoch{epoch:02d}.jsonl"
-        tmp = final.with_name(final.name + ".tmp")
-        write_rows(tmp, order)
-        tmp.replace(final)
-        written.append(final)
-    return written
+    order = list(rows)
+    random.Random(seed).shuffle(order)
+    final = inbox / f"{name}.jsonl"
+    tmp = final.with_name(final.name + ".tmp")
+    write_rows(tmp, order)
+    tmp.replace(final)
+    return final
 
 
 # ---- the command line -------------------------------------------------------------------------------------------
+def teachers_from_calibration(folder: Path) -> list[str]:
+    """The calibration panel's teachers' model names, best first (`stats.rank_teachers`); SystemExit when none played
+    Petra-3, because there is then nothing to pick on."""
+    from agentenv_zeroad.train import report
+
+    summary = report.teacher_calibration(folder)
+    ranked = stats.rank_teachers(summary) if summary else []
+    if not ranked:
+        raise SystemExit(f"no teacher in {folder} has finished a game against {stats.CALIBRATION_RUNG}")
+    return [summary["teachers"][name]["model"] or name for name in ranked]
+
+
 def _teacher(
     model: str, base_url: str, key_env: str, cap: float, http: httpx.AsyncClient, ledger: Path | None
 ) -> StrategistModel:
@@ -423,14 +491,22 @@ async def _policy(args: argparse.Namespace) -> Policy:
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
     from transformers import AutoTokenizer  # the trainer image's, not the base install's
 
-    pool = candidates(args.games, args.learner_slot.split(",") if args.learner_slot else None)
-    briefs = select(pool, args.n, per_game=args.per_game, seed=args.seed)
+    losing = tuple(args.losing_opponents.split(","))
+    pool = candidates(args.games, args.learner_slot.split(",") if args.learner_slot else None, losing)
+    weights = parse_weights(args.weights) if args.weights else DEFAULT_WEIGHTS
+    briefs = select(pool, args.n, weights=weights, per_game=args.per_game, seed=args.seed)
     policies = {INTERFACE: await _policy(args)}
+    first, runner_up = args.teacher, args.second_teacher
+    if args.calibration:
+        picked = teachers_from_calibration(args.calibration)
+        first, runner_up = first or picked[0], runner_up or (picked[1] if len(picked) > 1 else None)
+    if not first:
+        raise SystemExit("name a teacher with --teacher, or pick one with --calibration")
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as http:
-        teacher = _teacher(args.teacher, args.base_url, args.api_key_env, args.cap_usd, http, args.spend_log)
+        teacher = _teacher(first, args.base_url, args.api_key_env, args.cap_usd, http, args.spend_log)
         second = (
-            _teacher(args.second_teacher, args.base_url, args.api_key_env, args.second_cap_usd, http, args.spend_log)
-            if args.second_teacher
+            _teacher(runner_up, args.base_url, args.api_key_env, args.second_cap_usd, http, args.spend_log)
+            if runner_up
             else None
         )
         rows, report = await distill(
@@ -443,11 +519,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.seed,
         )
     report["pool"] = len(pool)
+    report["weights"] = dict(weights)
+    if args.calibration:
+        report["calibration"] = str(args.calibration)
     report["strata"] = {s: sum(r["stratum"] == s for r in rows) for s in STRATA}
     write_rows(args.out / "sft.jsonl", rows)
     (args.out / "distill.json").write_text(json.dumps(report, indent=1))
     if args.inbox:
-        write_inbox(rows, args.inbox, epochs=args.epochs, seed=args.seed)
+        write_inbox(rows, args.inbox, seed=args.seed)
     if args.ledger:
         usd = teacher.guard.spent_usd + (second.guard.spent_usd if second else 0.0)
         spend.append_ledger(args.ledger, "distill", usd)
@@ -461,19 +540,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--tools", type=Path, help="JSON list of tools {name, description, parameters} (default: the env's)")
     p.add_argument("--system", type=Path, help="the policy's system prompt (default: the env's v2 prompt)")
     p.add_argument("--tokenizer", required=True)
-    p.add_argument("--teacher", required=True)
-    p.add_argument("--second-teacher")
+    p.add_argument("--teacher", help="the teacher's model name (default: the calibration panel's best)")
+    p.add_argument("--calibration", type=Path, help="the teacher calibration panel's folder: picks the teacher")
+    p.add_argument("--second-teacher", help="the label-noise check's teacher (default: the calibration's runner-up)")
     p.add_argument("--base-url", required=True)
     p.add_argument("--api-key-env", required=True)
     p.add_argument("--cap-usd", type=float, required=True, help="the first teacher's spend cap")
     p.add_argument("--second-cap-usd", type=float, default=10.0)
-    p.add_argument("--n", type=int, default=3000)
+    p.add_argument("--n", type=int, default=DEFAULT_LABELS)
+    p.add_argument("--weights", help="stratum shares, e.g. losing=0.6,late=0.2,rejected=0.2 (the default)")
+    p.add_argument("--losing-opponents", default=",".join(LOSING_OPPONENTS), help="whose wins make a turn `losing`")
     p.add_argument("--check", type=int, default=200)
     p.add_argument("--per-game", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--learner-slot")
-    p.add_argument("--inbox", type=Path, help="also write the SFT learner's inbox files here")
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--inbox", type=Path, help="also write the SFT learner's inbox file here")
     p.add_argument("--ledger", type=Path, help="the budget ledger to append this run's spend to")
     p.add_argument("--spend-log", type=Path, help="a per-call spend log")
     args = p.parse_args(argv)
