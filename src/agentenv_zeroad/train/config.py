@@ -138,6 +138,21 @@ class HeldOut:
     civ_pairs: tuple[tuple[str, str], ...] = ()
     maps: tuple[str, ...] = ()
     seeds: tuple[int, ...] = ()
+    seed_ranges: tuple[
+        tuple[int, int], ...
+    ] = ()  # [low, high) blocks of held-out seeds, for panels of hundreds of games
+
+    def __post_init__(self) -> None:
+        for low, high in self.seed_ranges:
+            if low >= high:
+                raise ValueError(f"held_out.seed_ranges: {low}..{high} is empty")
+
+    def is_held_seed(self, seed: int) -> bool:
+        return seed in self.seeds or any(low <= seed < high for low, high in self.seed_ranges)
+
+    def all_seeds(self) -> list[int]:
+        """Every held-out seed, the listed ones first and then each range in turn."""
+        return [*self.seeds, *(s for low, high in self.seed_ranges for s in range(low, high))]
 
 
 @dataclass(frozen=True)
@@ -148,13 +163,16 @@ class TeacherConfig:
     model: str  # the LiteLLM model name
     effort: str | None = "low"
     max_tokens: int = 1024
+    games: int = 0  # a frontier baseline panel: this teacher's games against the policy seat
 
     def __post_init__(self) -> None:
         if not self.name or "/" in self.name or self.name.startswith(".") or not self.model:
             raise ValueError(f"a teacher needs a plain name and a model, not {self.name!r} / {self.model!r}")
 
 
-PANEL_KINDS = ("specs", "teacher_calibration")
+PANEL_KINDS = ("specs", "teacher_calibration", "heldout", "frontier")
+PANEL_POSITIONS = ("held_out", "training")
+HELDOUT_MIX = {"petra-1": 0.3125, "petra-2": 0.3125, "petra-3": 0.25, "bot": 0.0625, "base": 0.0625}
 DEFAULT_CALIBRATION_GAMES = 16  # 2 teachers x Petra-3 and Petra-4: 6 and 6 against Petra-3, 2 and 2 against Petra-4
 MIN_PRIMARY_GAMES = 6  # at least this many games per teacher against the rung the pick is made on (Petra-3)
 
@@ -176,6 +194,14 @@ class PanelConfig:
     latency_ms: int | None = None  # None: games.latency_ms, the policy's
     base_url: str = ""  # "": LITELLM_BASE_URL, which the box's with-model.sh puts in the environment
     api_key_env: str = "LITELLM_API_KEY"
+    opponents: Mapping[str, float] = field(
+        default_factory=lambda: dict(HELDOUT_MIX)
+    )  # kind heldout: the policy's opponents
+    interface: Interface | None = None  # kinds heldout and frontier: what the policy seat plays; None: games.interface
+    positions: str = (
+        "held_out"  # kinds heldout and frontier: draw maps, civs and seeds from the held-out ones or the training ones
+    )
+    time_cap_minutes: float | None = None  # None: games.time_cap_minutes
 
     def __post_init__(self) -> None:
         if not self.name or "/" in self.name or self.name.startswith("."):
@@ -188,6 +214,27 @@ class PanelConfig:
             raise ValueError(f"panel {self.name}: specs is required")
         if self.kind == "teacher_calibration":
             self._check_calibration()
+        if self.kind in ("heldout", "frontier"):
+            self._check_positions()
+
+    def _check_positions(self) -> None:
+        if self.positions not in PANEL_POSITIONS:
+            raise ValueError(f"panel {self.name}: positions must be one of {', '.join(PANEL_POSITIONS)}")
+        if self.interface is not None and self.interface not in INTERFACES:
+            raise ValueError(f"panel {self.name}: interface must be one of {', '.join(INTERFACES)}")
+        if self.time_cap_minutes is not None and self.time_cap_minutes <= 0:
+            raise ValueError(f"panel {self.name}: time_cap_minutes must be positive")
+        if self.kind == "heldout":
+            unknown = set(self.opponents) - set(OPPONENTS)
+            if unknown or sum(self.opponents.values()) <= 0 or any(w < 0 for w in self.opponents.values()):
+                raise ValueError(f"panel {self.name}: opponents are weights over {', '.join(OPPONENTS)}")
+            if self.games < 1:
+                raise ValueError(f"panel {self.name}: games is at least 1")
+        else:
+            if not self.teachers or any(t.games < 1 for t in self.teachers):
+                raise ValueError(f"panel {self.name}: a frontier panel needs teachers, each with games of at least 1")
+            if len({t.name for t in self.teachers}) != len(self.teachers):
+                raise ValueError(f"panel {self.name}: teacher names must be unique")
 
     def _check_calibration(self) -> None:
         if not self.teachers or not self.rungs:
@@ -283,6 +330,10 @@ class RunConfig:
     stall_rows: int = 256  # rows waiting in the inbox that a live learner would have taken
     min_free_gb: float | None = None  # None: ZEROAD_MIN_FREE_GB from the box config, else 8
     game_cap_usd: float | None = None  # per frontier seat, None: ZEROAD_MATCH_CAP_USD from the box config
+    panels_only: bool = False  # start no training games: the panels are the whole run
+    stop_when_done: bool = False  # end with reason "complete" once every panel has finished and brief_target is met
+    brief_target: int = 0  # stop_when_done also waits until this many distillation briefs could be labelled (0: none)
+    brief_per_game: int = 8  # distill.select's cap per game, which the supply is counted under
 
     def __post_init__(self) -> None:
         if not self.run_id or "/" in self.run_id:
@@ -300,6 +351,10 @@ class RunConfig:
             object.__setattr__(self, "concurrency", self.engines)
         if not 1 <= self.concurrency <= self.engines:
             raise ValueError("concurrency must be from 1 to the number of engines")
+        if self.brief_target < 0 or self.brief_per_game < 1:
+            raise ValueError("brief_target is not negative and brief_per_game is at least 1")
+        if self.panels_only and not self.panels:
+            raise ValueError("panels_only needs at least one panel")
         self._resolve_adapter_dir()
         self._check_held_out()
 
@@ -346,7 +401,7 @@ class RunConfig:
         if not self.training_civ_pairs():
             raise ValueError("every civ pair is held out")
         low, high = self.games.seed_low, self.games.seed_high
-        if len({s for s in self.held_out.seeds if low <= s < high}) >= high - low:
+        if high - low <= 100_000 and all(self.held_out.is_held_seed(s) for s in range(low, high)):
             raise ValueError("every seed from games.seed_low up to seed_high is held out")
 
     @property
@@ -371,6 +426,8 @@ class RunConfig:
             teachers = [_checked(t, TeacherConfig, "teacher") for t in p.pop("teachers", ())]
             p["teachers"] = tuple(TeacherConfig(**t) for t in teachers)
             p["rungs"] = tuple(p.get("rungs", PanelConfig.rungs))
+            if "opponents" in p:
+                p["opponents"] = dict(p["opponents"])
             if "specs" in p:
                 p["specs"] = Path(p["specs"])
         hard = _checked(top.pop("hard_states", {}), HardStateConfig, "hard_states")
@@ -396,6 +453,7 @@ class RunConfig:
                 civ_pairs=tuple(tuple(p) for p in held.get("civ_pairs", ())),
                 maps=tuple(held.get("maps", ())),
                 seeds=tuple(held.get("seeds", ())),
+                seed_ranges=tuple((int(a), int(b)) for a, b in held.get("seed_ranges", ())),
             ),
             panels=tuple(PanelConfig(**p) for p in panels),
             hard_states=HardStateConfig(**hard),
