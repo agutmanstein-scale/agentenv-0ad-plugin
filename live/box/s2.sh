@@ -32,6 +32,19 @@ case $CMD in
     if tar tzf "$tmp/config.tgz" | grep -Eq '(^/|\.\.)'; then die "the config archive names a path outside its folder"; fi
     mkdir -p "$tmp/new" "$TRAIN"
     tar xzf "$tmp/config.tgz" -C "$tmp/new"
+    # The configs name vLLM at its URLs on this box (bootstrap's Docker address pools move the bridge off 172.17.0.1).
+    [ -s "$ETC/vllm.urls" ] || die "no $ETC/vllm.urls: live/bootstrap.sh ID --train first"
+    python3 - "$tmp/new" $(cat "$ETC/vllm.urls") <<'PY' || die "could not point the configs at this box's vLLM"
+import pathlib, re, sys
+root, urls = pathlib.Path(sys.argv[1]), sys.argv[2:]
+line = "urls = [" + ", ".join(f'"{u}"' for u in urls) + "]"
+for path in sorted(root.glob("*.toml")):
+    text = path.read_text()
+    new, n = re.subn(r"(?m)^urls = \[[^\]]*\]", line, text)
+    if n:
+        path.write_text(new)
+        print(f"{path.name}: [servers] urls = {', '.join(urls)}")
+PY
     "${PY[@]}" check "$tmp/new" || die "the config directory is not valid"
     rm -rf "$CONFIGDIR.old"; [ ! -d "$CONFIGDIR" ] || mv "$CONFIGDIR" "$CONFIGDIR.old"
     mv "$tmp/new" "$CONFIGDIR"

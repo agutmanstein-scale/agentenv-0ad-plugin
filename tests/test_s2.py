@@ -1046,9 +1046,14 @@ def test_the_end_uploads_the_report_and_files_then_powers_the_box_off_unless_the
     assert S.run(ctx, shutdown=lambda: off.append(True)) == 1
     assert off == [True] and json.loads((ctx.s2 / "gates.json").read_text())["verdict"] == "stopped"
     sync = [c for c in runner.lines() if "aws s3 sync" in c]
-    assert len(sync) == 2 and sync[0].startswith(f"aws s3 sync {ctx.s2} s3://BUCKET/zeroad-train/run/s2/s2 ")
-    assert "--include gates.json" in sync[0] and "--include s2-report.json" in sync[0]
-    assert sync[1].endswith("run/s2/s2/sft-epochs --only-show-errors") and "/epochs " in sync[1]
+    assert len(sync) == 1 and sync[0].startswith(f"aws s3 sync {ctx.s2} s3://BUCKET/zeroad-train/run/s2/s2 ")
+    assert "--include gates.json" in sync[0] and "--include s2-report.json" in sync[0]  # no SFT ran: no epochs to sync
+    with_sft = FakeRunner()
+    ctx3, _ = make_ctx(tmp_path / "sft", with_sft)
+    (ctx3.cfg("sft").root / "epochs").mkdir(parents=True)
+    S.run(ctx3, shutdown=lambda: None)
+    sync = [c for c in with_sft.lines() if "aws s3 sync" in c]
+    assert len(sync) == 2 and sync[1].endswith("run/s2/s2/sft-epochs --only-show-errors") and "/epochs " in sync[1]
     failing = FakeRunner({"aws s3 sync": 1})
     ctx2, _ = make_ctx(tmp_path / "up", failing)
     off.clear()

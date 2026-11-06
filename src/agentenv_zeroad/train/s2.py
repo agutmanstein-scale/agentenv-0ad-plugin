@@ -1034,12 +1034,15 @@ FINAL_INCLUDES = ("gates.json", "status.json", "progress.log", "s2-report.json",
 
 
 def upload_commands(s2: Path, uri: str, sft_epochs: Path) -> list[list[str]]:
-    """`aws s3 sync` of the sequence's own files, then of the SFT checkpoints (the step roots upload themselves, but
-    only manifests of adapters, and the SFT run has no orchestrator to do even that)."""
+    """`aws s3 sync` of the sequence's own files, then of the SFT checkpoints if the SFT step made any (the step roots
+    upload themselves, but only manifests of adapters, and the SFT run has no orchestrator to do even that). `aws s3
+    sync` fails on a missing source, which would keep a box that stopped before SFT from powering off."""
     base = uri.rstrip("/")
     own = ["aws", "s3", "sync", str(s2), base + "/s2", "--only-show-errors", "--exclude", "*"]
     for pattern in FINAL_INCLUDES:
         own += ["--include", pattern]
+    if not sft_epochs.is_dir():
+        return [own]
     return [own, ["aws", "s3", "sync", str(sft_epochs), base + "/s2/sft-epochs", "--only-show-errors"]]
 
 

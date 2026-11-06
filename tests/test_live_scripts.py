@@ -540,7 +540,10 @@ def test_teardown_terminates_a_box_with_both_tags(stubs):
     out = run(stubs, "teardown.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
     assert out.returncode == 0, out.stderr
     assert [c["argv"][1] for c in aws_calls(stubs)] == [
-        "describe-instances", "describe-instances", "terminate-instances", "wait"
+        "describe-instances",
+        "describe-instances",
+        "terminate-instances",
+        "wait",
     ]
     assert "aws ssm delete-parameters" in out.stderr
 
@@ -556,7 +559,9 @@ def test_grow_disk_resizes_the_root_volume_then_the_filesystem_and_never_shrinks
         ["get-command-invocation&&Status", "Success\n", 0],
         ["get-command-invocation", '{"StandardOutputContent": "grown\\n"}', 0],
     ]
-    out = run(stubs, "grow-disk.sh", ID, "500", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"})
+    out = run(
+        stubs, "grow-disk.sh", ID, "500", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"}
+    )
     assert out.returncode == 0, out.stderr
     calls = [c["argv"] for c in aws_calls(stubs)]
     modify = [c for c in calls if c[1] == "modify-volume"]
@@ -580,7 +585,11 @@ def test_teardown_cancels_a_spot_boxs_persistent_request_before_terminating_it(s
     assert out.returncode == 0, out.stderr
     calls = [c["argv"] for c in aws_calls(stubs)]
     assert [c[1] for c in calls] == [
-        "describe-instances", "describe-instances", "cancel-spot-instance-requests", "terminate-instances", "wait"
+        "describe-instances",
+        "describe-instances",
+        "cancel-spot-instance-requests",
+        "terminate-instances",
+        "wait",
     ]
     assert "sir-0abc" in calls[2]
 
@@ -2081,7 +2090,8 @@ def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_i
     import io
     import tarfile
 
-    s2_box(box_stubs)
+    etc = s2_box(box_stubs)
+    (etc / "vllm.urls").write_text("http://172.20.0.1:8000\nhttp://172.20.0.1:8001\n")
 
     def archive(files: dict[str, str]) -> str:
         buffer = io.BytesIO()
@@ -2094,7 +2104,14 @@ def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_i
         return base64.b64encode(buffer.getvalue()).decode()
 
     def put(b64: str, **extra):
-        return run_box(box_stubs, "s2.sh", "put-config", b64, DRY_RUN="0", **{"STUB_UNITS": "{}", **extra})
+        return run_box(
+            box_stubs,
+            "s2.sh",
+            "put-config",
+            b64,
+            DRY_RUN="0",
+            **{"STUB_UNITS": "{}", "ZEROAD_PILOT_ETC": str(etc), **extra},
+        )
 
     config = box_stubs["tmp"] / "state" / "train" / "s2-config"
     (config / "old.toml").write_text("old")
@@ -2104,9 +2121,13 @@ def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_i
     assert (config / "old.toml").exists()
     bad = put(archive({"sequence.toml": "x"}), STUB_CHECK_FAIL="1")
     assert bad.returncode != 0 and "not valid" in bad.stderr and (config / "old.toml").exists()
-    good = put(archive({"sequence.toml": "root = 'x'", "e1.toml": "y"}))
+    e1 = '[servers]\nurls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]\nkey_env = "VLLM_API_KEY"\n'
+    good = put(archive({"sequence.toml": "root = 'x'", "e1.toml": e1}))
     assert good.returncode == 0, good.stderr
     assert (config / "sequence.toml").read_text() == "root = 'x'" and not (config / "old.toml").exists()
+    assert (config / "e1.toml").read_text() == (
+        '[servers]\nurls = ["http://172.20.0.1:8000", "http://172.20.0.1:8001"]\nkey_env = "VLLM_API_KEY"\n'
+    )  # the box's own vLLM URLs, whatever the configs were written with
     assert (config.parent / "s2-config.old" / "old.toml").exists()
     running = put(archive({"a.toml": "x"}), STUB_UNITS=json.dumps({"zeroad-s2": "active"}))
     assert running.returncode != 0
