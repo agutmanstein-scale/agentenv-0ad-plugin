@@ -1049,9 +1049,7 @@ async def serve(args: argparse.Namespace) -> str:
     credit = PlayOnly() if args.play_only else load_credit(cfg)
     (cfg.root / "orchestrator").mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, cfg.root / "orchestrator" / "config.toml")
-    pool_options: dict[str, Any] = {"mode": args.mode}
-    if args.image:
-        pool_options["image"] = args.image
+    pool_options: dict[str, Any] = {"mode": args.mode, "image": args.image or cfg.engine_image}
     limits = httpx.Limits(max_connections=512)
     async with (
         httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, limits=limits) as http,

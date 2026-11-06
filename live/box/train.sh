@@ -60,7 +60,7 @@ case $CMD in
     awk -v a="$TRAIN_BOX_USD_PER_HOUR" -v b="$ZEROAD_BOX_USD_PER_HOUR" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.005) }' \
       || die "the run config's box_usd_per_hour ($TRAIN_BOX_USD_PER_HOUR) is not this box's rate ($ZEROAD_BOX_USD_PER_HOUR in $CONF): a run on another instance type must be priced at its own"
     "$BOX_HOME/box/budget.sh" check --planned-usd 0 --planned-hours "$TRAIN_DURATION_HOURS" --budget "$BUDGET"
-    say "training run from $CONFIG ${ARGS[*]-}"
+    say "training run from $CONFIG ${ARGS[*]-}: ${TRAIN_ENGINES:-?} engines (${TRAIN_CONCURRENCY:-?} games at once) on ${TRAIN_ENGINE_IMAGE:-?}"
     # TimeoutStopSec covers the final upload's 3 tries of 10 minutes (sync.py) plus the learner's grace.
     run systemd-run --unit zeroad-train --collect -p KillMode=control-group -p TimeoutStopSec=2400 \
       -p "After=network-online.target docker.service" -p "Wants=network-online.target docker.service" \

@@ -9,8 +9,12 @@ budget_usd = 140             # box hours at box_usd_per_hour + frontier spend; a
 box_usd_per_hour = 10.49     # required, no default: the instance type's on-demand price (g6e.12xlarge; 15.07 for a
                              # g6e.24xlarge). train.sh start refuses it if the box's own rate differs.
 shutdown = false             # true: `shutdown -h now` after the final upload (the box then stops, it is not terminated)
-engines = 24                 # engine containers; each game takes one for its 6-8 minutes
-concurrency = 24             # games in flight, at most `engines`
+engines = 24                 # engine containers; each game takes one for its 6-8 minutes. 0 (or leave it out) is the box's
+                             # physical cores (24 on the g6e.12xlarge, 48 vCPUs): more engines than cores slow every game
+concurrency = 24             # games in flight, at most `engines`; 0 (or leave it out) is all of them
+# engine_image = "zeroad-engine:0.28-rt"  # the default: built by `scripts/build-engine.sh rt`, which applies
+                             # patches/rl-idle-wait.patch so an engine waiting for its next /step sleeps instead of
+                             # spinning a core; only the unpatched PPA image ("zeroad-engine:0.28") spins
 seed = 1
 
 [servers]

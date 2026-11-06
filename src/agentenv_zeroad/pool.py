@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -43,6 +44,24 @@ from agentenv_zeroad.engine import (
 log = logging.getLogger(__name__)
 
 BASE_PORT = 16000
+
+TRAIN_IMAGE = "zeroad-engine:0.28-rt"  # 0.28 rebuilt with patches/rl-idle-wait.patch: an idle engine sleeps
+
+
+def physical_cores(cpu_root: Path = Path("/sys/devices/system/cpu")) -> int:
+    """Physical cores of this machine (hyperthreads counted once), from sysfs; half the logical CPUs when sysfs has no
+    topology (a laptop, a container without it), at least 1. Engines beyond this share cores with each other and with
+    the Python workers, so it is the pool's default size."""
+    cores: set[tuple[str, str]] = set()
+    for cpu in cpu_root.glob("cpu[0-9]*"):
+        try:
+            package = (cpu / "topology/physical_package_id").read_text().strip()
+            core = (cpu / "topology/core_id").read_text().strip()
+        except OSError:
+            continue
+        cores.add((package, core))
+    return len(cores) or max(1, (os.cpu_count() or 2) // 2)
+
 
 StartOne = Callable[[EngineOptions, Path | None], Awaitable[RunningEngine]]
 
