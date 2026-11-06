@@ -2284,7 +2284,8 @@ def actor_toml(state: Path, *, role: str = "actor", rate: float = 1.32, hours: f
     return (
         f'run_id = "run1"\nroot = "{state}/train/run1-a1"\nbudget_usd = 100\nbox_usd_per_hour = {rate}\n'
         f"duration_hours = {hours}\n"
-        'servers = { urls = ["http://172.17.0.1:8000"], adapter_dir = "/train/run1-a1/adapters" }\n'
+        'servers = { urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001", "http://172.17.0.1:8002",'
+        ' "http://172.17.0.1:8003"], adapter_dir = "/train/run1-a1/adapters" }\n'
         f'[transport]\nenabled = true\nuri = "s3://b/p"\nrole = "{role}"\nactor_id = "a1"\n'
     )
 
@@ -2376,7 +2377,7 @@ def test_the_actor_starts_in_its_own_unit_and_a_second_is_refused(box_stubs):
     out = start_actor(box_stubs)
     assert out.returncode == 0, out.stderr
     [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
-    assert "--unit zeroad-actor" in call and "KillMode=control-group" in call and "TimeoutStopSec=1800" in call
+    assert "--unit zeroad-actor" in call and "KillMode=control-group" in call and "TimeoutStopSec=4200" in call
     assert "After=network-online.target docker.service" in call and call.split("actor-run.sh ")[1].endswith(
         "actor.toml"
     )
@@ -2405,6 +2406,49 @@ def test_an_actor_start_is_refused_for_a_learners_config_a_wrong_rate_a_down_vll
     assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
 
 
+def test_an_actor_start_is_refused_when_the_configs_urls_are_not_the_boxs_vllm_instances(box_stubs):
+    out = start_actor(box_stubs)
+    assert out.returncode == 0, out.stderr
+    etc = box_stubs["tmp"] / "etc"
+    (etc / "vllm.urls").write_text("http://172.17.0.1:8000\nhttp://172.17.0.1:8001\n")  # a 2-GPU box, a 4-GPU config
+    out = run_box(
+        box_stubs, "actor.sh", "start", "--budget", "150", DRY_RUN="0", ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_NOW_EPOCH="1800000000", ZEROAD_BOOT_EPOCH="1800000000",
+    )  # fmt: skip
+    assert out.returncode != 0 and "are not this box's vLLM instances" in out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_the_config_cli_names_the_actor_the_shutdown_flag_and_the_server_urls():
+    import subprocess as sp
+
+    out = sp.run(
+        [sys.executable, "-m", "agentenv_zeroad.train.config", str(ACTOR_CONFIG)],
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, check=True,
+    ).stdout  # fmt: skip
+    assert "TRAIN_ACTOR_ID=a1" in out and "TRAIN_SHUTDOWN=1" in out and "TRAIN_TRANSPORT_ROLE=actor" in out
+    assert "TRAIN_SERVER_URLS='http://172.17.0.1:8000 http://172.17.0.1:8001" in out
+
+
+def test_train_iam_create_for_a_second_box_reuses_the_role_and_profile_and_only_attaches_the_box(stubs):
+    stubs["env"]["LIVE_ENV"] = str(train_stubs(stubs)["env"]["LIVE_ENV"])
+    rules = [
+        ["sts&&get-caller-identity", "123456789012\n", 0],
+        ["list-roles", "zeroad-train-box\n", 0],
+        ["list-instance-profiles", "zeroad-train-box\n", 0],
+        ["describe-iam-instance-profile-associations", "iip-assoc-1\n", 0],
+        ["replace-iam-instance-profile-association", "associating\n", 0],
+    ]
+    out = run(stubs, "train-iam.sh", "create", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
+    assert out.returncode == 0, out.stderr
+    verbs = [" ".join(c["argv"][:2]) for c in aws_calls(stubs)]
+    assert "iam create-role" not in verbs and "iam create-instance-profile" not in verbs
+    assert "iam put-role-policy" in verbs and "iam attach-role-policy" in verbs
+    assert "ec2 replace-iam-instance-profile-association" in verbs
+    fresh = run(train_stubs(stubs), "train-iam.sh", "create", ID, forbid_aws=True).stderr
+    assert "iam create-role" in fresh and "iam create-instance-profile" in fresh
+
+
 def test_the_box_actor_config_upload_refuses_a_learners_config_and_what_is_not_base64(stubs):
     out = run_box(stubs, "actor.sh", "put-config", "not base64!", DRY_RUN="1")
     assert out.returncode != 0 and "needs base64" in out.stderr
@@ -2424,6 +2468,12 @@ def test_the_box_actor_run_plays_with_no_learner_and_refuses_a_config_that_is_no
     text = out.stdout.replace("\\", "")
     assert "agentenv_zeroad.train.orchestrate run --config" in text and "--play-only" not in text
     assert "zeroad-learner" not in text and "docker" not in text and "VLLM_API_KEY, never printed" in text
+    assert "ZEROAD_INSTANCE_ID from IMDSv2" in text
+    lines = text.splitlines()
+    run = next(i for i, line in enumerate(lines) if "orchestrate run --config" in line)
+    flush = next(i for i, line in enumerate(lines) if "agentenv_zeroad.train.transport flush --config" in line)
+    assert run < flush < next(i for i, line in enumerate(lines) if "shutdown -h now" in line)
+    assert "--timeout-minutes 30" in lines[flush]
     out = run_box(stubs, "actor-run.sh", str(TRAIN_CONFIG), DRY_RUN="1")
     assert out.returncode != 0 and "not an actor's config" in out.stderr
 
