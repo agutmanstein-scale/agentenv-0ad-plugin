@@ -12,8 +12,8 @@ source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
 CONFIG=${1:?usage: train-run.sh CONFIG [--init DIR] [--baseline FILE] [--play-only]}; shift
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 TRAIN=$STATE/train
-UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; a dry run elsewhere may have it elsewhere
-export PATH="/usr/local/bin:/usr/bin:/bin${UV_BIN:+:${UV_BIN%/*}}"
+UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; elsewhere (a dry run, the tests' stubs) it goes first
+export PATH="${UV_BIN:+${UV_BIN%/*}:}/usr/local/bin:/usr/bin:/bin"
 export XDG_STATE_HOME=$STATE/agentenv AGENT_ENV_CONFIG=$ETC/agent-env.toml
 PLAY_ONLY=0 LEARNER=()
 while [ $# -gt 0 ]; do
