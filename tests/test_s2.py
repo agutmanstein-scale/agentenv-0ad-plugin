@@ -392,7 +392,7 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
     numbers = S.check_dir(LIVE_S2, 600)
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
-    assert 19 <= numbers["expected_hours"] <= 20 and numbers["cap_hours"] > numbers["expected_hours"]
+    assert 21 <= numbers["expected_hours"] <= 22 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
@@ -503,13 +503,13 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
     S.sequence(ctx)
     assert asked == [
         (0.75, 0),
-        (3.5, 110.0),
+        (5.0, 110.0),
         (0.1, 0),
         (0.5, 0),
         (2.6, 0),
         (1.0, 132.0),
         (1.25, 0),
-        (3.0, 0),
+        (4.0, 0),
         (0.1, 0),
         (11.0, 70.0),
     ]

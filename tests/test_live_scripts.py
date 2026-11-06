@@ -144,6 +144,7 @@ CHANGE_SCRIPTS = [
     ("stop-box.sh", ID),
     ("teardown.sh", ID),
     ("grow-disk.sh", ID, "500"),
+    ("extend-poweroff.sh", ID, "6"),
     ("fetch.sh", ID),
     ("fetch.sh", ID, "livestream-1"),
     ("fetch.sh", ID, "--only", "rec/zeroad/2026-10-29_01-00-00-000000.mp4"),
@@ -1432,6 +1433,20 @@ def test_a_bootstrap_re_arms_a_missing_power_off_and_fails_loudly_if_it_stays_un
     (stubs["tmp"] / "armed.flag").unlink(missing_ok=True)
     out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
     assert out.returncode == 1 and "NOT ARMED" in out.stdout and "NOT ARMED" in out.stderr
+
+
+def test_extending_the_power_off_moves_the_deadline_and_re_arms_it(stubs):
+    arm = busctl_stub(stubs, ARMED)
+    deadline = stubs["tmp"] / "deadline"
+    deadline.write_text("1800000000\n")
+    out = run_box(stubs, "poweroff.sh", "extend", "6", ZEROAD_POWEROFF_ARM=str(arm), ZEROAD_DEADLINE_FILE=str(deadline))
+    assert out.returncode == 0, out.stderr
+    assert deadline.read_text().strip() == str(1800000000 + 6 * 3600) and (stubs["tmp"] / "armed.flag").exists()
+    assert "power-off armed" in out.stdout
+    for bad in ("0", "x", "100"):
+        bad_out = run_box(stubs, "poweroff.sh", "extend", bad, ZEROAD_DEADLINE_FILE=str(deadline))
+        assert bad_out.returncode == 2
+    assert deadline.read_text().strip() == str(1800000000 + 6 * 3600)
 
 
 def test_a_bootstrap_does_not_rearm_a_power_off_that_is_already_scheduled(stubs):

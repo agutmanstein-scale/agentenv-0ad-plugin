@@ -42,8 +42,8 @@ minute = 10.0
 
 [baselines]                # play-only v0: panels, calibration, briefs
 config = "baselines.toml"
-cap_hours = 3.5
-expected_hours = 2.6
+cap_hours = 5.0            # 6 Nov: one orchestrator loop held games to ~216 an hour (a saturated core)
+expected_hours = 3.9
 min_finished_share = 0.9   # of each panel's games that must have finished
 planned_usd = 110.0        # frontier spend the guard counts ahead: 20 baseline + 16 calibration games at about $2.5-3.5 each (6 Nov)
 heldout_panel = "heldout"
@@ -72,8 +72,8 @@ lr = 1e-4
 
 [sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel; the chosen one then plays the rest
 config = "sft-panels.toml"
-cap_hours = 3.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games
-expected_hours = 2.1
+cap_hours = 4.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games
+expected_hours = 2.8
 panel_games = 192          # per epoch: enough to choose between epochs
 heldout_games = 384        # the held-out panel's size (baselines.toml): the chosen epoch plays heldout_games - panel_games more,
                            # so the init decision is on the same 384 configs v0 played

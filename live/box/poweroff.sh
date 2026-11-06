@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# poweroff.sh check|status: whether the MAX_HOURS power-off is scheduled with systemd-logind (the zeroad-poweroff unit
-# arms it after logind on every boot; see live/lib/poweroff-boothook.sh).
-#   check   re-arms from /etc/zeroad-live/deadline if nothing is scheduled, then exits 1 loudly if it still is not
-#   status  prints one line, "power-off armed: ..." or "power-off NOT ARMED: ...", and always exits 0
+# poweroff.sh check|status|extend HOURS: whether the MAX_HOURS power-off is scheduled with systemd-logind (the
+# zeroad-poweroff unit arms it after logind on every boot; see live/lib/poweroff-boothook.sh).
+#   check         re-arms from /etc/zeroad-live/deadline if nothing is scheduled, then exits 1 loudly if it still is not
+#   status        prints one line, "power-off armed: ..." or "power-off NOT ARMED: ...", and always exits 0
+#   extend HOURS  moves the deadline HOURS later and re-arms from it (a new shutdown -h +N replaces the scheduled one),
+#                 for a run that needs longer than the launch allowed; later boots keep the new deadline
 set -uo pipefail
 ARM=${ZEROAD_POWEROFF_ARM:-/usr/local/sbin/zeroad-poweroff-arm}
+DEADLINE_FILE=${ZEROAD_DEADLINE_FILE:-/etc/zeroad-live/deadline}
 MAX=18446744073709551615
 
 # Prints the scheduled epoch seconds, or nothing when nothing is scheduled (type "" or USEC_INFINITY).
@@ -39,5 +42,17 @@ case ${1:-} in
     echo "ERROR: the MAX_HOURS power-off is NOT ARMED and re-arming failed; stop or terminate this box yourself" >&2
     exit 1
     ;;
-  *) echo "usage: poweroff.sh check|status" >&2; exit 2 ;;
+  extend)
+    hours=${2:-}
+    [[ $hours =~ ^[1-9][0-9]?$ ]] || { echo "usage: poweroff.sh extend HOURS (1-99)" >&2; exit 2; }
+    if [ "${DRY_RUN:-0}" = 1 ]; then echo "+ move the deadline in $DEADLINE_FILE $hours h later, then $ARM"; exit 0; fi
+    old=$(cat "$DEADLINE_FILE" 2>/dev/null) || { echo "ERROR: no deadline file $DEADLINE_FILE" >&2; exit 1; }
+    [[ $old =~ ^[0-9]+$ ]] || { echo "ERROR: $DEADLINE_FILE does not hold epoch seconds" >&2; exit 1; }
+    new=$(( old + hours * 3600 ))
+    printf '%s\n' "$new" > "$DEADLINE_FILE.tmp" && mv "$DEADLINE_FILE.tmp" "$DEADLINE_FILE"
+    echo "deadline $(date -u -d "@$old" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$old") -> $(date -u -d "@$new" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$new")"
+    "$ARM" || { echo "ERROR: re-arming failed" >&2; exit 1; }
+    report || exit 1
+    ;;
+  *) echo "usage: poweroff.sh check|status|extend HOURS" >&2; exit 2 ;;
 esac
