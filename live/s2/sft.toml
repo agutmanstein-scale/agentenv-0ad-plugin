@@ -3,7 +3,7 @@
 run_id = "s2-sft"
 root = "/var/lib/zeroad-live/train/s2/sft"
 duration_hours = 1
-budget_usd = 450            # LIVE_BUDGET_USD: the box's hours (counted once, whatever the step) plus frontier spend
+budget_usd = 600            # LIVE_BUDGET_USD: the box's hours (counted once, whatever the step) plus frontier spend
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false            # the sequence powers the box off itself, once, after the final upload
 engines = 24

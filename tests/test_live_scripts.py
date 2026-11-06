@@ -1892,7 +1892,7 @@ def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_
     assert int(env["LIVE_MAX_HOURS"]) >= numbers["expected_hours"] + 2  # the bootstrap's hour and an hour of margin
     box = numbers["expected_hours"] * numbers["rate"]
     assert (
-        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 260
+        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 420
     )  # box, two frontier panels, calibration, labels
 
 
@@ -1926,11 +1926,11 @@ def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket
     out = run(s2_stubs(stubs), "s2.sh", ID, "start", str(S2_DIR), forbid_aws=True)
     plan = out.stderr
     assert out.returncode == 0, plan
-    assert "agentenv_zeroad.train.s2 check" in plan and "--budget 450" in plan and "against $450" in plan
+    assert "agentenv_zeroad.train.s2 check" in plan and "--budget 600" in plan and "against $600" in plan
     assert plan.count("aws ssm send-command") == 2
-    assert "box/s2.sh put-config" in plan and "box/s2.sh start --budget 450" in plan
-    assert plan.index("put-config") < plan.index("s2.sh start --budget 450")
-    assert "systemd-run --unit zeroad-s2" in plan and "s2-run.sh --budget 450" in plan.replace("\\", "")
+    assert "box/s2.sh put-config" in plan and "box/s2.sh start --budget 600" in plan
+    assert plan.index("put-config") < plan.index("s2.sh start --budget 600")
+    assert "systemd-run --unit zeroad-s2" in plan and "s2-run.sh --budget 600" in plan.replace("\\", "")
     [blob] = [b for b in re.findall(r"[A-Za-z0-9+/=]{500,}", plan)]
     with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob)), mode="r:gz") as tar:
         files = {m.name.removeprefix("./"): tar.extractfile(m).read().decode() for m in tar.getmembers() if m.isfile()}
@@ -1946,11 +1946,11 @@ def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket
 def test_the_s2_start_takes_resume_or_fresh_but_not_both_and_needs_a_config_directory(stubs):
     s2_stubs(stubs)
     assert (
-        "s2.sh start --budget 450 --resume"
+        "s2.sh start --budget 600 --resume"
         in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", forbid_aws=True).stderr
     )
     assert (
-        "s2.sh start --budget 450 --fresh"
+        "s2.sh start --budget 600 --fresh"
         in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--fresh", forbid_aws=True).stderr
     )
     out = run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", "--fresh", forbid_aws=True)

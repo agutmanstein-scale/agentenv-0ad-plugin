@@ -390,13 +390,13 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 
 
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
-    numbers = S.check_dir(LIVE_S2, 450)
+    numbers = S.check_dir(LIVE_S2, 600)
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
     assert 19 <= numbers["expected_hours"] <= 20 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
-    assert cost < 450
+    assert cost < 600
 
 
 @pytest.mark.parametrize(
@@ -404,7 +404,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
     [("e2.toml", "positive_control = true", "positive_control = false", "positive_control must be true"),
      ("run1.toml", "shutdown = false", "shutdown = true", "shutdown must be false"),
      ("run1.toml", "box_usd_per_hour = 10.49", "box_usd_per_hour = 15.07", "different box rates"),
-     ("e1.toml", "budget_usd = 450", "budget_usd = 500", "above the stage budget"),
+     ("e1.toml", "budget_usd = 600", "budget_usd = 650", "above the stage budget"),
      ("run1.toml", "duration_hours = 10", "duration_hours = 12", "past its cap_hours"),
      ("baselines.toml", 'uri = "s3://BUCKET/zeroad-train/run/s2-baselines"', "", "s3.uri is required"),
      ("sft-panels.toml", 's2/sft"', 's2/other"', "share one root"),
@@ -419,7 +419,7 @@ def test_a_config_directory_that_would_break_the_sequence_is_refused(tmp_path, f
     assert old in path.read_text(), old
     path.write_text(path.read_text().replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 450)
+        S.check_dir(cdir, 600)
 
 
 def test_every_step_is_recorded_with_its_start_and_end_and_the_next_starts_only_if_the_gate_passed(
@@ -503,15 +503,15 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
     S.sequence(ctx)
     assert asked == [
         (0.75, 0),
-        (3.5, 45.0),
+        (3.5, 110.0),
         (0.1, 0),
         (0.5, 0),
         (2.6, 0),
-        (1.0, 68.0),
+        (1.0, 132.0),
         (1.25, 0),
         (3.0, 0),
         (0.1, 0),
-        (11.0, 30.0),
+        (11.0, 70.0),
     ]
 
 
@@ -842,7 +842,7 @@ def test_the_labels_run_the_distill_cli_under_with_model_into_the_sft_inbox_with
     assert out.passed
     line = runner.lines()[0]
     assert line.startswith(f"{ctx.box_home}/box/with-model.sh python -m agentenv_zeroad.train.distill")
-    for part in ("--cap-usd 60.0", "--second-cap-usd 8.0", "--n 3000", "--api-key-env LITELLM_API_KEY",
+    for part in ("--cap-usd 120.0", "--second-cap-usd 12.0", "--n 3000", "--api-key-env LITELLM_API_KEY",
                  "--base-url https://litellm.example", "--per-game 8", "--tokenizer Qwen/Qwen3-8B"):  # fmt: skip
         assert part in line
     assert f"--calibration {ctx.cfg('baselines').root}/panels/teacher-calibration" in line
