@@ -6,10 +6,11 @@ Each game's files land in `DIR/<game_id>/` (results.json; commands.txt with `--r
 game is appended to `DIR/games.jsonl`. A game that fails is recorded as failed and its engine is restarted before it
 is leased again; the other games go on.
 
-Workers are separate processes (`--workers`, default 1), each with its own pool of its share of the engines and up to
-`--concurrency` games in flight on one asyncio loop, started with PYTHONHASHSEED=0 so that two runs of one spec make
-the same set-ordered choices. The parent only splits the specs round-robin, gives each worker its own port range and
-waits.
+Workers are separate processes, each with its own pool of its share of the engines and up to `--concurrency` games in
+flight on one asyncio loop, started with PYTHONHASHSEED=0 so that two runs of one spec make the same set-ordered
+choices. There are `--workers` of them, or by default one per `--engines-per-worker` engines (4): a loop that
+serialises the HTTP, JSON and bot work of a dozen engines is a queue the engines wait in. The parent only splits the
+specs round-robin, gives each worker its own port range and waits.
 
 `run_games` and `run_game` are the async API for callers that already have a pool.
 """
@@ -38,6 +39,7 @@ from agentenv_zeroad.train.spec import GameSpec, load_specs
 log = logging.getLogger(__name__)
 
 PORT_STRIDE = 1000  # ports between two workers' ranges
+ENGINES_PER_WORKER = 4  # one worker's loop keeps up with this many engines stepping flat out (re-measure: s1_calibrate)
 
 
 @dataclass(frozen=True)
@@ -149,8 +151,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--specs", type=Path, required=True, help="JSON lines, one game spec each")
     p.add_argument("--out", type=Path, required=True, help="folder for the games' files")
     p.add_argument("--engines", type=int, default=4, help="engines in all workers together")
-    p.add_argument("--concurrency", type=int, default=4, help="games in flight per worker, at most its engines")
-    p.add_argument("--workers", type=int, default=1, help="worker processes")
+    p.add_argument("--concurrency", type=int, default=None, help="games in flight per worker (default: its engines)")
+    p.add_argument("--workers", type=int, default=None, help="worker processes (default: engines / engines-per-worker)")
+    p.add_argument(
+        "--engines-per-worker", type=int, default=ENGINES_PER_WORKER, help="engines one worker process drives"
+    )
     p.add_argument("--mode", choices=("docker", "local"), default="docker")
     p.add_argument("--image", default=None, help="the engine image (docker mode)")
     p.add_argument("--base-port", type=int, default=BASE_PORT)
@@ -168,6 +173,14 @@ def engines_per_worker(engines: int, workers: int) -> list[int]:
     return [engines // workers + (1 if i < engines % workers else 0) for i in range(workers)]
 
 
+def worker_count(engines: int, *, workers: int | None = None, per_worker: int = ENGINES_PER_WORKER) -> int:
+    """`workers` if given, else enough for `per_worker` engines each; never more workers than engines."""
+    if per_worker < 1 or (workers is not None and workers < 1):
+        raise ValueError("workers and engines-per-worker must be at least 1")
+    wanted = workers if workers is not None else -(-engines // per_worker)
+    return max(1, min(wanted, engines))
+
+
 async def work(args: argparse.Namespace) -> list[GameOutcome]:
     specs = load_specs(args.specs)
     pool_options: dict[str, Any] = {
@@ -179,7 +192,7 @@ async def work(args: argparse.Namespace) -> list[GameOutcome]:
     if args.image:
         pool_options["image"] = args.image
     async with EnginePool(args.engines, **pool_options) as pool:
-        return await run_games(specs, pool, args.out, concurrency=min(args.concurrency, args.engines))
+        return await run_games(specs, pool, args.out, concurrency=min(args.concurrency or args.engines, args.engines))
 
 
 async def supervise(args: argparse.Namespace) -> int:
@@ -187,7 +200,7 @@ async def supervise(args: argparse.Namespace) -> int:
     specs = args.specs.read_text().splitlines()
     specs = [line for line in specs if line.strip()]
     load_specs(args.specs)  # a bad spec fails here, before any engine starts
-    workers = max(1, min(args.workers, args.engines, len(specs) or 1))
+    workers = min(worker_count(args.engines, workers=args.workers, per_worker=args.engines_per_worker), len(specs) or 1)
     shards = args.out / ".shards"
     shards.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONHASHSEED": "0"}
@@ -200,9 +213,10 @@ async def supervise(args: argparse.Namespace) -> int:
         cmd = [
             sys.executable, "-m", "agentenv_zeroad.train.runner", "--worker",
             "--specs", str(shard), "--out", str(args.out), "--engines", str(engines),
-            "--concurrency", str(args.concurrency), "--mode", args.mode,
-            "--base-port", str(args.base_port + i * PORT_STRIDE),
+            "--mode", args.mode, "--base-port", str(args.base_port + i * PORT_STRIDE),
         ]  # fmt: skip
+        if args.concurrency:
+            cmd += ["--concurrency", str(args.concurrency)]
         if args.image:
             cmd += ["--image", args.image]
         if args.replays:
