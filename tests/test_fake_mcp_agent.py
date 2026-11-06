@@ -57,7 +57,17 @@ async def test_a_fake_mcp_agent_plays_its_seat_through_the_real_endpoint(tmp_pat
 
         agent = FakeAgent(base, "1")
         tools = await agent.play()
-        assert set(tools) == {"get_brief", "set_economy", "train", "build", "research", "advance_phase", "army", "say"}
+        assert set(tools) == {
+            "get_brief",
+            "set_economy",
+            "train",
+            "build",
+            "research",
+            "advance_phase",
+            "army",
+            "hold",
+            "say",
+        }
         assert agent.brief.startswith("Time ") and "[" in agent.brief.splitlines()[-1]
         assert [r["status"] for r in agent.results] == ["accepted"] * 4
         assert all(r["footer"].startswith("[") for r in agent.results)

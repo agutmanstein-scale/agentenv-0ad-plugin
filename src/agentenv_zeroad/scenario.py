@@ -5,6 +5,12 @@ throws unless the top level carries `mapType`, `map` and `script` (relative to `
 `mapName`, `Biome`, `PlayerPlacement` and a `Color` per player (spike-results.md, engine quirk 2). Every field the
 spike proved working is set here so callers can't forget one.
 
+Game knobs: `ai_seed` (the seed Petra's random choices use, kept apart from the map seed), `ceasefire_minutes`, a
+seat's Petra `ai_behavior` (`random`, `balanced`, `aggressive` or `defensive`; Petra rolls `random` from the AI seed)
+and, experimental, starting resources and a population limit. The last two are written under the setting names the
+0.28 game setup uses (`StartingResources`, `PlayerData[i].Resources`, `PlayerData[i].PopulationLimit`); those names
+come from the setup's source and are not yet checked against a running 0.28 engine, so they stay out unless asked for.
+
 A seat is either driven from outside (our brains and executor send its commands through `/step`; `AI` is "") or
 played by the engine's built-in Petra AI.
 """
@@ -13,10 +19,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 Controller = Literal["external", "petra"]
 
+AiBehavior = Literal["random", "balanced", "aggressive", "defensive"]
+AI_BEHAVIORS: tuple[str, ...] = get_args(AiBehavior)
 PLAYER_PLACEMENTS = ("circle", "river", "groupedLines", "randomGroup", "stronghold")
 MAP_SIZES = (128, 192, 256, 320, 384, 448, 512)
 CONQUEST_TRIGGER_SCRIPTS = ("scripts/TriggerHelper.js", "scripts/ConquestCommon.js", "scripts/Conquest.js")
@@ -41,9 +49,11 @@ class Seat:
     civ: str
     controller: Controller = "external"
     ai_difficulty: int = 3
-    ai_behavior: str = "balanced"
+    ai_behavior: AiBehavior = "balanced"
     team: int = -1
     color: tuple[int, int, int] | None = None
+    starting_resources: int | None = None  # experimental: this much of each resource at the start
+    population_limit: int | None = None  # experimental: the seat's population limit
 
 
 def build_scenario(
@@ -56,6 +66,7 @@ def build_scenario(
     seed: int = 7,
     ai_seed: int | None = None,
     ceasefire_minutes: int = 0,
+    starting_resources: int | None = None,
     conquest: bool = True,
     circular: bool = True,
 ) -> dict[str, Any]:
@@ -68,6 +79,8 @@ def build_scenario(
         raise ValueError(f"size must be one of {MAP_SIZES}, got {size}")
     if ceasefire_minutes < 0:
         raise ValueError("ceasefire_minutes must be >= 0")
+    if starting_resources is not None and starting_resources < 0:
+        raise ValueError("starting_resources must be >= 0")
     script = f"{map_name}.js"
     settings: dict[str, Any] = {
         "mapName": map_name,
@@ -85,6 +98,8 @@ def build_scenario(
         "TriggerScripts": list(CONQUEST_TRIGGER_SCRIPTS) if conquest else [],
         "PlayerData": [_player_data(i, seat) for i, seat in enumerate(seats)],
     }
+    if starting_resources is not None:
+        settings["StartingResources"] = starting_resources
     return {
         "mapType": "random",
         "map": f"maps/random/{map_name}",
@@ -105,8 +120,10 @@ def _player_data(index: int, seat: Seat) -> dict[str, Any]:
     if seat.controller not in ("external", "petra"):
         raise ValueError(f"seat {index + 1}: controller must be 'external' or 'petra', got {seat.controller!r}")
     r, g, b = seat.color or DEFAULT_COLORS[index]
+    if seat.ai_behavior not in AI_BEHAVIORS:
+        raise ValueError(f"seat {index + 1}: ai_behavior must be one of {AI_BEHAVIORS}, got {seat.ai_behavior!r}")
     petra = seat.controller == "petra"
-    return {
+    data: dict[str, Any] = {
         "Name": seat.name,
         "Civ": seat.civ,
         "Color": {"r": r, "g": g, "b": b},
@@ -115,3 +132,8 @@ def _player_data(index: int, seat: Seat) -> dict[str, Any]:
         "AIBehavior": seat.ai_behavior if petra else "balanced",
         "Team": seat.team,
     }
+    if seat.starting_resources is not None:
+        data["Resources"] = dict.fromkeys(("food", "wood", "stone", "metal"), seat.starting_resources)
+    if seat.population_limit is not None:
+        data["PopulationLimit"] = seat.population_limit
+    return data

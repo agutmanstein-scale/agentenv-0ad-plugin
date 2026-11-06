@@ -1,9 +1,11 @@
 """How a 0 A.D. match is decided and graded (spec §4.7): conquest, a time cap with the engine score, draws, forfeits.
 
 The engine decides conquest itself (its conquest victory condition marks the last player standing `won` and the others
-`defeated`). At the time cap the highest engine score among the players still standing wins (a player already
-defeated stays lost, whatever its score); players tied on top (within `draw_margin` points) draw, and everyone else
-loses. Grading follows agentenv-game-env's convention through its
+`defeated`). At the time cap the highest score among the players still standing wins (a player already defeated stays
+lost, whatever its score); players tied on top (within `draw_margin`) draw, and everyone else loses. The score is the
+engine's official total (`official`, the default) or each player's net worth (`net_worth`: what its living units and
+finished structures cost plus its banked resources), per the match's `score_rule`; `draw_margin` is in that measure's
+own units. Grading follows agentenv-game-env's convention through its
 `grade_match`: a win 1, a draw 0.5, a loss 0.
 
 The forfeit rule is about brains, not orders: a brain call that errors or runs past `BRAIN_TIMEOUT_S` counts as
@@ -16,7 +18,7 @@ none (a plain MCP agent) is counted by its tool calls instead, each one made, si
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -25,6 +27,27 @@ FORFEIT_SHARE = 0.5
 POINTS = {"won": 1.0, "drawn": 0.5, "lost": 0.0}
 
 Outcome = Literal["won", "lost", "drawn"]
+ScoreRule = Literal["official", "net_worth"]
+SCORE_KEYS: dict[ScoreRule, str] = {"official": "total", "net_worth": "net_worth"}
+PROMPT_RULES: dict[str, ScoreRule] = {"v1": "official", "v2": "net_worth"}
+
+
+def resolve_score_rule(rule: ScoreRule | None, agent_interfaces: Iterable[str]) -> ScoreRule:
+    """The score rule a match runs under, given what its agents are told.
+
+    An interface's system prompt states how the time cap is decided (v1: the highest score; v2: the higher net
+    worth), so the rule has to agree with it or the policy is trained, and the baseline measured, on a goal the engine
+    does not score. `None` takes the rule the agents' prompt names (official when no agent plays, or when agents on
+    both interfaces do, as in an interface comparison, where no one rule fits both); an explicit rule that contradicts
+    the one prompt all the agents share is an error.
+    """
+    named = {PROMPT_RULES[i] for i in agent_interfaces}
+    prompted = next(iter(named)) if len(named) == 1 else None
+    if rule is None:
+        return prompted or "official"
+    if prompted is not None and rule != prompted:
+        raise ValueError(f"score_rule {rule!r} contradicts the agents' prompt, which says the {prompted} rule decides")
+    return rule
 
 
 @dataclass(frozen=True)

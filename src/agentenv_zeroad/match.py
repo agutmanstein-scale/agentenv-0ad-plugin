@@ -8,14 +8,19 @@ touch this loop: their MCP tool calls only put orders in a seat's book (`submit`
 (`brief`), so a slow model never delays a step or a tick (spec §4.2).
 
 Seats: `agent` seats are played by brains through MCP and driven by the executor; `bot` seats by the scripted bot
-through the same executor; `petra` seats by the engine's own AI. Fog (spec §4.3, U2's carry-forward note): right
+through the same executor; `replay` seats by an order replay (`replay.py`) through the same executor; `petra` seats by
+the engine's own AI. Fog (spec §4.3, U2's carry-forward note): right
 after the reset each player's own LOS reveal flag is turned off, so Petra and every snapshot see only what that
 player sees, while the observer still sees all.
 
-The match ends by conquest (the engine's own player states), or at the time cap, where the highest engine score
-among the players still standing wins and a tie on top draws (`grading`); a player the engine already defeated
-stays lost. The time cap is checked every seat-loop second even when that second's engine reads fail, on the last
-known scores, and a loop that fails `MAX_FAILED_TICKS` seconds in a row fails the match, so it can't run unbounded.
+The match ends by conquest (the engine's own player states), or at the time cap, where the highest score among the
+players still standing wins and a tie on top draws (`grading`); a player the engine already defeated stays lost. The
+score is the engine's official total or, with `score_rule="net_worth"`, each player's net worth (`js/snapshot.js`); an
+unset rule follows what the agents' prompt says (`grading.resolve_score_rule`). A
+`time_cap_s` of 0 means no time cap: the game then ends at the safety cap (`safety_cap_s`), decided the same way and
+recorded as `ended_by` "safety_cap". The cap is checked every seat-loop second even when that second's engine reads
+fail, on the last known scores, and a loop that fails `MAX_FAILED_TICKS` seconds in a row fails the match, so it can't
+run unbounded.
 At the end the clock stops, the replay is copied out of the engine and the results file is written.
 
 Brains (U5): a seat whose plan sets `reflex="luna"` gets a Luna reflex (`reflex.py`), its own task beside the clock and
@@ -52,20 +57,24 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from agentenv_zeroad import grading
+from agentenv_zeroad.army import ArmyReport
 from agentenv_zeroad.autopilot import held_default
 from agentenv_zeroad.bots import ScriptedBot
 from agentenv_zeroad.brief import json_brief, text_brief
+from agentenv_zeroad.brief_v2 import BriefContext, affordable_text, net_worth, reference_text, text_brief_v2
 from agentenv_zeroad.clock import GameClock
 from agentenv_zeroad.decisions import DecisionsClient
 from agentenv_zeroad.engine import TURN_MS, GameEngine
 from agentenv_zeroad.executor import Executor, build_executors
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.metrics import MatchMetrics, percentile
 from agentenv_zeroad.orders import OrderResult, _Order, call_text, rejected
 from agentenv_zeroad.reflex import Decider, Reflex, ReflexAction, open_decisions
+from agentenv_zeroad.replay import ReplayController, ReplaySpec
 from agentenv_zeroad.roles import RoleCatalog
-from agentenv_zeroad.scenario import Seat, build_scenario
+from agentenv_zeroad.scenario import AiBehavior, Seat, build_scenario
 from agentenv_zeroad.spend import SpendGuard, results_spend
-from agentenv_zeroad.state import EventTracker, Snapshot, SnapshotQuery, clock_text
+from agentenv_zeroad.state import RESOURCES, EventTracker, Snapshot, SnapshotQuery, clock_text
 from agentenv_zeroad.view import ExecutorView, ViewQuery
 
 if TYPE_CHECKING:
@@ -73,7 +82,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-SeatKind = Literal["agent", "bot", "petra"]
+SeatKind = Literal["agent", "bot", "replay", "petra"]
 TICK_S = 1.0
 MAX_FAILED_TICKS = 30
 TOOL_LOG_LIMIT = 2000
@@ -81,6 +90,8 @@ TIMELINE_EVERY_MS = 10_000  # results' timeline: every player's score and essent
 TURNS_KEPT = 1000  # logged brain turns a seat keeps for results (a 12-hour match at 25 s is under 1,800)
 REFLEX_RECENT = 3  # reflex and autopilot actions the strategist's brief lists
 ACTIONS_KEPT = 500
+SAFETY_CAP_S = 45 * 60  # the longest a game with no time cap runs
+NO_TIME_LIMIT = "No time limit: the game is won by conquest."
 HOLD_REPEAT_MS = 30_000  # a held default is carried out at most this often per decision
 Who = Literal["brain", "reflex", "autopilot", "bot"]
 
@@ -109,6 +120,11 @@ class SeatPlan:
     ai_difficulty: int = 3
     reflex: str | None = None
     reflex_max_usd: float | None = None
+    interface: Interface = DEFAULT_INTERFACE
+    ai_behavior: AiBehavior = "balanced"
+    starting_resources: int | None = None  # experimental (scenario.py)
+    population_limit: int | None = None  # experimental (scenario.py)
+    replay: str | None = None  # a replay seat's spec file (replay.py)
 
 
 @dataclass(frozen=True)
@@ -120,18 +136,49 @@ class MatchConfig:
     size: int = 192
     seed: int = 7
     speed: float = 1.0
-    time_cap_s: float = 40 * 60
+    time_cap_s: float = 40 * 60  # 0: no time cap, the game ends at `safety_cap_s`
+    safety_cap_s: float = SAFETY_CAP_S
+    score_rule: grading.ScoreRule | None = None
+    """None: the rule the agent seats' prompt names (v2 net worth, else official); see grading.resolve_score_rule."""
     draw_margin: float = 0.0
     fog: bool = True
     tick_s: float = TICK_S
+    ai_seed: int | None = None  # Petra's seed; the map seed by default
+    ceasefire_minutes: int = 0
+    starting_resources: int | None = None  # experimental (scenario.py)
+
+    def __post_init__(self) -> None:
+        agents = (s.interface for s in self.seats if s.kind == "agent")
+        object.__setattr__(self, "score_rule", grading.resolve_score_rule(self.score_rule, agents))
+
+    @property
+    def cap_s(self) -> float:
+        """Game seconds until the match is decided by score: the time cap, or the safety cap when there is none."""
+        return self.time_cap_s if self.time_cap_s > 0 else self.safety_cap_s
 
     def scenario(self) -> dict[str, Any]:
         seats = [
-            Seat(s.name, s.civ, controller="petra" if s.kind == "petra" else "external", ai_difficulty=s.ai_difficulty)
+            Seat(
+                s.name,
+                s.civ,
+                controller="petra" if s.kind == "petra" else "external",
+                ai_difficulty=s.ai_difficulty,
+                ai_behavior=s.ai_behavior,
+                starting_resources=s.starting_resources,
+                population_limit=s.population_limit,
+            )
             for s in self.seats
         ]
         return build_scenario(
-            seats, map_name=self.map_name, biome=self.biome, placement=self.placement, size=self.size, seed=self.seed
+            seats,
+            map_name=self.map_name,
+            biome=self.biome,
+            placement=self.placement,
+            size=self.size,
+            seed=self.seed,
+            ai_seed=self.ai_seed,
+            ceasefire_minutes=self.ceasefire_minutes,
+            starting_resources=self.starting_resources,
         )
 
 
@@ -160,7 +207,7 @@ class Action:
 class SeatState:
     plan: SeatPlan
     executor: Executor | None = None
-    bot: ScriptedBot | None = None
+    bot: ScriptedBot | ReplayController | None = None
     brain_calls: list[grading.BrainCall] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_count: int = 0
@@ -173,6 +220,12 @@ class SeatState:
     holds: dict[str, int] = field(default_factory=dict)  # decision -> game ms of the last held default carried out
     thinking_since: float | None = None
     turns: list[dict[str, Any]] = field(default_factory=list)
+    brief_stats: dict[str, int] = field(default_factory=dict)  # the combat totals at the last v2 brief
+    reference: str | None = None  # the v2 cost tables, written once so every ask gets the same text
+    kills_seen: int = 0  # the engine's enemy_units_killed at the last tick
+    kills_home: int = 0  # kills made while enemy soldiers were within reach of the seat's base
+    kills_away: int = 0  # every other kill
+    enemies_near: bool = False  # enemy soldiers were within reach of the base at the last tick
 
     @property
     def brain_is_luna(self) -> bool:
@@ -259,7 +312,7 @@ class LiveMatch:
         self.metrics = MatchMetrics(sorted(self.by_player))
         self.trackers: dict[int, EventTracker] = {}
         self.snapshot: Snapshot | None = None
-        self.scores: dict[str, dict[str, float]] = {}
+        self.scores: dict[str, dict[str, Any]] = {}  # net_worth: None until read; net_worth_stale: reads since
         self.states: dict[str, str] = {}
         self.outcomes: dict[str, grading.Outcome] | None = None
         self.ended_by: str | None = None
@@ -287,7 +340,7 @@ class LiveMatch:
         await self.engine.reset(self.config.scenario(), save_replay=True)
         if self.config.fog:
             self.fog = await self.engine.evaluate(js("fog.js"))
-        driven = sorted(s.plan.player for s in self.seats.values() if s.plan.kind in ("agent", "bot"))
+        driven = sorted(s.plan.player for s in self.seats.values() if s.plan.kind in ("agent", "bot", "replay"))
         self._snapshots = SnapshotQuery(self.engine, sorted(self.by_player))
         if driven:
             executors, self._view = await build_executors(
@@ -297,18 +350,24 @@ class LiveMatch:
                 players=sorted(self.by_player),
                 catalog=self._catalog,
                 placer=self._placer,
+                interfaces={s.plan.player: s.plan.interface for s in self.seats.values()},
             )
             for p, executor in executors.items():
                 seat = self.seats[self.by_player[p]]
                 seat.executor = executor
                 if seat.plan.kind == "bot":
-                    seat.bot = ScriptedBot(
-                        executor, submit=lambda order, seat=seat: self._submit_logged(seat, order, by="bot")
-                    )
+                    seat.bot = ScriptedBot(executor, submit=self._scripted_submit(seat))
+                elif seat.plan.kind == "replay":
+                    assert seat.plan.replay is not None, f"seat {seat.plan.slot} is a replay seat without a spec"
+                    spec = ReplaySpec.load(Path(seat.plan.replay))
+                    seat.bot = ReplayController(executor, spec, submit=self._scripted_submit(seat))
                 if seat.plan.reflex == "luna":
                     self._add_reflex(seat)
         self.trackers = {s.plan.player: EventTracker(s.plan.player) for s in self.seats.values()}
         await self._tick()
+
+    def _scripted_submit(self, seat: SeatState) -> Callable[[_Order], OrderResult]:
+        return lambda order: self._submit_logged(seat, order, by="bot")
 
     def start(self) -> None:
         """Start the clock and the seat loop; the match runs until it ends or `stop()`."""
@@ -326,6 +385,10 @@ class LiveMatch:
 
     def now(self) -> float:
         return self._now()
+
+    @property
+    def cap_ms(self) -> int:
+        return int(self.config.cap_s * 1000)
 
     @property
     def started(self) -> bool:
@@ -429,22 +492,50 @@ class LiveMatch:
                 self.tick_errors += 1
                 log.exception("seat %s: tick failed", seat.plan.slot)
         self.metrics.observe(snap)
+        self._count_kills(snap)
         for tracker in self.trackers.values():
             tracker.update(snap)
         self.snapshot = snap
         outcome = await self.engine.evaluate(js("outcome.js"))
-        self._read_outcome(outcome or {})
+        self._read_outcome(outcome or {}, snap)
         self._sample_timeline(snap)
         self.ticks += 1
         self._check_end(snap.time_ms)
 
-    def _read_outcome(self, raw: Mapping[str, Any]) -> None:
+    def _count_kills(self, snap: Snapshot) -> None:
+        """Split each seat's new kills into home and away. The engine counts kills without saying where, so a kill is
+        'home' when enemy soldiers were within reach of the seat's base (`enemies_near_base`) at this tick or the last
+        one, which is when a defence fights; anything else is 'away'."""
+        for seat in self.seats.values():
+            me = snap.players.get(seat.plan.player)
+            if me is None:
+                continue
+            total = int(me.stats.get("enemy_units_killed", 0))
+            new, seat.kills_seen = max(0, total - seat.kills_seen), total
+            near = bool(me.enemies_near_base)
+            if new:
+                if near or seat.enemies_near:
+                    seat.kills_home += new
+                else:
+                    seat.kills_away += new
+            seat.enemies_near = near
+
+    def _read_outcome(self, raw: Mapping[str, Any], snap: Snapshot) -> None:
+        """Each player's state and score: the engine's parts and total, and the net worth the snapshot read."""
         for p, row in raw.items():
             slot = self.by_player.get(int(p))
             if slot is None:
                 continue
             self.states[slot] = str(row.get("state", "active"))
-            self.scores[slot] = {k: float(row.get(k, 0)) for k in ("total", "economy", "military", "exploration")}
+            scores = {k: float(row.get(k, 0)) for k in ("total", "economy", "military", "exploration")}
+            seen = snap.players.get(int(p))
+            before = self.scores.get(slot, {})
+            if seen is not None and seen.net_worth is not None:
+                scores["net_worth"], scores["net_worth_stale"] = float(seen.net_worth), 0
+            else:  # carried forward, and counted: None until the first reading, then `net_worth_stale` reads missed
+                scores["net_worth"] = before.get("net_worth")
+                scores["net_worth_stale"] = int(before.get("net_worth_stale", 0)) + 1
+            self.scores[slot] = scores
         fallen = frozenset(s.plan.player for s in self.seats.values() if self.states.get(s.plan.slot) == "defeated")
         for seat in self.seats.values():
             if seat.executor is not None:
@@ -466,6 +557,7 @@ class LiveMatch:
                     "army": me.army,
                     "gatherers": sum(me.gatherers.values()),
                     "resources": sum(me.resources.values()),
+                    "villagers": me.units.get("villager", 0),
                     "phase": me.phase,
                     "buildings": len(me.buildings),
                     "kills": int(me.stats.get("enemy_units_killed", 0)),
@@ -481,12 +573,13 @@ class LiveMatch:
         decided = grading.conquest_outcomes(self.states) if len(self.states) == len(self.seats) else None
         if decided is not None:
             self._end(decided, "conquest")
-        elif time_ms >= self.config.time_cap_s * 1000:
+        elif time_ms >= self.cap_ms:
+            key = grading.SCORE_KEYS[self.config.score_rule]
             standing = [slot for slot in self.seats if self.states.get(slot) != "defeated"]
-            totals = {slot: self.scores.get(slot, {}).get("total", 0.0) for slot in standing}
+            measure = {slot: self.scores.get(slot, {}).get(key) or 0.0 for slot in standing}
             outcomes: dict[str, grading.Outcome] = dict.fromkeys(self.seats, "lost")
-            outcomes |= grading.time_cap_outcomes(totals, draw_margin=self.config.draw_margin)
-            self._end(outcomes, "time_cap")
+            outcomes |= grading.time_cap_outcomes(measure, draw_margin=self.config.draw_margin)
+            self._end(outcomes, "time_cap" if self.config.time_cap_s > 0 else "safety_cap")
 
     def _end(self, outcomes: dict[str, grading.Outcome], ended_by: str) -> None:
         self.outcomes, self.ended_by = outcomes, ended_by
@@ -516,10 +609,12 @@ class LiveMatch:
         winners = [self.seats[s].plan.name for s, o in self.outcomes.items() if o == "won"]
         if self.ended_by == "conquest":
             return f"{', '.join(winners) or 'nobody'} won by conquest at {self.game_clock}"
+        measure = "net worth" if self.config.score_rule == "net_worth" else "score"
+        cap = "safety cap" if self.ended_by == "safety_cap" else "time cap"
         if winners:
-            return f"{', '.join(winners)} won on score at the time cap, {self.game_clock}"
+            return f"{', '.join(winners)} won on {measure} at the {cap}, {self.game_clock}"
         drawn = [self.seats[s].plan.name for s, o in self.outcomes.items() if o == "drawn"]
-        return f"a draw between {', '.join(drawn)} at the time cap, {self.game_clock}"
+        return f"a draw between {', '.join(drawn)} at the {cap}, {self.game_clock}"
 
     # ---- seats: orders, briefs and timings ------------------------------------------------------------------------
     def submit(self, slot: str, order: _Order) -> OrderResult:
@@ -546,12 +641,17 @@ class LiveMatch:
         player = self.seats[slot].plan.player
         if self.snapshot is None or player not in self.snapshot.players:
             return "The match has not produced a snapshot yet; try again in a second."
+        if self.seats[slot].plan.interface == "v2" and self.seats[slot].executor is not None:
+            return self._brief_v2(slot)
         names = {s.plan.player: s.plan.name for s in self.seats.values()}
         events = self.trackers[player].drain() if player in self.trackers else []
         orders = self.seats[slot].executor.book.summary() if self.seats[slot].executor else {}
         lines = [text_brief(self.snapshot, player, events, names=names)]
-        left = max(0, int(self.config.time_cap_s * 1000) - self.time_ms)
-        lines.append(f"Time left before the score decides: {clock_text(left)}.")
+        if self.config.time_cap_s > 0:
+            left = max(0, self.cap_ms - self.time_ms)
+            lines.append(f"Time left before the score decides: {clock_text(left)}.")
+        else:
+            lines.append(NO_TIME_LIMIT)
         if orders:
             lines.append("Standing orders: " + json.dumps(orders, separators=(", ", ": ")))
         seat = self.seats[slot]
@@ -564,6 +664,44 @@ class LiveMatch:
         lines.append(self.footer(slot))
         return "\n".join(lines)
 
+    def _brief_v2(self, slot: str) -> str:
+        """The v2 brief: players by number only, own score and army, what is affordable, the executor's give-ups."""
+        seat = self.seats[slot]
+        player, executor = seat.plan.player, seat.executor
+        assert self.snapshot is not None and executor is not None
+        me = self.snapshot.players[player]
+        tracker = self.trackers.get(player)
+        events = tracker.drain() if tracker else []
+        totals = {k: int(me.stats.get(k, 0)) for k in ("enemy_units_killed", "units_lost")}
+        before, seat.brief_stats = seat.brief_stats, totals
+        view = executor.last_seat
+        book = executor.book
+        ctx = BriefContext(
+            cap_ms=self.cap_ms if self.config.time_cap_s > 0 else 0,
+            scores=self.scores.get(slot, {}),
+            army=executor.army.report(executor, view) if view is not None else ArmyReport({}, "none"),
+            orders=book.army.describe(),
+            killed=totals["enemy_units_killed"] - before.get("enemy_units_killed", 0),
+            lost=totals["units_lost"] - before.get("units_lost", 0),
+            villager_target=book.villager_target,
+            affordable=affordable_text(executor.roles, view, me.resources, executor._phase_tech(view))
+            if view is not None
+            else "",
+            standing=_standing(book.summary()),
+            net_worth=net_worth(self.snapshot, player),
+            notices=executor.drain_notices(),
+        )
+        return text_brief_v2(self.snapshot, player, events, ctx)
+
+    def reference(self, slot: str) -> str:
+        """The seat's static cost tables for its prompt prefix (interface v2; empty for a v1 seat)."""
+        seat = self.seats[slot]
+        if seat.plan.interface != "v2" or seat.executor is None:
+            return ""
+        if seat.reference is None:
+            seat.reference = reference_text(seat.executor.roles, seat.executor.last_seat)
+        return seat.reference
+
     def compact_brief(self, slot: str) -> str:
         """The JSON brief Luna's questions are built from (spec §4.3), with the standing orders and match status."""
         player = self.seats[slot].plan.player
@@ -574,9 +712,12 @@ class LiveMatch:
         brief = json_brief(self.snapshot, player, events)
         brief["state"] = self.snapshot.players[player].state
         brief["orders"] = executor.book.summary() if executor else {}
-        brief["players"] = {str(s.plan.player): s.plan.name for s in self.seats.values()}
-        brief["cap"] = clock_text(int(self.config.time_cap_s * 1000))
-        brief["cap_ms"] = int(self.config.time_cap_s * 1000)
+        v2 = self.seats[slot].plan.interface == "v2"
+        brief["players"] = {
+            str(s.plan.player): f"player {s.plan.player}" if v2 else s.plan.name for s in self.seats.values()
+        }
+        brief["cap"] = clock_text(self.cap_ms)
+        brief["cap_ms"] = self.cap_ms
         brief["over"] = self.over
         if executor is not None and executor.last_seat is not None:
             tech = executor._phase_tech(executor.last_seat)
@@ -587,9 +728,10 @@ class LiveMatch:
     def footer(self, slot: str) -> str:
         """One line every tool result ends with: clock, the seat's essentials, pending events, how the match ends."""
         player = self.seats[slot].plan.player
-        cap = clock_text(int(self.config.time_cap_s * 1000))
+        # With no time cap the safety cap is internal: the seat is told there is no limit, never a countdown.
+        cap = f"/ cap {clock_text(self.cap_ms)}" if self.config.time_cap_s > 0 else "· no time limit"
         if self.snapshot is None or player not in self.snapshot.players:
-            return f"[{self.game_clock} / cap {cap}]"
+            return f"[{self.game_clock} {cap}]"
         me = self.snapshot.players[player]
         tracker = self.trackers.get(player)
         pending = tracker.peek() if tracker else []
@@ -603,7 +745,7 @@ class LiveMatch:
             line = (last.line or last.what)[:60]
             luna = f" · {n} reflex/autopilot actions, last {clock_text(last.game_ms)} {seat.label(last)}: {line}"
         return (
-            f"[{self.game_clock} / cap {cap} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
+            f"[{self.game_clock} {cap} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
             f"army {me.army} · {len(pending)} new events ({urgent} urgent){luna}: get_brief()]"
         )
 
@@ -712,7 +854,7 @@ class LiveMatch:
         picked = held_default(
             decision,
             time_ms=self.time_ms,
-            cap_ms=int(self.config.time_cap_s * 1000),
+            cap_ms=self.cap_ms,
             phase=me.phase,
             advancing=book.advance_phase,
             army_action=book.army.action,
@@ -749,20 +891,28 @@ class LiveMatch:
             "over": self.over,
             "defeated": self.states.get(slot) == "defeated",
             "game_ms": self.time_ms,
-            "time_cap_ms": int(self.config.time_cap_s * 1000),
+            "time_cap_ms": self.cap_ms,
             "events": len(pending),
             "urgent": sum(1 for e in pending if e.urgent),
             "open": open_decisions(me, book, pending),
         }
 
     # ---- results ---------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _petra_settings(plan: SeatPlan) -> dict[str, Any]:
+        if plan.kind != "petra":
+            return {}
+        return {"ai_difficulty": plan.ai_difficulty, "ai_behavior": plan.ai_behavior}
+
     def _combat(self, player: int) -> dict[str, int] | None:
         """Units and buildings lost and enemy units killed, from the engine's statistics in the last snapshot."""
         me = self.snapshot.players.get(player) if self.snapshot is not None else None
         if me is None or not me.stats:
             return None
         keys = ("units_lost", "enemy_units_killed", "buildings_lost", "units_trained")
-        return {k: int(me.stats.get(k, 0)) for k in keys}
+        seat = next((s for s in self.seats.values() if s.plan.player == player), None)
+        split = {"kills_home": seat.kills_home, "kills_away": seat.kills_away} if seat is not None else {}
+        return {**{k: int(me.stats.get(k, 0)) for k in keys}, **split}
 
     def results(self) -> dict[str, Any]:
         clock = self.clock.metrics()
@@ -778,6 +928,9 @@ class LiveMatch:
                 "kind": seat.plan.kind,
                 "civ": seat.plan.civ,
                 "name": seat.plan.name,
+                "interface": seat.plan.interface,
+                "reference": self.reference(slot),  # the cost tables the policy's prompt carried (v2; "" for v1)
+                **self._petra_settings(seat.plan),
                 "state": self.states.get(slot),
                 "outcome": outcome,
                 "score": self.scores.get(slot),
@@ -814,6 +967,10 @@ class LiveMatch:
             "wall_s": round(wall, 1),
             "speed": self.config.speed,
             "time_cap_s": self.config.time_cap_s,
+            "safety_cap_s": self.config.safety_cap_s,
+            "score_rule": self.config.score_rule,
+            "ai_seed": self.config.ai_seed,
+            "ceasefire_minutes": self.config.ceasefire_minutes,
             "map": {"name": self.config.map_name, "size": self.config.size, "seed": self.config.seed},
             "fog": self.fog,
             "clock": clock,
@@ -824,6 +981,22 @@ class LiveMatch:
             "seats": seats,
             "timeline": self.timeline,
         }
+
+
+def _standing(summary: dict[str, Any]) -> str:
+    """The v2 brief's standing orders in a line: the split, what is queued, to build and to research (the villager
+    target and the army posture are in the brief's own lines)."""
+    split = "/".join(str(summary["economy"][r]) for r in RESOURCES)
+    parts = [f"economy {split} (food/wood/stone/metal)"]
+    if summary["train"]:
+        parts.append("train " + ", ".join(f"{n} {role}" for role, n in summary["train"].items()))
+    if summary["build"]:
+        parts.append("build " + ", ".join(summary["build"]))
+    if summary["research"]:
+        parts.append("research " + ", ".join(summary["research"]))
+    if summary["advance_phase"]:
+        parts.append("advancing phase")
+    return "; ".join(parts) + "."
 
 
 def _tool_summary(calls: list[ToolCall], count: int) -> dict[str, Any]:

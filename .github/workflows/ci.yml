@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group dev
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run pytest -q
+
+  trainer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group dev
+      - name: CPU torch (the CPU index carries torch's own dependencies)
+        run: uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install transformers peft
+      - name: Trainer tests on a tiny CPU model
+        run: |
+          uv run --no-sync python -c "import torch, transformers, peft"
+          uv run --no-sync pytest tests/test_trainer.py -q

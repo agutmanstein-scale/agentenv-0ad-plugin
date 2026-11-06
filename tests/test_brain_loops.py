@@ -106,7 +106,7 @@ async def test_without_an_urgent_event_the_strategist_calls_on_its_interval():
 
 async def test_on_the_game_clock_the_interval_counts_game_seconds_at_any_speed():
     clock = Clock()
-    status = lambda t, calls: {"started": True, "over": t >= 60, "game_ms": int(t * 4000), "open": []}  # 4x  # noqa: E731
+    status = lambda t, calls: {"started": True, "over": t >= 60, "game_ms": int(t * 4000), "open": []}  # noqa: E731
     link = FakeLink(clock, status)
     await commander(FakeLiteLLM(), clock, game_clock=True).play(link)
     first, second = link.call_times[:2]

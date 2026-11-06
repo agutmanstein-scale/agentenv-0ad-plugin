@@ -10,7 +10,9 @@ Environment: ZEROAD_INTERVAL_S (25), ZEROAD_MIN_GAP_S (8), ZEROAD_MAX_COST_USD (
 unset), ZEROAD_SHARE_REFLEX_KEY (1). The key is never logged or put in the result. For a model the box serves itself
 (vLLM, the post-training pilot): ZEROAD_INTERVAL_CLOCK=game counts the interval in game seconds, ZEROAD_TURN_LOG=1
 reports each turn (prompt and sampled token ids, orders) to the env for training, and ZEROAD_EXTRA_BODY (a JSON
-object) is added to every chat request (sampling, chat template settings, `return_token_ids`).
+object) is added to every chat request (sampling, chat template settings, `return_token_ids`). ZEROAD_INTERFACE
+(`v1`, the default, or `v2`: waves, order feedback in the memory, `hold`, the v2 prompt and cost tables) picks the
+interface the brain plays; the seat's slot must set the same `interface`.
 """
 
 import json
@@ -29,7 +31,8 @@ from agentenv_protocol.a2a_agent import (
     a2a_agent,
 )
 
-from agentenv_zeroad.brains import STRATEGIST_SYSTEM, Commander, CommanderSettings, seat_link, summary
+from agentenv_zeroad.brains import Commander, CommanderSettings, seat_link, strategist_system, summary
+from agentenv_zeroad.interface import ENV_VAR, parse_interface
 from agentenv_zeroad.llm import StrategistModel
 from agentenv_zeroad.spend import SpendGuard
 
@@ -73,21 +76,26 @@ class ZeroADCommander(AgentEnvAgent):
         extra = json.loads(environ.get("ZEROAD_EXTRA_BODY") or "{}")
         if not isinstance(extra, dict):
             return TaskResult.failure("bad_config", "ZEROAD_EXTRA_BODY must be a JSON object")
+        try:
+            interface = parse_interface(environ.get(ENV_VAR))
+        except ValueError as e:
+            return TaskResult.failure("bad_config", str(e))
         model = StrategistModel(
             config.model, base, key, guard, effort=config.effort, max_tokens=max_tokens, extra_body=extra
         )
         settings = CommanderSettings(
             interval_s=_float(environ, "ZEROAD_INTERVAL_S", 25.0) or 25.0,
             min_gap_s=_float(environ, "ZEROAD_MIN_GAP_S", 8.0) or 8.0,
-            system_prompt=config.system_prompt or STRATEGIST_SYSTEM,
+            system_prompt=config.system_prompt or strategist_system(interface),
             opening="\n".join(p.text for p in request.parts if getattr(p, "text", None)),
             game_clock=environ.get("ZEROAD_INTERVAL_CLOCK", "wall") == "game",
             log_turns=environ.get("ZEROAD_TURN_LOG", "0") in ("1", "true", "yes"),
+            interface=interface,
         )
         commander = Commander(model, settings)
         share = environ.get("ZEROAD_SHARE_REFLEX_KEY", "1") not in ("0", "false", "no")
         try:
-            async with seat_link(server) as link:
+            async with seat_link(server, interface) as link:
                 await commander.play(link, reflex_key=(base, key) if share else None)
         except Exception as e:  # noqa: BLE001 - the result says why the brain stopped
             commander.record.end_reason = "error"

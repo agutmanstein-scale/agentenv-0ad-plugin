@@ -61,6 +61,14 @@ async def agent_vs_petra(env, **settings):
     await env.close_lobby()
 
 
+async def agent_vs_petra_with(env, agent, **settings):
+    env.new_lobby({**FAST, **settings})
+    slot = {"player_id": "1", "player_kind": "agent", "player_name": "alice", **agent}
+    env.fill_slot(SlotRequest(**slot))
+    env.fill_slot(SlotRequest(player_id="2", player_kind="ai"))
+    await env.close_lobby()
+
+
 async def test_player_slots_are_the_engines_player_numbers(env):
     env.new_lobby(FAST)
     with pytest.raises(GameError, match="player numbers 1 to 8"):
@@ -137,6 +145,9 @@ async def test_the_envs_own_address_and_an_ai_seat_play_no_one(env):
     assert ai["code"] == "unknown_player"
 
 
+V2_DEFAULTS = {"min_size": {"default": 8}, "regroup_below": {"default": 0.4}}
+
+
 async def test_every_order_tool_takes_its_order_models_fields(env):
     tools = {t.name: t.inputSchema for t in await env.mcp.list_tools()}
     assert set(tools) == {"get_brief"} | {m.model_fields["kind"].default for m in ORDER_TYPES}
@@ -145,6 +156,8 @@ async def test_every_order_tool_takes_its_order_models_fields(env):
         got = tools[model.model_fields["kind"].default].get("properties", {})
         assert set(got) == set(expected)
         for name, prop in expected.items():
+            if name in V2_DEFAULTS:  # optional (None) on the model, a plain default on the tool
+                prop = {**next(b for b in prop.get("anyOf", [prop]) if b.get("type") != "null"), **V2_DEFAULTS[name]}
             for key in ("type", "enum", "minimum", "maximum", "minLength", "maxLength", "default"):
                 assert got[name].get(key) == prop.get(key), (model.__name__, name, key)
 
@@ -186,7 +199,12 @@ async def test_finish_plays_the_match_out_and_its_files_are_the_results_and_the_
     agent = json.loads(env.live.files["results"].read_text())["seats"]["1"]
     # an agent whose brain reports no calls is graded by its tool calls
     assert agent["outcome"] == "won" and agent["grade"] == 1.0 and agent["forfeited"] is False
-    assert [s.name for s in match.player_states["2"].scores] == ["score", "economy", "military", "exploration"]
+    assert [s.name for s in match.player_states["2"].scores] == [
+        "score",
+        "economy",
+        "military",
+        "exploration",
+    ]  # no net_worth: this engine never reported one
     late = json.loads(await call(env, "1", "advance_phase"))
     assert late["code"] in ("match_over", "no_match") or late["status"] == "rejected"
     listed = await env.list_match_files()
@@ -254,3 +272,67 @@ async def test_an_engine_whose_setup_fails_is_stopped_and_no_match_is_kept(tmp_p
     with pytest.raises(Exception, match="reset failed"):
         await agent_vs_petra(env)
     assert len(handles) == 1 and handles[0].closed == 1 and env.live is None
+
+
+async def test_the_game_knobs_and_score_rule_in_the_lobby_reach_the_match(env):
+    env.new_lobby(
+        {**FAST, "score_rule": "net_worth", "ai_seed": 31, "ceasefire_minutes": 4, "safety_cap_minutes": 50}
+        | {"time_cap_minutes": 0, "experimental_starting_resources": 800}
+    )
+    env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings={"controller": "bot"}))
+    petra = {"ai_behavior": "defensive", "experimental_resources": 200, "experimental_population_limit": 60}
+    env.fill_slot(SlotRequest(player_id="2", player_kind="ai", game_settings=petra))
+    await env.close_lobby()
+    config = env.live.config
+    assert (config.score_rule, config.ai_seed, config.ceasefire_minutes) == ("net_worth", 31, 4)
+    assert (config.time_cap_s, config.safety_cap_s, config.cap_s) == (0, 3000, 3000)
+    settings = env.live.engine.scenario["settings"]
+    assert settings["AISeed"] == 31 and settings["Ceasefire"] == 4 and settings["StartingResources"] == 800
+    assert settings["PlayerData"][1]["AIBehavior"] == "defensive"
+    assert settings["PlayerData"][1]["PopulationLimit"] == 60
+    assert settings["PlayerData"][1]["Resources"] == {"food": 200, "wood": 200, "stone": 200, "metal": 200}
+
+
+async def test_the_lobby_rejects_a_bad_score_rule_ai_behavior_and_a_replay_slot_without_its_spec(env):
+    with pytest.raises(GameError, match="score_rule"):
+        env.new_lobby({**FAST, "score_rule": "gold"})
+    env.new_lobby(FAST)
+    with pytest.raises(GameError, match="ai_behavior"):
+        env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings={"ai_behavior": "sneaky"}))
+    with pytest.raises(GameError, match="replay slot needs a replay_spec"):
+        env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings={"controller": "replay"}))
+    with pytest.raises(GameError, match="only for a replay slot"):
+        env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings={"replay_spec": "x.json"}))
+
+
+async def test_the_report_carries_each_players_net_worth_beside_the_engine_scores(env):
+    await agent_vs_petra(env)
+    env.live.engine.net_worth = {"1": 1500}
+    await env.live._tick()
+    scores = {s.name: s.value for s in env.match.player_states["1"].scores}
+    assert scores["net_worth"] == 1500
+
+
+async def test_a_v2_agent_defaults_the_score_rule_to_net_worth_and_a_contradicting_rule_fails_the_lobby(env, handles):
+    v2 = {"game_settings": {"interface": "v2"}}
+    await agent_vs_petra_with(env, v2)
+    assert env.live.config.score_rule == "net_worth"
+    await agent_vs_petra_with(env, {"game_settings": {}})
+    assert env.live.config.score_rule == "official"
+    await agent_vs_petra_with(env, v2, score_rule="net_worth")
+    assert env.live.config.score_rule == "net_worth"
+    before = len(handles)
+    with pytest.raises(ValueError, match="score_rule 'official' contradicts the agents' prompt"):
+        await agent_vs_petra_with(env, v2, score_rule="official")
+    with pytest.raises(ValueError, match="score_rule 'net_worth' contradicts the agents' prompt"):
+        await agent_vs_petra_with(env, {"game_settings": {}}, score_rule="net_worth")
+    assert len(handles) == before and env.lobby.status.value == "failed"
+
+
+async def test_a_v2_bot_or_replay_seat_leaves_the_score_rule_at_official(env):
+    env.new_lobby(FAST)
+    bot = {"controller": "bot", "interface": "v2"}
+    env.fill_slot(SlotRequest(player_id="1", player_kind="ai", game_settings=bot))
+    env.fill_slot(SlotRequest(player_id="2", player_kind="ai"))
+    await env.close_lobby()
+    assert env.live.config.score_rule == "official"

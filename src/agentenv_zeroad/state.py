@@ -125,6 +125,7 @@ class PlayerSnapshot:
     enemies_near_base: int
     base: Pos | None
     stats: dict[str, int] = field(default_factory=dict)
+    net_worth: int | None = None  # cost of living units and finished structures plus banked resources
 
     @classmethod
     def from_json(cls, player: int, raw: Mapping[str, Any]) -> PlayerSnapshot:
@@ -154,6 +155,7 @@ class PlayerSnapshot:
             enemies_near_base=int(raw.get("enemies_near_base", 0)),
             base=_pos(raw.get("base")),
             stats={k: int(v) for k, v in raw.get("stats", {}).items()},
+            net_worth=None if raw.get("net_worth") is None else int(raw["net_worth"]),
         )
 
     @property

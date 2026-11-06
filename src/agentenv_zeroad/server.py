@@ -85,14 +85,23 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 from agentenv_zeroad import grading
 from agentenv_zeroad.engine import DEFAULT_IMAGE, EngineOptions, free_port, start_engine
+from agentenv_zeroad.grading import ScoreRule
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.live import Broadcast, BroadcastSettings, overlay_html, overlay_state
 from agentenv_zeroad.match import TICK_S, EngineHandle, LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.orders import (
+    DEFAULT_MIN_SIZE,
+    DEFAULT_REGROUP_BELOW,
     MAX_TRAIN,
+    MAX_VILLAGER_TARGET,
+    MAX_WAVE_SIZE,
+    MIN_VILLAGER_TARGET,
+    MIN_WAVE_SIZE,
     AdvancePhase,
     Army,
     ArmyAction,
     Build,
+    Hold,
     OrderResult,
     Research,
     Role,
@@ -103,7 +112,7 @@ from agentenv_zeroad.orders import (
     rejected,
 )
 from agentenv_zeroad.roles import CIVS
-from agentenv_zeroad.scenario import MAP_SIZES, MAX_PLAYERS, PLAYER_PLACEMENTS
+from agentenv_zeroad.scenario import MAP_SIZES, MAX_PLAYERS, PLAYER_PLACEMENTS, AiBehavior
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +123,7 @@ FILE_KINDS = {
     "recording": ("recording.mp4", "video/mp4"),
     "engine_log": ("engine-log.html", "text/html"),
 }
+SEAT_LABELS = {"bot": "Bot", "replay": "Replay"}
 RT_IMAGE = "zeroad-engine:0.28-rt"
 ROLES = list(Role.__args__)  # type: ignore[attr-defined]
 ACTIONS = list(ArmyAction.__args__)  # type: ignore[attr-defined]
@@ -136,10 +146,26 @@ class MatchSettings(BaseModel):
     speed: float = Field(1.0, ge=1.0, le=8.0)
     """Game speed: 1.0 steps the engine every 200 ms of wall time (real time), 2.0 every 100 ms, up to 8.0 (25 ms) for
     an unrendered match. The executors tick once a game second at any speed."""
-    time_cap_minutes: float = Field(40.0, gt=0, le=720)
-    """Game minutes until the time cap, where the highest engine score wins."""
+    time_cap_minutes: float = Field(40.0, ge=0, le=720)
+    """Game minutes until the time cap, where the highest score wins (the score_rule says which). 0: no time cap, the
+    game runs until conquest or the safety cap."""
+    safety_cap_minutes: float = Field(45.0, gt=0, le=720)
+    """With no time cap, the game minutes after which the game is decided by the score rule anyway (ended_by
+    "safety_cap")."""
+    score_rule: ScoreRule | None = None
+    """What decides a game at the time cap or safety cap: official (the engine's score total) or net_worth (what a
+    player's living units and finished structures cost, plus its banked resources). Conquest is unaffected. By default
+    the rule the agents' prompt states: net_worth when an agent plays interface v2, else official. A rule the prompt
+    contradicts fails the lobby."""
     draw_margin: float = Field(0.0, ge=0)
-    """At the time cap, players within this many score points of the top draw."""
+    """At the time cap, players within this many points of the top draw (points of the score rule's own measure)."""
+    ai_seed: int | None = Field(None, ge=0)
+    """The seed Petra's random choices use, apart from the map seed (default: the map seed)."""
+    ceasefire_minutes: int = Field(0, ge=0, le=60)
+    """Game minutes at the start in which no player can attack another."""
+    experimental_starting_resources: int | None = Field(None, ge=0, le=100_000)
+    """Experimental: start every player with this much of each resource. Written as the 0.28 game setup's
+    StartingResources, a name not yet checked against a running engine."""
     fog: bool = True
     """Each player sees only what its units see (the observer always sees all)."""
     start_grace_seconds: float = Field(30.0, ge=0, le=600)
@@ -181,16 +207,30 @@ class SlotSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
     civ: str | None = None
     """The civilization (rome, athen, pers, cart, ...); by default rome, athen, pers, cart, ... by player number."""
-    controller: Literal["petra", "bot"] | None = None
-    """For an ai slot: petra (0 A.D.'s AI, the default) or bot (the scripted bot). Not for an agent slot."""
+    controller: Literal["petra", "bot", "replay"] | None = None
+    """For an ai slot: petra (0 A.D.'s AI, the default), bot (the scripted bot) or replay (a logged order stream, from
+    replay_spec). Not for an agent slot."""
     ai_difficulty: int = Field(3, ge=0, le=5)
     """Petra's level, 0 (sandbox) to 5 (very hard)."""
+    ai_behavior: AiBehavior = "balanced"
+    """Petra's style: random (rolled from the AI seed), balanced, aggressive or defensive."""
+    replay_spec: str | None = None
+    """For a replay slot: the path of its replay spec (scripts/s1_specs.py writes them)."""
+    experimental_resources: int | None = Field(None, ge=0, le=100_000)
+    """Experimental: this player starts with this much of each resource. Written as PlayerData[i].Resources, a name not
+    yet checked against a running 0.28 engine."""
+    experimental_population_limit: int | None = Field(None, ge=1, le=1000)
+    """Experimental: this player's population limit. Written as PlayerData[i].PopulationLimit, a name not yet checked
+    against a running 0.28 engine."""
     label: str | None = Field(None, max_length=40)
     """The seat's display name; by default the agent's name, or Petra/Bot and the player number."""
     reflex: Literal["luna"] | None = None
     """luna: GPT-6 Luna reflexes inside the env for this seat (Setup A); for agent and bot seats, not Petra."""
     reflex_max_usd: float | None = Field(None, gt=0, le=100)
     """The reflex's spend cap for the match, in estimated USD; it stops asking before a call could pass it."""
+    interface: Interface = DEFAULT_INTERFACE
+    """The interface version this seat plays: v1 (the live stream's, the default) or v2 (waves, order feedback, a
+    richer brief with players by number; docs/post-training-v2.md). Its brain must be set to the same one."""
 
     @field_validator("civ")
     @classmethod
@@ -286,6 +326,11 @@ class ZeroADEnv(AgentEnvGameEnv):
         petra = slot.player_kind is PlayerKind.AI and (slot.game_settings.get("controller") or "petra") == "petra"
         if petra and slot.game_settings.get("reflex"):
             raise ValueError("reflex is for seats the executor drives (agent or bot); Petra plays on its own")
+        replay = slot.player_kind is PlayerKind.AI and slot.game_settings.get("controller") == "replay"
+        if replay != bool(slot.game_settings.get("replay_spec")):
+            raise ValueError("a replay slot needs a replay_spec, and replay_spec is only for a replay slot")
+        if petra and slot.game_settings.get("interface", DEFAULT_INTERFACE) != DEFAULT_INTERFACE:
+            raise ValueError("interface is for seats the executor drives (agent or bot); Petra has none")
 
     @create_game
     async def new_match(self, lobby: Lobby) -> None:
@@ -306,9 +351,14 @@ class ZeroADEnv(AgentEnvGameEnv):
             seed=s["seed"],
             speed=s["speed"],
             time_cap_s=s["time_cap_minutes"] * 60,
+            safety_cap_s=s["safety_cap_minutes"] * 60,
+            score_rule=s["score_rule"],
             draw_margin=s["draw_margin"],
             fog=s["fog"],
             tick_s=self.tick_s / s["speed"],
+            ai_seed=s["ai_seed"],
+            ceasefire_minutes=s["ceasefire_minutes"],
+            starting_resources=s["experimental_starting_resources"],
         )
         out_dir = self.out_root / lobby.lobby_id
         broadcast = self.broadcast_for(s, out_dir) if s.get("render") else None
@@ -345,7 +395,7 @@ class ZeroADEnv(AgentEnvGameEnv):
             kind, default_name = "agent", slot.player_name or f"Agent {n}"
         else:
             kind = g.get("controller") or "petra"
-            default_name = f"{'Bot' if kind == 'bot' else 'Petra'} {n}"
+            default_name = f"{SEAT_LABELS.get(kind, 'Petra')} {n}"
         return SeatPlan(
             slot=slot.player_id,
             player=n,
@@ -355,6 +405,11 @@ class ZeroADEnv(AgentEnvGameEnv):
             ai_difficulty=g.get("ai_difficulty", 3),
             reflex=g.get("reflex"),
             reflex_max_usd=g.get("reflex_max_usd"),
+            interface=g.get("interface", DEFAULT_INTERFACE),
+            ai_behavior=g.get("ai_behavior", "balanced"),
+            starting_resources=g.get("experimental_resources"),
+            population_limit=g.get("experimental_population_limit"),
+            replay=g.get("replay_spec"),
         )
 
     async def _start_after(self, seconds: float) -> None:
@@ -431,6 +486,11 @@ class ZeroADEnv(AgentEnvGameEnv):
                 Score(name="economy", value=sc["economy"], better="higher", unit="points"),
                 Score(name="military", value=sc["military"], better="higher", unit="points"),
                 Score(name="exploration", value=sc["exploration"], better="higher", unit="points"),
+                *(
+                    [Score(name="net_worth", value=sc["net_worth"], better="higher", unit="resources")]
+                    if sc.get("net_worth") is not None
+                    else []
+                ),
             ]
             for slot, sc in live.scores.items()
         }
@@ -445,7 +505,7 @@ class ZeroADEnv(AgentEnvGameEnv):
                     name="game",
                     unit="seconds",
                     value=round(live.time_ms / 1000, 1),
-                    limit=live.config.time_cap_s,
+                    limit=live.config.cap_s,
                     rate=live.config.speed if running else 0,
                 )
             ],
@@ -546,10 +606,21 @@ class ZeroADEnv(AgentEnvGameEnv):
         wood: Annotated[int, Field(ge=0, le=100, description="Percent on wood.")],
         stone: Annotated[int, Field(ge=0, le=100, description="Percent on stone.")],
         metal: Annotated[int, Field(ge=0, le=100, description="Percent on metal.")],
+        villagers: Annotated[
+            int | None,
+            Field(
+                ge=MIN_VILLAGER_TARGET,
+                le=MAX_VILLAGER_TARGET,
+                description="Villagers to keep training (20-100, default 45); leave out to keep it.",
+            ),
+        ] = None,
     ):
         """Split your gatherers between the four resources, in percent; the four must add up to 100. Idle and surplus
         gatherers move over the next seconds."""
-        return await self._order("set_economy", lambda: SetEconomy(food=food, wood=wood, stone=stone, metal=metal))
+        return await self._order(
+            "set_economy",
+            lambda: SetEconomy(food=food, wood=wood, stone=stone, metal=metal, villagers=villagers),
+        )
 
     @tool()
     async def train(
@@ -588,10 +659,29 @@ class ZeroADEnv(AgentEnvGameEnv):
         self,
         action: Annotated[ArmyAction, Field(description="gather, attack, raid, defend, retreat or scout.")],
         target: Annotated[str, Field(description=f"The target: {TARGET_HELP}.")] = "home",
+        min_size: Annotated[
+            int,
+            Field(
+                ge=MIN_WAVE_SIZE,
+                le=MAX_WAVE_SIZE,
+                description="Soldiers to gather (4-30) before an attack or raid wave goes.",
+            ),
+        ] = DEFAULT_MIN_SIZE,
+        regroup_below: Annotated[
+            float,
+            Field(ge=0.0, le=0.9, description="A wave below this share (0-0.9) of its launch size falls back."),
+        ] = DEFAULT_REGROUP_BELOW,
     ):
         """Set your army's posture: gather (soldiers work), attack or raid a player, defend a place, retreat home, or
         scout."""
-        return await self._order("army", lambda: Army(action=action, target=target))
+        return await self._order(
+            "army", lambda: Army(action=action, target=target, min_size=min_size, regroup_below=regroup_below)
+        )
+
+    @tool()
+    async def hold(self):
+        """Keep every standing order as it is this turn: a turn with nothing to change."""
+        return await self._order("hold", Hold)
 
     @tool()
     async def say(self, text: Annotated[str, Field(min_length=1, max_length=200, description="One short line.")]):
@@ -605,6 +695,7 @@ class ZeroADEnv(AgentEnvGameEnv):
         app.custom_route("/waiting", methods=["POST"])(self._waiting)
         app.custom_route("/status", methods=["GET"])(self._status)
         app.custom_route("/reflex", methods=["POST"])(self._reflex)
+        app.custom_route("/reference", methods=["GET"])(self._reference)
         app.custom_route("/held", methods=["POST"])(self._held)
         app.custom_route("/live", methods=["GET"])(self._live_page)
         app.custom_route("/live/state.json", methods=["GET"])(self._live_state)
@@ -666,6 +757,14 @@ class ZeroADEnv(AgentEnvGameEnv):
             return error
         assert slot is not None and self.live is not None
         return JSONResponse({"ok": True, **self.live.status(slot), "playing_out": self.playing_out})
+
+    async def _reference(self, request: Request) -> JSONResponse:
+        """The seat's static cost tables for its prompt prefix: `{"text": ...}`, empty unless the seat plays v2."""
+        slot, error = self._route_seat("reference")
+        if error is not None:
+            return error
+        assert slot is not None and self.live is not None
+        return JSONResponse({"ok": True, "text": self.live.reference(slot)})
 
     async def _reflex(self, request: Request) -> JSONResponse:
         """The seat's brain hands its model endpoint to the seat's Luna reflex. The key is never echoed or logged."""

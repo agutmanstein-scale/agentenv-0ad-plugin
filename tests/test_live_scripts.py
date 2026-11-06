@@ -880,6 +880,7 @@ def test_the_pilot_bootstrap_binds_vllm_to_the_docker_bridge_behind_a_key_and_sp
     assert out.returncode == 0, out.stderr
     text = out.stdout.replace("\\", "")  # the plan's printf %q escapes commas and quotes
     assert "-p 172.17.0.1:8000:8000" in text and "--env-file" in text and "VLLM_API_KEY=<random>" in text
-    assert "device=0,1" in text and "--tensor-parallel-size 2" in text and "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True" in text
+    assert "device=0,1" in text and "--tensor-parallel-size 2" in text
+    assert "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True" in text
     assert "zeroad setup --source" in text and "--live" not in text and "zeroad-trainer" in text
     assert "zeroad-boxtime.timer" in text and "zeroad-x" not in text

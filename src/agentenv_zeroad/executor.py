@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -40,11 +40,13 @@ from agentenv_zeroad.commands import (
     cmd_train,
 )
 from agentenv_zeroad.engine import GameEngine
+from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.orders import (
     AdvancePhase,
     Army,
     Build,
     BuildRequest,
+    Hold,
     OrderBook,
     OrderResult,
     Research,
@@ -57,8 +59,16 @@ from agentenv_zeroad.orders import (
     partial,
     rejected,
 )
-from agentenv_zeroad.placement import EnginePlacer, Placer, enemy_base_guess, search_for
-from agentenv_zeroad.roles import RoleCatalog, RoleTable
+from agentenv_zeroad.placement import (
+    EnginePlacer,
+    Placement,
+    Placer,
+    Search,
+    enemy_base_guess,
+    fallback_searches,
+    search_for,
+)
+from agentenv_zeroad.roles import RoleCatalog, RoleTable, Template
 from agentenv_zeroad.state import RESOURCES, PlayerSnapshot, Snapshot
 from agentenv_zeroad.view import ExecutorView, Pos, SeatView, Structure, ViewQuery, distance
 
@@ -70,6 +80,7 @@ MAX_ATTEMPTS = 3
 BUILDERS_PER_SITE = 3
 MAX_QUEUE = 2
 MAX_BATCH = 5
+NOTICES_KEPT = 50
 
 Queue = Callable[[int, dict[str, Any]], None]
 PlaceOutcome = Literal["placed", "unaffordable", "waiting", "failed"]
@@ -157,8 +168,10 @@ class Executor:
         players: Sequence[int] = (),
         book: OrderBook | None = None,
         autopilot: Autopilot | None = None,
+        interface: Interface = DEFAULT_INTERFACE,
     ):
         self.player = player
+        self.interface = interface
         self.roles = roles
         self.queue = queue
         self.placer = placer
@@ -173,6 +186,7 @@ class Executor:
         self.issued: Counter[str] = Counter()
         self.placed: list[tuple[str, str, int]] = []  # (structure, where, time_ms) confirmed by a later view
         self.failures: list[Failure] = []
+        self.notices: deque[Failure] = deque(maxlen=NOTICES_KEPT)  # `failures` the brief has not shown yet
         self.enemy_structures: dict[int, dict[int, Pos]] = {}
         self._cooldown: dict[Any, int] = {}
         self._marks: dict[Any, int] = {}  # this tick's cooldown marks, committed with the tick
@@ -183,6 +197,8 @@ class Executor:
     # ---- orders -------------------------------------------------------------------------------------------------
     def submit(self, order: _Order) -> OrderResult:
         """Validate `order` against the civ and the latest view and store it in the book."""
+        if self.interface == "v1" and (what := _v2_only(order)) is not None:
+            return rejected("not_in_v1", f"{what} is not available in this interface.")
         handler = {
             SetEconomy: self._submit_economy,
             Train: self._submit_train,
@@ -190,6 +206,7 @@ class Executor:
             Research: self._submit_research,
             AdvancePhase: self._submit_phase,
             Army: self._submit_army,
+            Hold: self._submit_hold,
             Say: self._submit_say,
         }[type(order)]
         return handler(order)  # type: ignore[operator]
@@ -197,7 +214,11 @@ class Executor:
     def _submit_economy(self, order: SetEconomy) -> OrderResult:
         self.book.set_split(order.split())
         text = ", ".join(f"{r} {v}%" for r, v in order.split().items())
-        return accepted(f"Economy split set: {text}. Idle and surplus gatherers move over the next ticks.")
+        villagers = ""
+        if order.villagers is not None:
+            self.book.villager_target = order.villagers
+            villagers = f" Villager target {order.villagers}."
+        return accepted(f"Economy split set: {text}.{villagers} Idle and surplus gatherers move over the next ticks.")
 
     def _submit_train(self, order: Train) -> OrderResult:
         if not self.roles.by_role.get(order.role):
@@ -205,24 +226,30 @@ class Executor:
                 "no_template", f"{self.roles.civ} has no {order.role} units.", self.roles.roles(), "train(role=..)"
             )
         at_options = self.roles.trained_at(order.role)
-        if order.at is not None and order.at not in at_options:
-            return rejected(
-                "bad_building",
-                f"A {order.at} can't train {order.role}; these can: {', '.join(at_options)}.",
-                at_options,
-                f'train(role="{order.role}", count={order.count}, at="{at_options[0]}")' if at_options else None,
-            )
-        self.book.train.append(TrainRequest(order.role, order.count, order.at))
+        ignored = ""
+        at = order.at
+        if at is not None and at not in at_options:
+            if self.interface == "v1":
+                return rejected(
+                    "bad_building",
+                    f"A {at} can't train {order.role}; these can: {', '.join(at_options)}.",
+                    at_options,
+                    f'train(role="{order.role}", count={order.count}, at="{at_options[0]}")' if at_options else None,
+                )
+            ignored = f"Ignored at={at!r} (a {at} can't train {order.role}). "
+            at = None
+        self.book.train.append(TrainRequest(order.role, order.count, at))
         seat = self.last_seat
-        if seat is not None and not self._trainers(seat, order.role, order.at):
-            where = order.at or next(
-                (b for b in at_options if b != "civil_centre"), at_options[0] if at_options else ""
-            )
+        if seat is not None and not self._trainers(seat, order.role, at):
+            where = at or next((b for b in at_options if b != "civil_centre"), at_options[0] if at_options else "")
             return partial(
-                f"Queued {order.count} {order.role}, but no building of yours can train them now; "
+                f"{ignored}Queued {order.count} {order.role}, but no building of yours can train them now; "
                 f"they start once a {where} stands and its requirements are met.",
                 suggest=f'build(structure="{where}", where="base")' if where else None,
             )
+        if ignored and seat is not None:
+            buildings = sorted({b.key for b, _ in self._trainers(seat, order.role, None)})
+            return accepted(f"{ignored}Queued {order.count} {order.role} at your {', '.join(buildings)}.")
         return accepted(f"Queued {order.count} {order.role}; production starts as resources and houses allow.")
 
     def _submit_build(self, order: Build) -> OrderResult:
@@ -280,13 +307,22 @@ class Executor:
         if target is not None and target in self.fallen:
             options = [f"player_{p}" for p in self.standing] + ["home", "center", "front"]
             return rejected("defeated", f"Player {target} is already defeated.", options)
+        posture = self.book.army
+        waves = self.interface == "v2" and order.action in ("attack", "raid")
+        if waves and posture.seq and _same_army(order, posture):
+            return accepted(f"Army already {order.action} {order.target}; its {posture.waves_text()} is unchanged.")
         time_ms = self.last_seat.time_ms if self.last_seat else 0
-        self.book.army.action, self.book.army.target, self.book.army.since_ms = order.action, order.target, time_ms
-        self.book.army.seq += 1
-        self.book.army.focus = "any"
+        posture.action, posture.target, posture.since_ms = order.action, order.target, time_ms
+        posture.seq += 1
+        posture.focus = "any"
+        posture.min_size, posture.regroup_below = order.wave_min_size, order.wave_regroup_below
+        how = f", {posture.waves_text()}" if waves else ""
         if self.last_seat is not None and not self.last_seat.soldiers:
-            return partial(f"Army set to {order.action} {order.target}, but you have no soldiers yet.")
-        return accepted(f"Army set to {order.action} {order.target}.")
+            return partial(f"Army set to {order.action} {order.target}{how}, but you have no soldiers yet.")
+        return accepted(f"Army set to {order.action} {order.target}{how}.")
+
+    def _submit_hold(self, order: Hold) -> OrderResult:
+        return accepted("Holding: every standing order stays as it is.")
 
     def _submit_say(self, order: Say) -> OrderResult:
         self.book.said.append((self.last_seat.time_ms if self.last_seat else 0, order.text))
@@ -358,8 +394,18 @@ class Executor:
             req.failure = reason
             build = isinstance(req, BuildRequest)
             key, where = (req.structure, req.where) if build else (req.role, "")
-            self.failures.append(Failure(now, self.player, key, what, reason, where))
+            self._record_failure(Failure(now, self.player, key, what, reason, where))
             log.warning("player %d: gave up on %s: %s", self.player, what, reason)
+
+    def _record_failure(self, failure: Failure) -> None:
+        self.failures.append(failure)
+        self.notices.append(failure)
+
+    def drain_notices(self) -> list[Failure]:
+        """The orders the executor gave up on since the last call (the v2 brief shows them once)."""
+        notices = list(self.notices)
+        self.notices.clear()
+        return notices
 
     @property
     def standing(self) -> tuple[int, ...]:
@@ -478,7 +524,7 @@ class Executor:
                 self.book.advance_phase = False
             else:
                 return
-            self.failures.append(Failure(now, self.player, tech, f"research {tech}", reason))
+            self._record_failure(Failure(now, self.player, tech, f"research {tech}", reason))
             log.warning("player %d: gave up on research %s: %s", self.player, tech, reason)
 
         return rejected_
@@ -515,14 +561,15 @@ class Executor:
         if not builders:
             return "waiting"
         try:
-            spot = await self.placer.find(self.player, tpl.name, search)
+            spot = await self._find_spot(t.seat, tpl, req.where, search)
         except Exception as e:  # noqa: BLE001 - a failed search counts as a failed attempt, not a stuck seat
             log.warning("player %d: placement search for %s failed: %r", self.player, req.structure, e)
             self.fail_attempt(req, now, what, f"placement search failed: {e!r}")
             return "failed"
         if not spot.ok:
             log.info("player %d: no spot for %s at %s: %s", self.player, req.structure, req.where, spot.why())
-            self.fail_attempt(req, now, what, f"no valid spot at {req.where}: {spot.why()}")
+            wider = " (rings out to 60 m tried)" if self._fallbacks(t.seat, req.where, tpl) else ""
+            self.fail_attempt(req, now, what, f"no valid spot at {req.where}{wider}: {spot.why()}")
             return "failed"
         t.spend(tpl.cost)
         t.busy.update(builders)
@@ -543,6 +590,27 @@ class Executor:
         item = Issued(label, command, now, check, req, undo=undo, rejected=rejected_)
         self.expect(t, item)
         return "placed"
+
+    def _fallbacks(self, seat: SeatView, where: str, tpl: Template) -> tuple[Search, ...]:
+        """The economy floor is part of interface v2; v1 stays as the pilot ran it."""
+        return fallback_searches(seat, where, tpl.kind) if self.interface == "v2" else ()
+
+    async def _find_spot(self, seat: SeatView, tpl: Template, where: str, search: Search) -> Placement:
+        """The engine-checked spot for `tpl`: the normal search first, then (v2) the economy floor's wider ones for a
+        field or a storehouse. A miss reports every search's tries and reasons, so the give-up names what was tried."""
+        spot = await self.placer.find(self.player, tpl.name, search)
+        if spot.ok:
+            return spot
+        tried, reasons = spot.tried, dict(spot.reasons)
+        for wider in self._fallbacks(seat, where, tpl):
+            spot = await self.placer.find(self.player, tpl.name, wider)
+            if spot.ok:
+                log.info("player %d: %s at %s placed by the ring fallback", self.player, tpl.key, where)
+                return spot
+            tried += spot.tried
+            for reason, n in spot.reasons.items():
+                reasons[reason] = reasons.get(reason, 0) + n
+        return Placement(False, tried=tried, reasons=reasons)
 
     # ---- production ---------------------------------------------------------------------------------------------
     def _trainers(self, seat: SeatView, role: str, at: str | None) -> list[tuple[Structure, str]]:
@@ -614,6 +682,26 @@ class Executor:
             if req.remaining > 0 and req.failure is None:
                 req.remaining -= self.train_at(t, req.role, req.remaining, req.at, req)
         self.book.train = [r for r in self.book.train if r.remaining > 0 and r.failure is None]
+
+
+def _v2_only(order: _Order) -> str | None:
+    """What a v1 seat may not use: `hold`, army waves and the villager lever (None for an ordinary order)."""
+    if isinstance(order, Hold):
+        return "hold()"
+    if isinstance(order, Army) and (order.min_size is not None or order.regroup_below is not None):
+        return "army waves (min_size, regroup_below)"
+    if isinstance(order, SetEconomy) and order.villagers is not None:
+        return "set_economy's villagers"
+    return None
+
+
+def _same_army(order: Army, posture: Any) -> bool:
+    return (order.action, order.target, order.wave_min_size, order.wave_regroup_below) == (
+        posture.action,
+        posture.target,
+        posture.min_size,
+        posture.regroup_below,
+    )
 
 
 def _needs_phase(requires: Sequence[str], phase: str) -> bool:
@@ -733,11 +821,12 @@ async def build_executors(
     players: Sequence[int] | None = None,
     catalog: RoleCatalog | None = None,
     placer: Placer | None = None,
+    interfaces: Mapping[int, Interface] | None = None,
 ) -> tuple[dict[int, Executor], ViewQuery]:
     """One executor per driven seat (`seats`), each with its civ's role table, plus the shared view query.
 
     `players` lists every player in the match (opponents include Petra seats the executor doesn't drive); it defaults
-    to `seats`.
+    to `seats`. `interfaces` gives a seat's interface version (v1 unless named).
     """
     query = ViewQuery(engine, seats)
     view = await query()
@@ -747,6 +836,13 @@ async def build_executors(
     executors = {}
     for p in seats:
         roles = await catalog.table(view.seats[p].civ)
-        executors[p] = Executor(p, roles, queue=clock.queue, placer=placer, players=everyone)
+        executors[p] = Executor(
+            p,
+            roles,
+            queue=clock.queue,
+            placer=placer,
+            players=everyone,
+            interface=(interfaces or {}).get(p, DEFAULT_INTERFACE),
+        )
         executors[p].last_seat = view.seats[p]
     return executors, query

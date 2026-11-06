@@ -4,9 +4,11 @@
 // asked BuildRestrictions.CheckPlacement(): territory, terrain passability, obstructions, and distance rules. The
 // first ring position that passes wins, so the result is the closest valid spot to the first anchor that has one.
 // Python replaces __CONFIG__ with {"player", "template", "anchors": [[x, z]], "minR", "maxR", "step", "angle",
-// "spacing", "phase"}. `spacing` keeps a corridor free: a spot closer than that to an own structure's footprint
-// centre than both half-diagonals (Obstruction.GetSize) plus `spacing` is skipped, so houses don't wall villagers in. Local entities never enter the
-// synchronised simulation, so the search can't change the game.
+// "spacing", "phase", "radii"}. A non-null "radii" lists the ring radii to walk instead of minR..maxR in `step`s;
+// `step` still sets the spacing of the spots along a ring. `spacing` keeps a corridor free: a spot closer than that to
+// an own structure's footprint centre than both half-diagonals (Obstruction.GetSize) plus `spacing` is skipped, so
+// houses don't wall villagers in. Local entities never enter the synchronised simulation, so the search can't change
+// the game.
 (function (cfg) {
   const cmpRange = Engine.QueryInterface(SYSTEM_ENTITY, IID_RangeManager);
   const ent = Engine.AddLocalEntity("preview|" + cfg.template);
@@ -29,8 +31,11 @@
     const br = Engine.QueryInterface(ent, IID_BuildRestrictions);
     const ob = Engine.QueryInterface(ent, IID_Obstruction);
     const half = ob ? ob.GetSize() : 0;
+    const radii = [];
+    if (cfg.radii) radii.push(...cfg.radii);
+    else for (let r = cfg.minR; r <= cfg.maxR; r += cfg.step) radii.push(r);
     for (const a of cfg.anchors) {
-      for (let r = cfg.minR; r <= cfg.maxR; r += cfg.step) {
+      for (const r of radii) {
         const n = Math.max(8, Math.round(2 * Math.PI * r / cfg.step));
         for (let i = 0; i < n; ++i) {
           const t = cfg.phase + 2 * Math.PI * i / n;
