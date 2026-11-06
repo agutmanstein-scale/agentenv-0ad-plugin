@@ -1,6 +1,9 @@
 # The stream engine, zeroad-engine:0.28-rt: the PPA's 0 A.D. 0.28 rebuilt with patches/rl-realtime.patch and layered
 # onto zeroad-engine:0.28. The patch adds -rl-realtime (the frame loop advances the game in real time, so motion is
 # smooth; /step only posts commands) and makes /reset honour ?playerID=-1, so the rendered game is the observer's.
+# patches/rl-idle-wait.patch is built in too: the PPA's nonvisual RL loop is `while (...) TryApplyMessage();`, a spin that
+# burns one core per engine between /step requests; the patch waits on a condition variable (2 ms cap) instead. It
+# touches only the nonvisual branch of main.cpp, so the stream's visual engine is unchanged by it.
 # Build with `scripts/build-engine.sh rt` (context: patches/). The build stage's lines up to the COPY match the spike's
 # (spike/engine/Dockerfile), so its build-dep layer is reused from the docker cache; the package build takes ~15 min.
 FROM ubuntu:24.04 AS build
@@ -9,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends software-proper
  && add-apt-repository -y -s ppa:wfg/0ad && apt-get update && apt-get build-dep -y 0ad && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN apt-get update && apt-get source 0ad && ls
-COPY rl-realtime.patch /src/
-RUN cd /src/0ad-0.28.0* && patch -p1 < /src/rl-realtime.patch \
+COPY rl-realtime.patch rl-idle-wait.patch /src/
+RUN cd /src/0ad-0.28.0* && patch -p1 < /src/rl-realtime.patch && patch -p1 < /src/rl-idle-wait.patch \
  && DEB_BUILD_OPTIONS="parallel=$(nproc) nocheck" dpkg-buildpackage -b -uc -us 2>&1 | tail -40 && ls -la /src/*.deb
 
 FROM zeroad-engine:0.28

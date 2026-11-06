@@ -1,0 +1,73 @@
+SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
+
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -703,7 +703,10 @@
+ 			if (isVisual)
+ 				Frame(rlInterface ? &*rlInterface : nullptr);
+ 			else if(rlInterface)
++			{
+ 				rlInterface->TryApplyMessage();
++				rlInterface->WaitForMessage(std::chrono::milliseconds{2});
++			}
+ 			else
+ 				NonVisualFrame();
+ 		}
+--- a/source/rlinterface/RLInterface.cpp
++++ b/source/rlinterface/RLInterface.cpp
+@@ -66,8 +66,20 @@
+ 	std::unique_lock<std::mutex> msgLock(m_MsgLock);
+ 	ENSURE(m_GameMessage.type == GameMessageType::None);
+ 	m_GameMessage = std::move(msg);
++	m_Posted = true;
++	{
++		std::lock_guard<std::mutex> wakeLock(m_WakeLock);
++	}
++	m_Wake.notify_one();
+ 	m_MsgApplied.wait(msgLock, [this]() { return m_GameMessage.type == GameMessageType::None; });
+ 	return m_ReturnValue;
++}
++
++void Interface::WaitForMessage(std::chrono::milliseconds timeout)
++{
++	std::unique_lock<std::mutex> wakeLock(m_WakeLock);
++	m_Wake.wait_for(wakeLock, timeout, [this]() { return m_Posted.load(); });
++	m_Posted = false;
+ }
+ 
+ std::string Interface::Step(std::vector<GameCommand>&& commands)
+--- a/source/rlinterface/RLInterface.h
++++ b/source/rlinterface/RLInterface.h
+@@ -21,6 +21,8 @@
+ #include "simulation2/helpers/Player.h"
+ #include "third_party/mongoose/mongoose.h"
+ 
++#include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <mutex>
+ #include <vector>
+@@ -87,6 +89,13 @@
+ 	~Interface();
+ 
+ 	/**
++	 * Block the calling (main) thread until a message is posted or @param timeout passes, whichever is first.
++	 * The nonvisual main loop calls this after each TryApplyMessage() instead of spinning, so an engine
++	 * waiting for its next /step uses no CPU. The timeout bounds the wait for the game-start poll in TryApplyMessage.
++	 */
++	void WaitForMessage(std::chrono::milliseconds timeout);
++
++	/**
+ 	 * Non-blocking call to process any pending messages from the RL client.
+ 	 * Updates m_ReturnValue to the gamestate after messages have been processed.
+ 	 */
+@@ -158,6 +167,9 @@
+ 	mutable std::mutex m_Lock;
+ 	std::mutex m_MsgLock;
+ 	std::condition_variable m_MsgApplied;
++	std::mutex m_WakeLock;
++	std::condition_variable m_Wake;
++	std::atomic<bool> m_Posted{false};
+ 	std::string m_Code;
+ 
+ 	mg_context* m_Context;
