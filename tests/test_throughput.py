@@ -5,6 +5,8 @@ import json
 
 import pytest
 
+from agentenv_zeroad.engine import PORT_STOP
+from agentenv_zeroad.pool import TRAIN_IMAGE, TRAIN_PATCHES
 from agentenv_zeroad.train import runner
 from tests.test_train_runner import spec_json
 
@@ -78,7 +80,7 @@ async def test_engines_per_worker_sets_the_worker_count_and_an_explicit_concurre
     assert len(started) == 4
     assert {c[c.index("--concurrency") + 1] for c, _ in started} == {"1"}
     ports = [int(c[c.index("--base-port") + 1]) for c, _ in started]
-    assert ports == [16_000, 17_000, 18_000, 19_000]
+    assert ports == [16_000, 16_100, 16_200, 16_300]
 
 
 @pytest.mark.anyio
@@ -106,3 +108,69 @@ async def test_a_worker_plays_on_all_its_engines_when_no_concurrency_is_given(tm
     args = runner._parser().parse_args(["--specs", str(path), "--out", str(tmp_path), "--engines", "3", "--worker"])
     await runner.work(args)
     assert seen == {"size": 3, "concurrency": 3}
+
+
+# ---- ports: every worker's range stays below the OS's ephemeral ports ----------------------------------------------
+def test_the_port_stride_keeps_the_biggest_calibration_below_the_ephemeral_range():
+    assert runner.PORT_STRIDE == 100
+    workers = runner.worker_count(400, per_worker=4)  # a 400-engine box is 100 workers, far past any real one
+    runner.check_ports(runner.BASE_PORT, workers, 4)
+    assert runner.BASE_PORT + workers * runner.PORT_STRIDE <= PORT_STOP
+
+
+def test_too_many_workers_or_engines_for_the_port_ranges_fail_loudly():
+    with pytest.raises(SystemExit, match="ephemeral"):
+        runner.check_ports(30_000, 40, 4)  # 30,000 + 40 * 100 > 32,768
+    with pytest.raises(SystemExit, match="its port range holds 100"):
+        runner.check_ports(16_000, 1, 101)
+
+
+@pytest.mark.anyio
+async def test_a_supervisor_that_would_pass_the_ephemeral_range_starts_nothing(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit, match="ephemeral"):
+        await supervise(tmp_path, monkeypatch, ["--engines", "40", "--base-port", "32000"])
+
+
+# ---- the image ----------------------------------------------------------------------------------------------------
+def test_the_runner_defaults_to_the_patched_training_image():
+    args = runner._parser().parse_args(["--specs", "s", "--out", "o"])
+    assert (args.image, args.allow_unpatched) == (TRAIN_IMAGE, False)
+
+
+@pytest.mark.anyio
+async def test_the_supervisor_passes_the_image_and_the_unpatched_opt_in_to_every_worker(tmp_path, monkeypatch):
+    started = await supervise(tmp_path, monkeypatch, ["--engines", "8"])
+    assert {c[c.index("--image") + 1] for c, _ in started} == {TRAIN_IMAGE}
+    assert all("--allow-unpatched" not in c for c, _ in started)
+    started = await supervise(
+        tmp_path, monkeypatch, ["--engines", "8", "--image", "zeroad-engine:0.28", "--allow-unpatched"]
+    )
+    assert all("--allow-unpatched" in c and "zeroad-engine:0.28" in c for c, _ in started)
+
+
+@pytest.mark.anyio
+async def test_a_worker_makes_its_pool_require_the_patches_unless_told_not_to(tmp_path, monkeypatch):
+    seen = []
+
+    class FakePool:
+        def __init__(self, size, **options):
+            seen.append(options)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    async def no_games(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(runner, "EnginePool", FakePool)
+    monkeypatch.setattr(runner, "run_games", no_games)
+    path = tmp_path / "specs.jsonl"
+    path.write_text(json.dumps(spec_json()) + "\n")
+    base = ["--specs", str(path), "--out", str(tmp_path), "--worker"]
+    await runner.work(runner._parser().parse_args(base))
+    await runner.work(runner._parser().parse_args([*base, "--allow-unpatched"]))
+    assert [o["require_patches"] for o in seen] == [TRAIN_PATCHES, ()]
+    assert all(o["image"] == TRAIN_IMAGE and o["port_stop"] == o["base_port"] + runner.PORT_STRIDE for o in seen)

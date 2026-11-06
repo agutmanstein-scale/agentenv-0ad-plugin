@@ -1,6 +1,7 @@
 """The training runner: play a list of game specs on an engine pool, `concurrency` games at a time.
 
-    python -m agentenv_zeroad.train.runner --specs specs.jsonl --out DIR --engines N --concurrency K
+    python -m agentenv_zeroad.train.runner --specs specs.jsonl --out DIR --engines N [--concurrency K] [--workers W]
+        [--engines-per-worker 4] [--image zeroad-engine:0.28-rt] [--replays]
 
 Each game's files land in `DIR/<game_id>/` (results.json; commands.txt with `--replays`), and one line per finished
 game is appended to `DIR/games.jsonl`. A game that fails is recorded as failed and its engine is restarted before it
@@ -10,7 +11,12 @@ Workers are separate processes, each with its own pool of its share of the engin
 flight on one asyncio loop, started with PYTHONHASHSEED=0 so that two runs of one spec make the same set-ordered
 choices. There are `--workers` of them, or by default one per `--engines-per-worker` engines (4): a loop that
 serialises the HTTP, JSON and bot work of a dozen engines is a queue the engines wait in. The parent only splits the
-specs round-robin, gives each worker its own port range and waits.
+specs round-robin, gives each worker its own port range (`PORT_STRIDE` ports, all below Linux's ephemeral range, or
+it refuses to start) and waits.
+
+The engine image defaults to the patched training engine (`pool.TRAIN_IMAGE`, built by `scripts/build-engine.sh rt`):
+its idle engines sleep instead of spinning a core and `step_raw` skips the state JSON. The pool refuses an image whose
+`zeroad.patches` label lacks `pool.TRAIN_PATCHES`; `--allow-unpatched` runs on any image (the PPA's, to compare).
 
 `run_games` and `run_game` are the async API for callers that already have a pool.
 """
@@ -30,15 +36,16 @@ from typing import Any
 
 import httpx
 
+from agentenv_zeroad.engine import PORT_STOP
 from agentenv_zeroad.grading import BRAIN_TIMEOUT_S
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, ToolSpec
-from agentenv_zeroad.pool import BASE_PORT, EnginePool
+from agentenv_zeroad.pool import BASE_PORT, TRAIN_IMAGE, TRAIN_PATCHES, EnginePool
 from agentenv_zeroad.train.game import ModelFactory, build_model, play_game
 from agentenv_zeroad.train.spec import GameSpec, load_specs
 
 log = logging.getLogger(__name__)
 
-PORT_STRIDE = 1000  # ports between two workers' ranges
+PORT_STRIDE = 100  # ports between two workers' ranges: a worker has at most this many engines
 ENGINES_PER_WORKER = 4  # one worker's loop keeps up with this many engines stepping flat out (re-measure: s1_calibrate)
 
 
@@ -157,7 +164,8 @@ def _parser() -> argparse.ArgumentParser:
         "--engines-per-worker", type=int, default=ENGINES_PER_WORKER, help="engines one worker process drives"
     )
     p.add_argument("--mode", choices=("docker", "local"), default="docker")
-    p.add_argument("--image", default=None, help="the engine image (docker mode)")
+    p.add_argument("--image", default=TRAIN_IMAGE, help="the engine image (docker mode)")
+    p.add_argument("--allow-unpatched", action="store_true", help="accept an image without the training engine patches")
     p.add_argument("--base-port", type=int, default=BASE_PORT)
     p.add_argument("--replays", action="store_true", help="also copy each game's engine replay (commands.txt)")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -171,6 +179,20 @@ def split(items: Sequence[Any], parts: int) -> list[list[Any]]:
 
 def engines_per_worker(engines: int, workers: int) -> list[int]:
     return [engines // workers + (1 if i < engines % workers else 0) for i in range(workers)]
+
+
+def check_ports(base_port: int, workers: int, engines_in_largest: int) -> None:
+    """Every worker's range must hold its engines and end below `PORT_STOP`, where Linux hands out ephemeral ports
+    (an engine port in that range can be taken by any outgoing connection); otherwise refuse, instead of running
+    engines on ports the OS may give away."""
+    if engines_in_largest > PORT_STRIDE:
+        raise SystemExit(f"a worker would run {engines_in_largest} engines; its port range holds {PORT_STRIDE}")
+    end = base_port + workers * PORT_STRIDE
+    if end > PORT_STOP:
+        raise SystemExit(
+            f"{workers} workers from port {base_port} need ports up to {end}, past {PORT_STOP} where the OS's "
+            "ephemeral ports begin: lower --base-port or use fewer workers"
+        )
 
 
 def worker_count(engines: int, *, workers: int | None = None, per_worker: int = ENGINES_PER_WORKER) -> int:
@@ -188,9 +210,9 @@ async def work(args: argparse.Namespace) -> list[GameOutcome]:
         "base_port": args.base_port,
         "port_stop": args.base_port + PORT_STRIDE,
         "keep_replays": args.replays,
+        "image": args.image,
+        "require_patches": () if args.allow_unpatched else TRAIN_PATCHES,
     }
-    if args.image:
-        pool_options["image"] = args.image
     async with EnginePool(args.engines, **pool_options) as pool:
         return await run_games(specs, pool, args.out, concurrency=min(args.concurrency or args.engines, args.engines))
 
@@ -201,6 +223,7 @@ async def supervise(args: argparse.Namespace) -> int:
     specs = [line for line in specs if line.strip()]
     load_specs(args.specs)  # a bad spec fails here, before any engine starts
     workers = min(worker_count(args.engines, workers=args.workers, per_worker=args.engines_per_worker), len(specs) or 1)
+    check_ports(args.base_port, workers, max(engines_per_worker(args.engines, workers)))
     shards = args.out / ".shards"
     shards.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "PYTHONHASHSEED": "0"}
@@ -217,8 +240,9 @@ async def supervise(args: argparse.Namespace) -> int:
         ]  # fmt: skip
         if args.concurrency:
             cmd += ["--concurrency", str(args.concurrency)]
-        if args.image:
-            cmd += ["--image", args.image]
+        cmd += ["--image", args.image]
+        if args.allow_unpatched:
+            cmd.append("--allow-unpatched")
         if args.replays:
             cmd.append("--replays")
         procs.append(await asyncio.create_subprocess_exec(*cmd, env=env))

@@ -406,7 +406,7 @@ async def test_the_supervisor_starts_each_worker_with_hash_seed_zero_its_shard_a
     )
     assert await runner.supervise(args) == 0
     assert len(started) == 2
-    for (cmd, env), expected_engines, ports in zip(started, ("3", "2"), (16_000, 17_000), strict=True):
+    for (cmd, env), expected_engines, ports in zip(started, ("3", "2"), (16_000, 16_100), strict=True):
         assert env["PYTHONHASHSEED"] == "0" and "--worker" in cmd
         assert cmd[cmd.index("--engines") + 1] == expected_engines
         assert cmd[cmd.index("--base-port") + 1] == str(ports) and cmd[cmd.index("--concurrency") + 1] == "2"
@@ -438,7 +438,7 @@ async def test_a_worker_scans_ports_only_inside_its_own_range(tmp_path, monkeypa
         ["--specs", str(path), "--out", str(tmp_path), "--engines", "2", "--worker", "--base-port", "17000"]
     )
     await runner.work(args)
-    assert (seen["base_port"], seen["port_stop"], seen["size"]) == (17_000, 18_000, 2)
+    assert (seen["base_port"], seen["port_stop"], seen["size"]) == (17_000, 17_100, 2)
 
 
 async def test_the_supervisor_refuses_a_bad_spec_before_starting_anything(tmp_path):
