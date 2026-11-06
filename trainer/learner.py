@@ -34,18 +34,26 @@ The LM head and log-softmax run in fp32 whatever the model's dtype.
 Two terms are added to the minibatch's loss, each over the same trained tokens (the masks) and divided by the same
 B x 128, so a weight reads as "per token, relative to the policy-gradient term":
   anchor   + beta_t sum_i sum_t m_it k3_it, the KL to a frozen reference policy held on the sampled tokens by the k3
-           estimator r - 1 - log r, r = pi_anchor / pi_theta (non-negative, unbiased for KL(pi_theta || pi_anchor) on
-           tokens drawn from pi_theta). The reference is the adapter given with --anchor (the frozen distilled SFT
-           adapter: RL's pull back to the imitation policy, which made imitation pay off in AlphaStar and VPT), or the
-           base model when none is given. beta_t = beta0 x decay^update, beta0 0.1 and decay 0.999 by default, 0 turns
-           it off. The update count is what a checkpoint and a rollback restore, so the schedule comes back with them.
-           The anchor's log-probs are computed once per update, with no gradient, before the first step; the health
-           record logs kl_to_anchor (its mean over the update's rows) and anchor_beta. kl_to_base, the alarm, stays.
+           estimator r - 1 - log r, r = pi_anchor / pi_theta. It is evaluated on the rows' tokens, which the sampler mu
+           drew (a stale pi_theta, so only approximately pi_theta's own samples), so it is a per-token penalty that
+           pulls log pi_theta toward the anchor's (its gradient on log pi_theta is 1 - r: negative where the anchor is
+           the likelier, positive where it is not) rather than an unbiased KL estimate; it is not weighted by the TIS
+           weight w. The reference is the adapter given with --anchor (the frozen distilled SFT adapter: RL's pull back
+           to the imitation policy, which made imitation pay off in AlphaStar and VPT); without --anchor it is --init,
+           so a run started from the SFT adapter is held to it, and `--anchor base` is the base model. beta_t = beta0 x
+           decay^update, beta0 0.1 and decay 0.999 by default, 0 turns it off. The update count is what a checkpoint
+           and a rollback restore, so the schedule comes back with them. The anchor's log-probs are computed once per
+           update, with no gradient, before the first step; the health record logs kl_to_anchor (its mean k3 over the
+           update's rows), anchor_beta and the anchor in use. kl_to_base, the alarm, stays.
   aux      + alpha_t sum_i sum_t m_it (-log pi_theta) over the sft-flagged rows, up to aux_rows_per_update beside
-           an update's 256 policy-gradient rows, split over the minibatches. alpha_t = alpha0 x decay^update, alpha0 0.2
-           and decay 0.995 by default. These rows are never in the PG term (no advantage, no ratio, no KL stop or
+           an update's 256 policy-gradient rows, all in minibatch 1 (so a KL stop of minibatch 2 never drops them).
+           alpha_t = alpha0 x decay^aux_updates, alpha0 0.2 and decay 0.995 by default, aux_updates the updates that
+           trained on any such rows (saved in a checkpoint and restored by a rollback), so the weight does not decay
+           while no label arrives. These rows are never in the PG term (no advantage, no ratio, no KL stop or
            tripwire statistics); they are the teacher's answer on states the policy lost from (the orchestrator's hard-
-           state labels), added only where RL has no signal. The health record logs aux_alpha, aux_rows and aux_ce.
+           state labels), added only where RL has no signal. The health record logs aux_alpha, aux_rows and aux_ce. Its
+`loss` is the policy-gradient and anchor terms (the SFT cross-entropy in SFT mode); pg_loss and anchor_loss are its
+two parts and aux_loss is the auxiliary term, each already divided by B x 128.
 
 State. LoRA r32 alpha 64 on every linear layer, fp32 master parameters, one AdamW for the whole run, gradient clip 1.0,
 lr constant after a linear warmup. The lr changes only through set_lr() and rollback(), which halves it. With torchrun
@@ -92,7 +100,11 @@ It trains `sft_epochs` passes over the dataset (default 2, reshuffled each pass;
 inbox has gone quiet, so drop it as one file). After each pass it publishes ROOT/epochs/epoch{N}/ (the adapter and a
 manifest with the version and the mean token entropy of the checkpoint and of the base model on a fixed sample of the
 teacher's tokens). Pick the checkpoint to keep by held-out win rate and that entropy ratio, never by the SFT loss:
-`select_sft_checkpoint` in train/stats.py. The epoch count is not saved in a checkpoint: a restart begins a pass again.
+`select_sft_checkpoint` in train/stats.py. The entropy is measured on a held-out tenth of the dataset (chosen by a
+hash of each row's game_id, never trained on). A checkpoint records the epoch and how many of its rows were trained, and
+a restart rebuilds the dataset from inbox/consumed/ and carries on from there; an epoch directory that already exists
+is reused when it holds this version's weights and refused otherwise. After the last epoch the learner writes
+ROOT/sft-done.json and exits.
 
 Run in the trainer image (vLLM's image with PEFT), after training starts:
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 [--init ADAPTER] --known-tools a,b,c
@@ -117,6 +129,7 @@ import statistics
 import sys
 import tempfile
 import time
+import zlib
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -175,6 +188,7 @@ class LearnerConfig:
     aux_rows_per_update: int = 32  # most sft-flagged rows trained on beside one update's policy-gradient rows
     sft_epochs: int = 2  # SFT mode: passes over the dataset; a checkpoint is published after each
     sft_entropy_rows: int = 128  # SFT mode: rows the epoch-end entropy is measured on
+    sft_holdout: float = 0.1  # SFT mode: the share of the dataset (by a hash of game_id) held out of training for it
 
     @property
     def inbox(self) -> Path:
@@ -199,6 +213,10 @@ class LearnerConfig:
     @property
     def epochs(self) -> Path:
         return self.root / "epochs"
+
+    @property
+    def sft_done(self) -> Path:
+        return self.root / "sft-done.json"
 
 
 @dataclass(frozen=True)
@@ -320,7 +338,8 @@ class Inbox:
         self.cfg = cfg
         self.pool: list[Decision] = []
         self.aux: list[Decision] = []  # sft-flagged teacher labels, oldest first
-        self.dataset: list[Decision] = []  # SFT mode: every row accepted, replayed by each further epoch
+        self.dataset: list[Decision] = []  # SFT mode: every row to train on, replayed by each further epoch
+        self.holdout: list[Decision] = []  # SFT mode: rows never trained on, for the epoch-end entropy
         self.epoch, self.epoch_trained, self.finished = 1, 0, False
         self.counts: Counter[str] = Counter()
         cfg.inbox.mkdir(parents=True, exist_ok=True)
@@ -330,27 +349,47 @@ class Inbox:
         """Read every new *.jsonl file into the pool, moving it to consumed/. Returns the rows accepted."""
         accepted = 0
         for path in sorted(self.cfg.inbox.glob("*.jsonl")):
-            for line in path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    row = parse_row(json.loads(line), self.cfg.max_len, sft=self.cfg.sft)
-                except json.JSONDecodeError:
-                    self.counts["rejected:bad_json"] += 1
-                    continue
-                except RowRejected as e:
-                    self.counts[f"rejected:{e.reason}"] += 1
-                    continue
-                if row.aux:
-                    self._keep_aux(row)
-                    continue
+            accepted += self._read(path)
+            os.replace(path, self.cfg.inbox / "consumed" / path.name)
+        return accepted
+
+    def _read(self, path: Path) -> int:
+        accepted = 0
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                self.counts["rejected:bad_json"] += 1
+                continue
+            # a malformed teacher label is counted apart: it must not feed the rejected share the tripwire reads
+            kind = (
+                "aux_rejected" if not self.cfg.sft and isinstance(obj, dict) and obj.get("sft") is True else "rejected"
+            )
+            try:
+                row = parse_row(obj, self.cfg.max_len, sft=self.cfg.sft)
+            except RowRejected as e:
+                self.counts[f"{kind}:{e.reason}"] += 1
+                continue
+            if row.aux:
+                self._keep_aux(row)
+                continue
+            if self.cfg.sft and self.held_out(row):
+                self.holdout.append(row)
+            else:
                 self.pool.append(row)
                 if self.cfg.sft:
                     self.dataset.append(row)
-                accepted += 1
-                self.counts["accepted"] += 1
-            os.replace(path, self.cfg.inbox / "consumed" / path.name)
+            accepted += 1
+            self.counts["accepted"] += 1
         return accepted
+
+    def held_out(self, row: Decision) -> bool:
+        """Whether an SFT row is in the held-out slice: a hash of its game_id, so the same rows are held out however
+        the dataset arrives, and again after a restart."""
+        key = zlib.crc32(f"{self.cfg.seed}:{row.game_id}".encode())
+        return key % 10_000 < self.cfg.sft_holdout * 10_000
 
     def _keep_aux(self, row: Decision) -> None:
         """An sft-flagged row waits for take_aux; with the auxiliary term off it is dropped, and counted apart from the
@@ -402,10 +441,20 @@ class Inbox:
         return self.cfg.sft and not self.finished and self.epoch_trained > 0 and not self.pool
 
     def entropy_sample(self) -> list[Decision]:
-        """A fixed sample of the dataset for the epoch-end entropy, the same rows at every epoch."""
-        rows = list(self.dataset)
+        """The held-out rows for the epoch-end entropy (at most sft_entropy_rows, the same ones at every epoch)."""
+        rows = list(self.holdout)
         random.Random(self.cfg.seed).shuffle(rows)
         return rows[: self.cfg.sft_entropy_rows]
+
+    def progress(self) -> tuple[int, int]:
+        """(epoch, rows of it trained so far): what a checkpoint records so a restart can carry on."""
+        return self.epoch, self.epoch_trained
+
+    def _shuffled(self, epoch: int) -> list[Decision]:
+        rows = list(self.dataset)
+        if epoch > 1:
+            random.Random(self.cfg.seed * 1_000_003 + epoch).shuffle(rows)
+        return rows
 
     def next_epoch(self) -> None:
         """Close the epoch just published: refill the pool with the dataset reshuffled, or finish after the last."""
@@ -414,8 +463,18 @@ class Inbox:
             return
         self.epoch += 1
         self.epoch_trained = 0
-        self.pool = list(self.dataset)
-        random.Random(self.cfg.seed * 1_000_003 + self.epoch).shuffle(self.pool)
+        self.pool = self._shuffled(self.epoch)
+
+    def restore(self, epoch: int, trained: int) -> None:
+        """SFT restart: the rows already read are in inbox/consumed/, so rebuild the dataset (and the held-out slice)
+        from there and carry on in `epoch` after the first `trained` rows of it. Files still in the inbox are read as
+        usual afterwards."""
+        self.pool, self.dataset, self.holdout = [], [], []
+        for path in sorted((self.cfg.inbox / "consumed").glob("*.jsonl")):
+            self._read(path)
+        self.counts.clear()
+        self.epoch, self.epoch_trained, self.finished = epoch, trained, False
+        self.pool = self._shuffled(epoch)[trained:]
 
     def drain_counts(self) -> dict[str, int]:
         """What was accepted, rejected (by reason) and dropped as stale since the last call."""
@@ -503,8 +562,10 @@ def sft_terms(logp: torch.Tensor, mask: torch.Tensor) -> TokenTerms:
 
 
 def anchor_k3(logp: torch.Tensor, logp_anchor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """sum_t m_t (r_t - 1 - log r_t), r_t = pi_anchor / pi_theta on the sampled tokens: the k3 estimator, non-negative
-    and unbiased for KL(pi_theta || pi_anchor) on tokens drawn from pi_theta. The anchor's log-probs carry no grad."""
+    """sum_t m_t (r_t - 1 - log r_t), r_t = pi_anchor / pi_theta on the rows' tokens: the k3 estimator, non-negative.
+    It is unbiased for KL(pi_theta || pi_anchor) only on tokens drawn from pi_theta; these were drawn by the sampler mu
+    (a stale pi_theta), so as a loss it is a penalty that pulls log pi_theta toward the anchor's: its gradient on
+    log pi_theta is 1 - r_t. It is not weighted by the TIS weight. The anchor's log-probs carry no grad."""
     delta = logp_anchor.detach() - logp
     return ((torch.exp(delta) - delta - 1) * mask).sum()
 
@@ -632,6 +693,8 @@ class Learner:
         "base_kl_n",
         "anchor_kl_sum",
         "anchor_kl_n",
+        "pg_loss",
+        "anchor_loss",
         "aux_loss",
         "aux_ce_sum",
         "aux_tokens",
@@ -665,6 +728,9 @@ class Learner:
         self.lr = cfg.lr
         self.version = 0
         self.updates = 0
+        self.aux_updates = 0  # updates that trained on sft-flagged rows: what the aux weight decays over
+        self.sft_progress: tuple[int, int] = (1, 0)  # SFT: (epoch, rows of it trained), saved in each checkpoint
+        self.resumed = False
         self.decisions_total = 0
         backbone = model.get_base_model()
         self.backbone = backbone.model
@@ -676,19 +742,40 @@ class Learner:
     def anchor_enabled(self) -> bool:
         return not self.cfg.sft and self.cfg.anchor_beta0 > 0
 
+    def anchor_label(self) -> str | None:
+        """What the KL penalty holds the policy to: the anchor adapter's path, "base", or None when it is off."""
+        return None if not self.anchor_enabled else self.cfg.anchor or "base"
+
     def anchor_beta(self) -> float:
         """beta_t = beta0 * decay ** update: the weight of the KL to the anchor in the update about to run. It is a
         function of the update count, which a checkpoint and a rollback restore."""
         return self.cfg.anchor_beta0 * self.cfg.anchor_decay**self.updates if self.anchor_enabled else 0.0
 
     def aux_alpha(self) -> float:
-        """alpha_t = alpha0 * decay ** update: the weight of the cross-entropy on sft-flagged rows in this update."""
-        return self.cfg.aux_alpha0 * self.cfg.aux_decay**self.updates if not self.cfg.sft else 0.0
+        """alpha_t = alpha0 * decay ** aux_updates: the weight of the cross-entropy on sft-flagged rows in this update.
+        It decays only over updates that had such rows, so a run that gets labels late is not already at the floor."""
+        return self.cfg.aux_alpha0 * self.cfg.aux_decay**self.aux_updates if not self.cfg.sft else 0.0
 
     def _load_anchor(self) -> dict[str, torch.Tensor]:
         """The frozen anchor adapter's weights, by the trainable parameters' names. They are swapped in for a no-grad
-        pass (anchor_logps), never trained and never published; the adapter must have the learner's shapes."""
-        state = load_file(str(Path(self.cfg.anchor) / "adapter_model.safetensors"), device=str(self.device))
+        pass (anchor_logps), never trained and never published. The adapter must be the learner's LoRA: the same r,
+        lora_alpha and target modules (read from its adapter_config.json, since the same shapes can carry another
+        scaling), and every parameter present with the same shape."""
+        folder = Path(self.cfg.anchor)
+        try:
+            saved = json.loads((folder / "adapter_config.json").read_text())
+        except (OSError, ValueError) as e:
+            raise ValueError(f"anchor adapter {folder} has no readable adapter_config.json: {e}") from e
+        mine = self.model.peft_config["default"]
+        want = {"r": mine.r, "lora_alpha": mine.lora_alpha, "target_modules": sorted(mine.target_modules)}
+        got = {"r": saved.get("r"), "lora_alpha": saved.get("lora_alpha"), "target_modules": None}
+        modules = saved.get("target_modules")
+        got["target_modules"] = sorted(modules) if isinstance(modules, list | set | tuple) else modules
+        if got != want:
+            raise ValueError(
+                f"anchor adapter {folder} does not fit the learner's LoRA: it is {got}, the learner's is {want}"
+            )
+        state = load_file(str(folder / "adapter_model.safetensors"), device=str(self.device))
         weights = {}
         for name, p in self.params:
             key = name.replace(".default", "")
@@ -722,16 +809,21 @@ class Learner:
         return logp, ent
 
     def anchor_logps(self, row: Decision) -> torch.Tensor:
-        """No-grad log-probs of the row's tokens under the anchor: the anchor adapter's weights swapped into the LoRA
-        for the pass, or the base model (adapter off) when no anchor adapter was given."""
+        """No-grad log-probs of one row's tokens under the anchor (see anchor_logps_many)."""
+        return self.anchor_logps_many([row])[0]
+
+    def anchor_logps_many(self, rows: Sequence[Decision]) -> list[torch.Tensor]:
+        """No-grad log-probs of the rows' tokens under the anchor: the anchor adapter's weights swapped into the LoRA
+        once for all the rows, or the base model (adapter off) when no anchor adapter was given. The policy's weights
+        are put back whatever happens, a failure part-way through the copy-in included."""
         if not self.anchor_weights:
-            return self.logps(row, grad=False, adapter=False)[0]
+            return [self.logps(row, grad=False, adapter=False)[0] for row in rows]
         held = {n: p.detach().clone() for n, p in self.params}
-        with torch.no_grad():
-            for n, p in self.params:
-                p.copy_(self.anchor_weights[n])
         try:
-            return self.logps(row, grad=False)[0]
+            with torch.no_grad():
+                for n, p in self.params:
+                    p.copy_(self.anchor_weights[n])
+            return [self.logps(row, grad=False)[0] for row in rows]
         finally:
             with torch.no_grad():
                 for n, p in self.params:
@@ -751,12 +843,8 @@ class Learner:
         aux_rows = (
             [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in aux] if schedule.alpha else []
         )
-        m = len(batches)
-        n_aux = len(aux_rows)
-        aux_owned = [
-            [r for i, r in enumerate(aux_rows[k * n_aux // m : (k + 1) * n_aux // m]) if i % comm.world == comm.rank]
-            for k in range(m)
-        ]
+        # every auxiliary row goes in minibatch 1, which always runs: a KL stop of the later ones cannot drop them
+        aux_owned = [[r for i, r in enumerate(aux_rows) if i % comm.world == comm.rank]] + [[] for _ in batches[1:]]
         totals: Counter[str] = Counter()
         prox, anchor = ({}, {}) if cfg.sft else self._prox_pass(rows, owned, totals, schedule.beta > 0)
         stepped, grad_norms, kl_check = 0, [], None
@@ -769,6 +857,7 @@ class Learner:
             stepped += 1
         reduced = self._reduce(totals)
         self.updates += 1
+        self.aux_updates += bool(aux_rows)
         self.version += 1
         trained = sum(len(batches[j]) for j in range(stepped))
         self.decisions_total += trained
@@ -803,24 +892,31 @@ class Learner:
             range(len(rows)), max(1, math.ceil(self.cfg.base_kl_fraction * len(rows)))
         ))  # fmt: skip
         position = {id(r): i for i, r in enumerate(rows)}
+        mine = [r for mb in owned for r in mb]
         prox: dict[int, torch.Tensor] = {}
         anchor: dict[int, torch.Tensor] = {}
-        for row in (r for mb in owned for r in mb):
+        masks = {id(r): torch.tensor(r.mask, device=self.device) for r in mine}
+        for row in mine:
             logp, ent = self.logps(row, grad=False, entropy=not row.is_hold)
             prox[id(row)] = logp
-            mask = torch.tensor(row.mask, device=self.device)
-            if with_anchor:
-                anchor[id(row)] = self.anchor_logps(row)
-                totals["anchor_kl_sum"] += float(anchor_k3(logp, anchor[id(row)], mask))
-                totals["anchor_kl_n"] += float(mask.sum())
             if ent is not None:
-                totals["entropy_sum"] += float((ent * mask).sum())
-                totals["entropy_n"] += float(mask.sum())
-            if position[id(row)] in sample:
-                base_logp, _ = self.logps(row, grad=False, adapter=False)
-                delta = base_logp - logp
-                totals["base_kl_sum"] += float(((torch.exp(delta) - delta - 1) * mask).sum())
-                totals["base_kl_n"] += float(mask.sum())
+                totals["entropy_sum"] += float((ent * masks[id(row)]).sum())
+                totals["entropy_n"] += float(masks[id(row)].sum())
+        if with_anchor:  # one swap of the anchor's weights for every row
+            for row, logp_anchor in zip(mine, self.anchor_logps_many(mine), strict=True):
+                anchor[id(row)] = logp_anchor
+                totals["anchor_kl_sum"] += float(anchor_k3(prox[id(row)], logp_anchor, masks[id(row)]))
+                totals["anchor_kl_n"] += float(masks[id(row)].sum())
+        for row in (r for r in mine if position[id(r)] in sample):
+            # with the base model as the anchor its log-probs are the base's: no second pass
+            base_logp = (
+                anchor[id(row)]
+                if with_anchor and not self.anchor_weights
+                else self.logps(row, grad=False, adapter=False)[0]
+            )
+            delta = base_logp - prox[id(row)]
+            totals["base_kl_sum"] += float(((torch.exp(delta) - delta - 1) * masks[id(row)]).sum())
+            totals["base_kl_n"] += float(masks[id(row)].sum())
         return prox, anchor
 
     def _kl_after(self, mb: list[Decision], prox: dict[int, torch.Tensor]) -> float:
@@ -859,11 +955,14 @@ class Learner:
                 terms = ppo_terms(
                     logp, prox[id(row)], torch.tensor(row.logprobs, device=self.device), row.advantage, mask, cfg
                 )
-            loss = terms.loss
+            divisor = size * cfg.token_divisor
+            scaled = pg = terms.loss / divisor
             if schedule.beta > 0 and anchor:
-                loss = loss + schedule.beta * anchor_k3(logp, anchor[id(row)], mask)
-            scaled = loss / (size * cfg.token_divisor)
+                pull = schedule.beta * anchor_k3(logp, anchor[id(row)], mask) / divisor
+                scaled = scaled + pull
+                totals["anchor_loss"] += float(pull.detach())
             scaled.backward()
+            totals["pg_loss"] += float(pg.detach())
             totals["loss"] += float(scaled.detach())
             totals["clipped"] += terms.clipped
             totals["truncated"] += terms.truncated
@@ -930,20 +1029,22 @@ class Learner:
             "tis_truncation_share": t["truncated"] / t["tokens"] if t["tokens"] else None,
             "grad_norm": statistics.fmean(finite) if finite else None,
             "nonfinite_steps": int(round(t["nonfinite_steps"])),
-            "loss": t["loss"],
+            "loss": t["loss"],  # pg_loss + anchor_loss (the SFT cross-entropy in SFT mode); aux_loss is apart
+            "pg_loss": t["pg_loss"],
+            "anchor_loss": t["anchor_loss"],
             "lr": lr_used,
             "rejected_share": rejected / received if received else 0.0,
             "stale_dropped": intake.get("stale", 0),
             "intake": intake,
         }
 
-    @staticmethod
-    def _aux_health(t: dict[str, float], schedule: Schedule, aux_rows: int) -> dict[str, Any]:
+    def _aux_health(self, t: dict[str, float], schedule: Schedule, aux_rows: int) -> dict[str, Any]:
         """The anchor's and the auxiliary term's numbers: the KL to the anchor over the update's rows (measured before
         its first step) and the beta, alpha and mean per-token cross-entropy they were weighed with."""
         return {
             "kl_to_anchor": t["anchor_kl_sum"] / t["anchor_kl_n"] if t["anchor_kl_n"] else None,
             "anchor_beta": schedule.beta,
+            "anchor": self.anchor_label(),
             "aux_alpha": schedule.alpha,
             "aux_rows": aux_rows,
             "aux_ce": t["aux_ce_sum"] / t["aux_tokens"] if t["aux_tokens"] else None,
@@ -969,6 +1070,8 @@ class Learner:
             "decisions": health.get("decisions"),
             "trained": health.get("trained"),
             "decisions_total": self.decisions_total,
+            "anchor": self.anchor_label(),
+            "init": self.cfg.init or None,
             "time": time.time(),
             "health": health,
         }
@@ -993,7 +1096,22 @@ class Learner:
 
         The entropy is measured on the teacher's tokens at every completion position, so the pair says how much
         sharper than the base the checkpoint has become on that text; `select_sft_checkpoint` (train/stats.py) reads it.
-        Every rank measures its share and the sums are reduced; rank 0 writes."""
+        Every rank measures its share and the sums are reduced; rank 0 writes. An epoch directory that already exists
+        (a restart between its publication and the next checkpoint) is reused if it holds this version's weights and
+        refused otherwise; every rank decides that alike, before any collective, so none waits at a barrier."""
+        existing = self.cfg.epochs / f"epoch{epoch}"
+        if existing.exists():
+            try:
+                record = json.loads((existing / "manifest.json").read_text())
+            except (OSError, ValueError):
+                record = {}
+            if record.get("version") != self.version:
+                raise RuntimeError(
+                    f"{existing} already exists and is not version {self.version}'s (it is {record.get('version')}): "
+                    "move it away, or use a fresh --root"
+                )
+            log.warning("%s is already published for version %d: reusing it", existing, self.version)
+            return record
         rows = [annotate(r, self.decode, self.cfg.tool_call_open, self.cfg.tool_call_close) for r in sample]
         acc = torch.zeros(4, dtype=torch.float64, device=self.device)
         for row in (r for i, r in enumerate(rows) if i % self.comm.world == self.comm.rank):
@@ -1034,6 +1152,8 @@ class Learner:
             "update": self.updates,
             "lr": self.lr,
             "decisions_total": self.decisions_total,
+            "aux_updates": self.aux_updates,
+            "sft_progress": list(self.sft_progress),
             "mode": self.mode,
         }
         path = self.cfg.checkpoints / f"ckpt-{self.version:06d}.pt"
@@ -1060,6 +1180,7 @@ class Learner:
         """Restore checkpoint `version` (weights, AdamW moments, update count), halve the lr, publish a new version."""
         state = self._load_checkpoint(version)
         self.updates = state["update"]
+        self.aux_updates = state.get("aux_updates", 0)
         self.decisions_total = state["decisions_total"]
         self.lr = self.lr / 2
         self.recent.clear()
@@ -1076,6 +1197,10 @@ class Learner:
         state = self._load_checkpoint(versions[-1])
         self.version, self.updates = state["version"], state["update"]
         self.lr, self.decisions_total = state["lr"], state["decisions_total"]
+        self.aux_updates = state.get("aux_updates", 0)
+        epoch, trained = state.get("sft_progress", (1, 0))
+        self.sft_progress = (int(epoch), int(trained))
+        self.resumed = True
         self._refill_window()
         if self.comm.rank == 0 and not (self.cfg.adapters / f"v{self.version}").exists():
             self.publish({"event": "resume"})
@@ -1280,6 +1405,8 @@ def serve(
     carries it out. In SFT mode, once the inbox has gone quiet and an epoch has trained on all its rows, the epoch's
     checkpoint is published and the next epoch's pass over the dataset begins, up to `sft_epochs`."""
     done = quiet = 0
+    if inbox is not None and learner.cfg.sft and learner.resumed:
+        inbox.restore(*learner.sft_progress)
     while True:
         action: dict[str, Any] = {"op": "idle"}
         if learner.comm.rank == 0:
@@ -1292,9 +1419,15 @@ def serve(
                 quiet = 0 if inbox.poll() else quiet + 1
                 batch = inbox.take(learner.version, flush=quiet >= 2)
                 if batch is not None:
-                    action = {"op": "update", "rows": batch, "intake": inbox.drain_counts(), "aux": inbox.take_aux()}
+                    action = {
+                        "op": "update", "rows": batch, "intake": inbox.drain_counts(), "aux": inbox.take_aux(),
+                        "progress": inbox.progress(),
+                    }  # fmt: skip
                 elif quiet >= 2 and inbox.epoch_done():
-                    action = {"op": "epoch_end", "epoch": inbox.epoch, "sample": inbox.entropy_sample()}
+                    action = {
+                        "op": "epoch_end", "epoch": inbox.epoch, "sample": inbox.entropy_sample(),
+                        "last": inbox.epoch >= learner.cfg.sft_epochs,
+                    }  # fmt: skip
         action = learner.comm.broadcast(action)
         if action["op"] == "command":
             if action["command"].get("op") == "stop":
@@ -1305,7 +1438,17 @@ def serve(
             log.info("sft epoch %d done: %s", record["epoch"], {k: record[k] for k in ("version", "entropy_ratio")})
             if inbox is not None:
                 inbox.next_epoch()
+                learner.sft_progress = inbox.progress()
+            if learner.comm.rank == 0:
+                learner.save_checkpoint()  # so a restart begins the next epoch, not this one again
+                if action["last"]:
+                    learner.cfg.sft_done.write_text(json.dumps({"epochs": action["epoch"], "version": learner.version}))
+            learner.comm.barrier()
+            if action["last"]:
+                return
         elif action["op"] == "update":
+            if "progress" in action:
+                learner.sft_progress = (int(action["progress"][0]), int(action["progress"][1]))
             health = learner.update(action["rows"], action["intake"], action["aux"])
             done += 1
             log.info(
@@ -1332,8 +1475,9 @@ def parse() -> argparse.Namespace:
     p.add_argument("--sft-epochs", type=int, default=2, help="SFT: passes over the dataset, a checkpoint after each")
     p.add_argument(
         "--anchor",
-        default="",
-        help="RL: the frozen adapter (the distilled SFT one) the KL penalty holds the policy near; none: the base",
+        default=None,
+        help="RL: the frozen adapter the KL penalty holds the policy near; default: --init (the distilled SFT "
+        "adapter), or the base model when there is no --init; `base` forces the base model",
     )
     p.add_argument(
         "--anchor-beta0", type=float, default=0.1, help="RL: KL-to-anchor weight at update 0; 0 turns it off"
@@ -1346,6 +1490,14 @@ def parse() -> argparse.Namespace:
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
     return p.parse_args()
+
+
+def resolve_anchor(init: str, anchor: str | None) -> str:
+    """The anchor adapter's path, "" for the base model: the one given, else --init (a run started from the distilled
+    adapter is held near it, not silently near the base), and `base` or an empty value mean the base model."""
+    if anchor is None:
+        return init
+    return "" if anchor in ("", "base") else anchor
 
 
 def main() -> None:
@@ -1362,10 +1514,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     cfg = LearnerConfig(
         base=args.base, root=Path(args.root), init=args.init, lr=args.lr, seed=args.seed, dtype=args.dtype,
-        known_tools=known_tools, sft=args.sft, sft_epochs=args.sft_epochs, anchor=args.anchor,
+        known_tools=known_tools, sft=args.sft, sft_epochs=args.sft_epochs,
+        anchor=resolve_anchor(args.init, args.anchor),
         anchor_beta0=args.anchor_beta0, anchor_decay=args.anchor_decay, aux_alpha0=args.aux_alpha0,
         aux_decay=args.aux_decay,
     )  # fmt: skip
+    log.info("init: %s; anchor: %s", cfg.init or "none", cfg.anchor or "base model")
     model = build_model(cfg, device)
     comm.sync_params([p for p in model.parameters() if p.requires_grad])
     tokenizer = AutoTokenizer.from_pretrained(cfg.base)

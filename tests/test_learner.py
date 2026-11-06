@@ -226,7 +226,7 @@ def test_the_freshest_rows_go_first_and_a_short_pool_waits(tmp_path):
 
 
 def test_an_update_publishes_a_version_and_logs_its_health(tmp_path):
-    learner = make_learner(tmp_path)
+    learner = make_learner(tmp_path, anchor_beta0=L.LearnerConfig.anchor_beta0)  # the production default, 0.1
     before = weights(learner)
     health = learner.update(rows(), {"accepted": 4})
     assert learner.version == 1 and health["version"] == 1 and health["minibatches_run"] == 2 and health["trained"] == 4
@@ -239,6 +239,8 @@ def test_an_update_publishes_a_version_and_logs_its_health(tmp_path):
     ]
     manifest = json.loads((adapter / "manifest.json").read_text())
     assert manifest["version"] == 1 and manifest["update"] == 1 and manifest["decisions"] == 4
+    assert health["anchor_beta"] == 0.1 and health["anchor"] == "base" and manifest["anchor"] == "base"
+    assert health["loss"] == pytest.approx(health["pg_loss"] + health["anchor_loss"], rel=1e-3)
     assert manifest["health"]["tokens_p50"] == health["tokens_p50"] and manifest["time"] > 0
     logged = [json.loads(line) for line in learner.cfg.health.read_text().splitlines()]
     assert len(logged) == 1 and logged[0]["grad_norm"] > 0 and logged[0]["kl_to_base"] == pytest.approx(0, abs=1e-9)
@@ -276,7 +278,7 @@ def test_the_adapter_off_pass_gives_the_plain_base_models_logprobs_and_only_a_te
 def test_the_second_minibatch_is_skipped_when_the_first_step_moved_the_policy_too_far(tmp_path):
     steps = {}
     for name, kl_stop in (("tight", 1e-9), ("loose", 1e9)):
-        learner = make_learner(tmp_path / name, kl_stop=kl_stop)
+        learner = make_learner(tmp_path / name, kl_stop=kl_stop, anchor_beta0=L.LearnerConfig.anchor_beta0)
         health = learner.update(rows())
         steps[name] = (
             health["minibatches_run"],
