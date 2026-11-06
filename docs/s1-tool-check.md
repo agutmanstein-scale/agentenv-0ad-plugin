@@ -13,7 +13,7 @@ network, one container each; the box's vCPUs minus 4), mainland map, 30-minute c
 |---|---|---|
 | Bot | 600 (N=100 per cell) | The scripted bot against Petra 1, 2 and 3, bot seat on v1 and on v2. Petra seats are always v1. Game `i` has the same seed and civs under both interfaces and at every level; the bot starts first on even `i` and second on odd. |
 | Replay | 80 (K=40 pilot games, two each) | Qwen's logged orders from `live/fetched/pilot-final` (policy v0, at least 15 turns, against Petra at a known level, spread over the levels), replayed under v1 and v2 in the setup they came from (map, seed, civs, Petra's level, the policy's start), 5 s late as lockstep play is. Only those pilot `results.json` files go to the box, as the `agent/v1` column. |
-| Calibration | 1 + 20 + 40 + 60 | One 30-minute game alone, then 20, 40 and 60 games at once on as many engines (the v2 bot against Petra 3). Step time by game minute, core-seconds per game, engine RSS. |
+| Calibration | 12 + 24 + 44, per worker 4 and one loop | 12, 24 and 44 30-minute games at once on as many engines (the v2 bot against Petra 3), each level in workers of 4 engines and in one loop of up to 24; idle engines (1 and 20) on the PPA image and the patched one; a same-seed parity game on both. Step time by game minute, core-seconds per game, Python CPU and loop lag per worker, engine RSS. |
 
 Order on the box: replays, calibration, bots. The bot specs are ordered game by game, so a batch cut by its wall-clock
 limit still has equal numbers in every cell; the summary says how many games each column has.
@@ -69,6 +69,13 @@ live/teardown.sh $ID                 # plan
 live/teardown.sh $ID --yes           # terminates; its by-hand list is for the stream, ignore the SSM/X lines
 aws s3 rm --recursive s3://$LIVE_BUCKET/zeroad-s1/    # the shipped code, inputs and archives
 ```
+
+The batch plays on the patched engine, `zeroad-engine:0.28-rt` (labelled `zeroad.patches="rl-realtime rl-idle-wait"`, built by
+`scripts/build-engine.sh rt`, which `cpu-bootstrap.sh` runs); `s1.sh start` and `s1-run.sh` refuse an image without that label
+(`S1_ALLOW_UNPATCHED=1` for a deliberate comparison). To re-measure the CPU alone: `live/s1.sh $ID start --calibration-only --yes`
+(its default flags are `--levels 12,24,44 --per-worker 4,24 --idle-engines 1,20`; `--cal-args "..."` overrides them) and read
+`calibration.txt`: idle cores per engine on both images, whether the parity game matched, and per cell the busiest worker's
+Python cores and its loop-lag p95 (near 1.0 cores or tens of ms means that loop is the bottleneck, not the box).
 
 Options: `live/s1.sh $ID start --n 100 --replays 40 --wall-hours 2.5 --engines 44` (defaults from `LIVE_S1_*`).
 `--wall-hours` must leave `LIVE_MAX_HOURS` an hour for bootstrap and fetch. `start` is refused when the wall-clock

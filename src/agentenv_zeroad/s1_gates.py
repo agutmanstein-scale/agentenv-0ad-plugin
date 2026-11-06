@@ -172,30 +172,99 @@ def format_gates(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_calibration(calibration: Mapping[str, Any]) -> str:
-    """The calibration numbers as lines: per level of engines in flight, the cost of a game and the engines' memory."""
-    host = calibration.get("host", {})
-    lines = [f"E1 CPU calibration ({host.get('vcpus', '?')} vCPUs, {host.get('mem_total_mb', '?')} MB):"]
-    for level, row in sorted(calibration.get("levels", {}).items(), key=lambda kv: int(kv[0])):
-        rss = row.get("rss_mb") or {}
+def _level_order(item: tuple[str, Any]) -> tuple[int, int]:
+    """Levels sort by engines, then engines per worker: "20" (one loop) after "20x4"."""
+    engines, _, share = item[0].partition("x")
+    return int(engines), int(share) if share else 10**9
+
+
+def _idle_lines(calibration: Mapping[str, Any]) -> list[str]:
+    lines = []
+    for key in ("idle_baseline", "idle"):  # the PPA image first: the spin, then the fix
+        for engines, row in sorted((calibration.get(key) or {}).items(), key=lambda kv: int(kv[0])):
+            where = f" on {row['image']}" if row.get("image") else ""
+            if row.get("error"):
+                lines.append(f"  {int(engines):>2} idle engines{where}: FAILED: {row['error']}")
+                continue
+            lines.append(
+                f"  {int(engines):>2} idle engines{where}, no /step for {_fmt(row.get('idle_s'))} s: "
+                f"{_fmt(row.get('cores'))} cores ({_fmt(row.get('cores_per_engine'), 3)} per engine)"
+            )
+    return lines
+
+
+def _parity_lines(parity: Mapping[str, Any] | None) -> list[str]:
+    if not parity:
+        return []
+    games = parity.get("games") or []
+    names = " and ".join(g.get("image", "?") for g in games)
+    head = f"  parity game ({_fmt(parity.get('minutes'))} game min) on {names}: "
+    if parity.get("errors"):
+        head += f"FAILED on {', '.join(parity['errors'])}"
+    elif parity.get("same"):
+        head += "identical commands, outcomes, scores and length"
+    else:
+        head += f"DIFFERS in {', '.join(parity.get('differences') or ['?'])}"
+    lines = [head]
+    for game in games:
+        if "error" in game:
+            lines.append(f"      {game.get('image')}: {game['error']}")
+            continue
+        scores = ", ".join(
+            f"{slot}: {s.get('outcome')} {s.get('score')}" for slot, s in (game.get("seats") or {}).items()
+        )
         lines.append(
-            f"  {int(level):>2} engines: {row.get('games_finished', 0)}/{row.get('games', 0)} games finished, "
-            f"wall {row.get('wall_s', 0):.0f} s, {_fmt(row.get('core_s_per_game'))} core-s per game, "
+            f"      {game['image']}: {game.get('commands')} commands ({str(game.get('commands_sha256'))[:12]}), "
+            f"{game.get('ended_by')} at {_fmt(game.get('game_time_s'))} s, {scores}"
+        )
+    return lines
+
+
+def format_calibration(calibration: Mapping[str, Any]) -> str:
+    """The calibration numbers as lines: what idle engines burn on the PPA image and the patched one, whether the two
+    play the same game, then per level of engines in flight (and engines per worker process) the cost of a game, the
+    Python cost and the engines' memory."""
+    host = calibration.get("host", {})
+    image = f", engine {calibration['image']}" if calibration.get("image") else ""
+    lines = [f"E1 CPU calibration ({host.get('vcpus', '?')} vCPUs, {host.get('mem_total_mb', '?')} MB{image}):"]
+    lines += _idle_lines(calibration) + _parity_lines(calibration.get("parity"))
+    for level, row in sorted(calibration.get("levels", {}).items(), key=_level_order):
+        rss = row.get("rss_mb") or {}
+        share = level.partition("x")[2]
+        per = f" in {row.get('workers', '?')} workers of {share}" if share else ""
+        lines.append(
+            f"  {int(level.partition('x')[0]):>2} engines{per}: {row.get('games_finished', 0)}/{row.get('games', 0)} "
+            f"games finished, wall {row.get('wall_s', 0):.0f} s, {_fmt(row.get('core_s_per_game'))} core-s per game, "
             f"{_fmt(row.get('mean_cores'))} cores busy, engine RSS median {_fmt(rss.get('median'))} MB "
             f"max {_fmt(rss.get('max'))} MB, all engines {_fmt(rss.get('sum_max'))} MB"
         )
+        if row.get("error"):
+            lines.append(f"      FAILED: {row['error']}")
         by_minute = row.get("step_ms_by_minute") or {}
         if by_minute:
             picks = [m for m in ("0", "5", "10", "15", "20", "25", "29") if m in by_minute]
             cells = ", ".join(f"min {m}: {by_minute[m]['median']:.0f}/{by_minute[m]['p95']:.0f}" for m in picks)
             lines.append(f"      step ms (median/p95) {cells}")
+        lag = row.get("loop_lag_ms")
+        if lag or row.get("python_core_s_per_game") is not None:
+            lag_text = (
+                f", loop lag ms median {_fmt(lag['median'])} p95 {_fmt(lag['p95'])} max {_fmt(lag['max'])}"
+                f" (worst worker p95 {_fmt(row.get('loop_lag_p95_ms_worst_worker'))})"
+                if lag
+                else ""
+            )
+            lines.append(
+                f"      python {_fmt(row.get('python_core_s_per_game'))} core-s per game, busiest worker "
+                f"{_fmt(row.get('python_cores_busy'), 2)} cores ({_fmt(row.get('python_cores_busy_total'), 2)} in all)"
+                f"{lag_text}"
+            )
     if not calibration.get("levels"):
         lines.append("  (no calibration run)")
     return "\n".join(lines)
 
 
-def _fmt(value: float | None) -> str:
-    return "n/a" if value is None else f"{value:.1f}"
+def _fmt(value: float | None, digits: int = 1) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
 
 
 def summary(

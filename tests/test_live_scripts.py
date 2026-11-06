@@ -1514,8 +1514,9 @@ def test_the_cpu_bootstrap_installs_docker_uv_the_engine_image_and_the_timer_and
     text = out.stdout.replace("\\", "")
     assert not [w for w in GPU_WORDS if w in text.lower()]
     assert "docker.io" in text and "astral.sh/uv/" in text and "uv sync --project" in text
-    assert "scripts/build-engine.sh" in text
+    assert "scripts/build-engine.sh rt" in text  # both images: the PPA's and the idle-wait one the runner plays on
     assert "docker run --rm zeroad-engine:0.28 test -x /usr/games/pyrogenesis" in text
+    assert "docker run --rm zeroad-engine:0.28-rt test -x /usr/games/pyrogenesis" in text
     assert "zeroad-boxtime.timer" in text and "zeroad-live.conf" in text
     assert text.index("docker.io") < text.index("build-engine.sh") < text.index("zeroad-boxtime.timer")
     assert "cpu bootstrap done" in text
@@ -1527,6 +1528,7 @@ def test_the_cpu_bootstrap_can_pull_the_engine_image_instead_of_building_it():
     assert out.returncode == 0, out.stderr
     assert "docker pull reg.example/zeroad/zeroad-engine:v2" in text
     assert "docker tag reg.example/zeroad/zeroad-engine:v2 zeroad-engine:0.28" in text
+    assert "docker tag reg.example/zeroad/zeroad-engine:v2-rt zeroad-engine:0.28-rt" in text
     assert "build-engine.sh" not in text
     assert cpu_bootstrap("--images", "pull").returncode == 2
     assert cpu_bootstrap("--images", "rsync").returncode == 2
@@ -1571,6 +1573,33 @@ def test_the_s1_batch_size_comes_from_the_env_and_the_flags_override_it(stubs):
     assert "s1.sh start --n 10 --wall-hours 1 --engines 20 --budget 15" in plan
     plan = run(stubs, "s1.sh", ID, "start", "--n", "7", "--wall-hours", "2", forbid_aws=True).stderr
     assert "--n 7 --wall-hours 2 --engines 20" in plan
+
+
+def test_a_calibration_only_run_is_the_calibration_phase_alone_with_the_flags_it_was_given(stubs):
+    cal = "--levels 20,40 --per-worker 2,4,11 --idle-engines 1,20"
+    out = run_box(
+        stubs, "s1-run.sh", "--n", "1", "--wall-s", "3000", "--engines", "44", "--calibration-only", "--cal-args", cal,
+        DRY_RUN="1",
+    )  # fmt: skip
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    assert "agentenv_zeroad.s1_calibrate --out" in text and cal in text and "--image zeroad-engine:0.28-rt" in text
+    assert "train.runner" not in text and "s1_batch" not in text and "s1_summary" not in text
+    assert "format_calibration" in text and "S1 calibration done" in text
+    bad = run_box(
+        stubs, "s1-run.sh", "--n", "1", "--wall-s", "3000", "--engines", "4", "--cal-args", "$(id)", DRY_RUN="1"
+    )
+    assert bad.returncode != 0 and "--cal-args has characters" in bad.stderr
+
+
+def test_the_calibration_flags_go_from_the_laptop_to_the_box_unit_unchanged_and_odd_ones_are_refused(stubs):
+    s1_stubs(stubs)
+    cal = "--per-worker 2,4 --idle-engines 1"
+    plan = run(stubs, "s1.sh", ID, "start", "--calibration-only", "--cal-args", cal, forbid_aws=True).stderr
+    assert "--calibration-only --cal-args" in plan.replace("\\", "") and "--per-worker" in plan
+    assert "s1-run.sh --n 100" in plan.replace("\\", "") and "--calibration-only" in plan
+    bad = run(stubs, "s1.sh", ID, "start", "--cal-args", "x; rm -rf /", forbid_aws=True)
+    assert bad.returncode != 0 and "--cal-args has characters" in bad.stderr
 
 
 def test_a_wall_clock_limit_that_leaves_no_hour_for_bootstrap_and_fetch_is_refused(stubs):
@@ -1687,12 +1716,37 @@ def test_the_s1_run_plans_the_phases_in_order_each_under_its_own_limit_with_a_po
     assert positions == sorted(positions)
     runner = [line for line in text.splitlines() if "agentenv_zeroad.train.runner" in line]
     assert len(runner) == 2
-    assert all("--engines 44 --concurrency 11 --workers 4" in line and "timeout -k 30" in line for line in runner)
+    assert all(
+        "--engines 44 --engines-per-worker 4 --image zeroad-engine:0.28-rt" in line and "timeout -k 30" in line
+        for line in runner
+    )
+    assert "--concurrency" not in "".join(runner) and "--workers" not in "".join(runner)
     assert "specs/replay.jsonl" in runner[0] and "specs/bot.jsonl" in runner[1]
     assert "agentenv_zeroad.s1_calibrate --out" in text and "--level-timeout-s 800" in text
+    flat = text.replace("\\", "")
+    assert "--image zeroad-engine:0.28-rt" in flat
+    assert "--levels 12,24,44 --per-worker 4,24 --idle-engines 1,20" in flat  # the re-measure's default cells
+    assert flat.count("docker image inspect zeroad-engine:0.28-rt") == 1 and "--allow-unpatched" not in flat
     summary = text.split("scripts/s1_summary.py")[1]
     assert "--calibration" in summary and "--out" in summary
     assert "litellm" not in text.lower() and "vllm" not in text.lower()
+
+
+def test_the_s1_batch_refuses_an_engine_image_without_the_patches_unless_told_to_compare(box_stubs):
+    out = start_s1(box_stubs, "--n", "10", STUB_ENGINE_LABEL="rl-realtime")  # an rt image from before the idle patch
+    assert out.returncode != 0 and "lacks the patch rl-idle-wait" in out.stderr
+    out = start_s1(box_stubs, "--n", "10", STUB_ENGINE_MISSING="1")
+    assert out.returncode != 0 and "is not built on this box" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    out = start_s1(box_stubs, "--n", "10", STUB_ENGINE_LABEL="", S1_ALLOW_UNPATCHED="1")
+    assert out.returncode == 0, out.stderr
+    plan = run_box(
+        box_stubs, "s1-run.sh", "--n", "1", "--wall-s", "9000", "--engines", "8", DRY_RUN="1", S1_ALLOW_UNPATCHED="1"
+    ).stdout.replace("\\", "")
+    assert plan.count("--allow-unpatched") == 3  # both runner phases and the calibration
+    assert (
+        "docker image inspect zeroad-engine:0.28-rt" not in plan and "docker image inspect zeroad-engine:0.28 " in plan
+    )
 
 
 def test_a_batch_with_no_time_left_skips_its_phases_and_still_writes_the_summary(stubs):
@@ -1706,12 +1760,13 @@ def test_a_batch_with_no_time_left_skips_its_phases_and_still_writes_the_summary
 def test_a_failed_phase_is_logged_and_the_batch_goes_on_to_the_summary_and_marks_itself_done(stubs):
     log = stubs["tmp"] / "uv.log"
     write_exe(stubs["bin"] / "timeout", '#!/bin/sh\nshift 3\nexec "$@"\n')  # GNU timeout, not on every machine
-    write_exe(stubs["bin"] / "docker", "#!/bin/sh\nexit 0\n")
+    write_exe(stubs["bin"] / "docker", STUB_DOCKER)
     write_exe(stubs["bin"] / "uv", f'#!/bin/sh\necho "$*" >> {log}\ncase "$*" in *s1_calibrate*) exit 3 ;; esac\n')
     out = run_box(stubs, "s1-run.sh", "--n", "10", "--wall-s", "9000", "--engines", "24", DRY_RUN="0")
     assert out.returncode == 0, out.stderr
     calls = log.read_text()
-    assert calls.count("agentenv_zeroad.train.runner") == 2 and "s1_summary.py" in calls and "--workers 2" in calls
+    assert calls.count("agentenv_zeroad.train.runner") == 2 and "s1_summary.py" in calls
+    assert "--engines 24 --engines-per-worker 4 --image zeroad-engine:0.28-rt" in calls and "--workers" not in calls
     out_dir = stubs["tmp"] / "state" / "s1" / "out"
     progress = (out_dir / "progress.log").read_text()
     assert "phase calibration FAILED (exit 3)" in progress and "phase bot done" in progress

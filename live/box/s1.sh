@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s1.sh put-inputs URL | start [--n N] [--wall-hours H] [--engines E] --budget USD | status [LINES] | stop
+# s1.sh put-inputs URL | start [--n N] [--wall-hours H] [--engines E] [--calibration-only] [--cal-args "ARGS"] --budget USD | status [LINES] | stop
 # The S1 tool check on this CPU box (bootstrapped with bootstrap.sh --cpu), in the transient unit zeroad-s1 (s1-run.sh:
 # the lockstep runner on an engine pool for the bot games, the replays and the calibration, then the summary).
 # `put-inputs` downloads and unpacks the replay specs and the pilot results they name (a tarball from live/s1.sh, at a
@@ -16,7 +16,7 @@ CMD=${1:-}; shift || true
 S1=$STATE/s1
 INPUTS=$S1/inputs
 OUT=$S1/out
-USAGE="usage: s1.sh put-inputs URL | start [--n N] [--wall-hours H] [--engines E] --budget USD | status [LINES] | stop"
+USAGE="usage: s1.sh put-inputs URL | start [--n N] [--wall-hours H] [--engines E] [--calibration-only] [--cal-args ARGS] --budget USD | status [LINES] | stop"
 case $CMD in
   put-inputs)
     URL=${1:?$USAGE}
@@ -30,18 +30,21 @@ case $CMD in
     fi
     ;;
   start)
-    N=100 WALL=2.5 ENGINES= BUDGET=
+    N=100 WALL=2.5 ENGINES= BUDGET= EXTRA=()
     while [ $# -gt 0 ]; do
       case $1 in
         --n) N=${2:-}; [[ $N =~ ^[1-9][0-9]*$ ]] || die "--n needs a whole number"; shift 2 ;;
         --wall-hours) WALL=${2:-}; [[ $WALL =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--wall-hours needs a number"; shift 2 ;;
         --engines) ENGINES=${2:-}; [[ $ENGINES =~ ^[1-9][0-9]*$ ]] || die "--engines needs a whole number"; shift 2 ;;
         --budget) BUDGET=${2:?}; shift 2 ;;
+        --calibration-only) EXTRA+=(--calibration-only); shift ;;
+        --cal-args) [[ ${2:-} =~ ^[A-Za-z0-9._,=:/\ -]*$ ]] || die "--cal-args has characters outside A-Za-z0-9._,=:/ -"; EXTRA+=(--cal-args "$2"); shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
       esac
     done
     [ -n "$BUDGET" ] || die "no budget: set LIVE_BUDGET_USD in the S1 live env"
     awk -v w="$WALL" 'BEGIN { exit !(w > 0) }' || die "--wall-hours must be positive"
+    if [ "${S1_ALLOW_UNPATCHED:-0}" != 1 ]; then require_engine_image "${S1_ENGINE_IMAGE:-zeroad-engine:0.28-rt}" rl-realtime rl-idle-wait; fi
     [ "$(active zeroad-s1)" != active ] || die "a batch is running: s1.sh status, or stop it first"
     [ "$DRY_RUN" = 1 ] || [ -d "$INPUTS/specs" ] || die "no inputs in $INPUTS: live/s1.sh start sends them (put-inputs)"
     [ -n "$ENGINES" ] || ENGINES=$(awk -v n="$(nproc 2>/dev/null || echo 48)" 'BEGIN { n -= 4; print (n < 4 ? 4 : n) }')
@@ -53,7 +56,7 @@ case $CMD in
     run systemd-run --unit zeroad-s1 --collect -p KillMode=control-group -p TimeoutStopSec=300 \
       -p "RuntimeMaxSec=$((WALL_S + 600))" -p "After=network-online.target docker.service" \
       -p "Wants=network-online.target docker.service" -p "WorkingDirectory=$REPO" \
-      "$BOX_HOME/box/s1-run.sh" --n "$N" --wall-s "$WALL_S" --engines "$ENGINES"
+      "$BOX_HOME/box/s1-run.sh" --n "$N" --wall-s "$WALL_S" --engines "$ENGINES" "${EXTRA[@]+"${EXTRA[@]}"}"
     say "started; follow it with live/s1.sh ID status"
     ;;
   status)

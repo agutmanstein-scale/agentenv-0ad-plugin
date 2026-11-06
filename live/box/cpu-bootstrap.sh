@@ -3,7 +3,8 @@
 # Run as root on a fresh CPU box (a c7i.12xlarge or like, plain Ubuntu 24.04 AMI) by live/bootstrap.sh --cpu. Makes it
 # the S1 tool-check box: no GPU or driver check, no Xorg, ffmpeg, mediamtx or vLLM, no display or stream. It installs
 # Docker (the engines run in it, on the host network), jq, zstd and uv, unpacks the box scripts and the repo, builds the
-# engine image (zeroad-engine:0.28, scripts/build-engine.sh, about 10 min) or pulls REG/zeroad-engine:TAG and tags it so,
+# engine images (zeroad-engine:0.28 and the idle-wait zeroad-engine:0.28-rt the batch runs on, scripts/build-engine.sh
+# rt, about 10 min plus the engine's own build) or pulls REG/zeroad-engine:TAG and REG/zeroad-engine:TAG-rt and tags them so,
 # and starts the box-time timer the budget guard reads. Nothing is played. Idempotent.
 set -euo pipefail
 USAGE='usage: cpu-bootstrap.sh PAYLOAD_URL REPO_URL [--images build | --images pull --registry REG --tag TAG]'
@@ -28,6 +29,7 @@ LOGDIR=${ZEROAD_LIVE_LOG:-/var/log/zeroad-live}
 DRY_RUN=${DRY_RUN:-0}
 UV=0.12.13
 ENGINE_IMAGE=zeroad-engine:0.28
+RT_IMAGE=zeroad-engine:0.28-rt  # patches/rl-idle-wait.patch: an engine waiting for /step sleeps (the PPA's spins a core)
 run() { if [ "$DRY_RUN" = 1 ]; then printf '+'; printf ' %q' "$@"; printf '\n'; else "$@"; fi; }
 step() { echo "== $*"; }
 export DEBIAN_FRONTEND=noninteractive
@@ -60,10 +62,13 @@ step "the engine image ($IMAGES): $ENGINE_IMAGE, 0 A.D. 0.28 on ubuntu:24.04, wh
 if [ "$IMAGES" = pull ]; then
   run docker pull "$REGISTRY/zeroad-engine:$TAG"
   run docker tag "$REGISTRY/zeroad-engine:$TAG" "$ENGINE_IMAGE"
+  run docker pull "$REGISTRY/zeroad-engine:$TAG-rt"
+  run docker tag "$REGISTRY/zeroad-engine:$TAG-rt" "$RT_IMAGE"
 else
-  run sh -c 'cd "$1/repo" && scripts/build-engine.sh' _ "$BOX_HOME"
+  run sh -c 'cd "$1/repo" && scripts/build-engine.sh rt' _ "$BOX_HOME"
 fi
 run docker run --rm "$ENGINE_IMAGE" test -x /usr/games/pyrogenesis
+run docker run --rm "$RT_IMAGE" test -x /usr/games/pyrogenesis
 
 step "the box-time timer (the budget guard's box hours)"
 run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
