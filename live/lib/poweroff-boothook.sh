@@ -32,6 +32,10 @@ TimeoutStartSec=60
 [Install]
 WantedBy=multi-user.target
 UNIT
-# enable only, never start: starting a unit from a boothook would wait on boot; multi-user.target starts it after logind
-[ -n "$ROOT" ] || systemctl enable zeroad-poweroff.service || ln -sf /etc/systemd/system/zeroad-poweroff.service /etc/systemd/system/multi-user.target.wants/zeroad-poweroff.service
+# Enable it for later boots, and queue it for this one with --no-block, which returns at once: a unit enabled during
+# boot is not pulled into the boot already under way, and a blocking start here would wait on boot.
+if [ -z "$ROOT" ]; then
+  systemctl enable zeroad-poweroff.service || ln -sf /etc/systemd/system/zeroad-poweroff.service /etc/systemd/system/multi-user.target.wants/zeroad-poweroff.service
+  systemctl start --no-block zeroad-poweroff.service || true
+fi
 exit 0

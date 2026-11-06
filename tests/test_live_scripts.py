@@ -1188,6 +1188,7 @@ def test_the_boothook_only_records_the_deadline_and_installs_a_unit_that_arms_af
     assert "After=systemd-logind.service" in unit and "Type=oneshot" in unit
     assert "WantedBy=multi-user.target" in unit and "ExecStart=/usr/local/sbin/zeroad-poweroff-arm" in unit
     assert "enable zeroad-poweroff.service" in script and "--now" not in script  # the unit never blocks boot
+    assert "systemctl start --no-block zeroad-poweroff.service" in script  # queued for the boot under way too
     arm = (tmp_path / "root/usr/local/sbin/zeroad-poweroff-arm").read_text()
     assert 'shutdown -h +"$mins" "zeroad-live: MAX_HOURS reached"' in arm and '[ "$mins" -ge 30 ]' in arm
 
