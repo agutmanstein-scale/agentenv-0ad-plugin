@@ -32,6 +32,11 @@ What it does, each on its own interval:
 - Budget. Every `budget_interval_s`: box hours (the box's, `budget.BoxTime`) at `box_usd_per_hour` plus the box ledger;
   at `budget_usd` the run stops; so it does after `duration_hours` of run time. Below `min_free_gb` of disk it stops
   starting games and alarms until space comes back.
+- Load. One asyncio loop drives every engine's HTTP and every vLLM call (credit runs in a thread), so it is a single
+  core's worth of Python for the whole run. Every minute status.json's `loop` records this process's CPU (`cpu_cores`:
+  1.0 is a saturated core) and the loop's lag (`lag_ms` p50/p95/max, `train/loopstats.py`). A p95 of tens of ms or a
+  `cpu_cores` near 1 means the engines wait on this loop; the follow-up is then to shard the games into worker processes
+  the way `runner.py` does (one pool of engines per worker), which is not done yet.
 - Durability. Every `sync_interval_s`, as a background task, it syncs the run folder to the configured S3 prefix with
   the instance role (`sync.py`): games, decision rows, health, every adapter's manifest, hourly and champion adapters,
   the latest healthy checkpoint, the run config. The hourly adapter is the version current at each hour of the run; the
@@ -82,6 +87,7 @@ from agentenv_zeroad.train import budget
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
 from agentenv_zeroad.train.game import ModelFactory, build_model
+from agentenv_zeroad.train.loopstats import LoopMonitor
 from agentenv_zeroad.train.mix import GameFactory, repin
 from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
@@ -93,6 +99,7 @@ log = logging.getLogger(__name__)
 DRAIN_REASONS = ("duration",)
 SYNC_ATTEMPTS = 3
 HOUSEKEEPING_S = 60.0  # disk, learner liveness, adapter pruning
+LOOP_STATS_S = 60.0  # the process's CPU and event-loop lag into status.json
 STEP_FAILURES_TO_STOP = 3  # consecutive failures of the budget check before the run stops rather than go unwatched
 DOWN_POLLS_TO_CANCEL = 2  # checks an instance must be down before a game on it with no failed request is cancelled
 DEFAULT_MIN_FREE_GB = 8.0
@@ -250,6 +257,9 @@ class Orchestrator:
         self._progress: tuple[int, int] = (-1, -1)
         self._progress_at = now()
         self._waiting_since: float | None = None
+        self.monitor = LoopMonitor()
+        self.loop_stats: dict[str, Any] = {}
+        self.last_spend: budget.Spend | None = None
         self._restore()
 
     # ---- the loop ------------------------------------------------------------------------------------------------
@@ -257,6 +267,7 @@ class Orchestrator:
         """Run until a stop reason, then stop cleanly (always: an error in the loop is a stop reason too); returns the
         reason."""
         self.odir.mkdir(parents=True, exist_ok=True)
+        self.monitor.start()
         try:
             await self._step("serving", self.refresh_serving)
             while self.stop_reason is None:
@@ -271,6 +282,7 @@ class Orchestrator:
             log.exception("the orchestrator loop failed")
             self.request_stop(f"crash: {type(e).__name__}: {str(e)[:200]}")
         finally:
+            await self.monitor.stop()
             await self.finish(self.stop_reason or "crash")
         return self.stop_reason or "crash"
 
@@ -286,6 +298,8 @@ class Orchestrator:
             await self._step("health", lambda: self.poll_health(now))
         if self._due("budget", now, self.cfg.budget_interval_s):
             await self._step("budget", lambda: self.check_budget(now))
+        if self._due("loop", now, LOOP_STATS_S):
+            await self._step("loop", lambda: self.record_loop(now))
         if self._due("housekeeping", now, HOUSEKEEPING_S):
             await self._step("housekeeping", lambda: self.housekeeping(now))
         if self.counts["started"] and self._due("sync", now, self.cfg.sync_interval_s):
@@ -700,6 +714,7 @@ class Orchestrator:
             self.hourly[hour] = self.current
             self._write("keep.json", {"hourly": self.hourly})
         log.info("budget: %s", spent.line(self.cfg.budget_usd))
+        self.last_spend = spent
         self.write_status(now, spent)
         if spent.total >= self.cfg.budget_usd:
             self.request_stop(f"budget: {spent.line(self.cfg.budget_usd)}")
@@ -714,6 +729,12 @@ class Orchestrator:
                 with contextlib.suppress(OSError):
                     self.odir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, self.odir / f"box-{source.name}")
+
+    def record_loop(self, now: float) -> None:
+        """Once a minute: this process's CPU and event-loop lag into status.json, so a saturated orchestrator shows."""
+        self.loop_stats = self.monitor.snapshot()
+        if self.last_spend is not None:
+            self.write_status(now, self.last_spend)
 
     def write_status(self, now: float, spent: budget.Spend) -> None:
         self._write(
@@ -731,6 +752,7 @@ class Orchestrator:
                 "alarms": dict(self.alarms),
                 "paused_for_disk": self.disk_paused,
                 "sync": {"last_ok": self.syncer.last_ok, "failures": self.syncer.failures},
+                "loop": self.loop_stats,
                 "stop_reason": self.stop_reason,
             },
         )
@@ -1049,7 +1071,11 @@ async def serve(args: argparse.Namespace) -> str:
     credit = PlayOnly() if args.play_only else load_credit(cfg)
     (cfg.root / "orchestrator").mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, cfg.root / "orchestrator" / "config.toml")
-    pool_options: dict[str, Any] = {"mode": args.mode, "image": args.image or cfg.engine_image}
+    pool_options: dict[str, Any] = {
+        "mode": args.mode,
+        "image": args.image or cfg.engine_image,
+        "require_patches": cfg.engine_patches,
+    }
     limits = httpx.Limits(max_connections=512)
     async with (
         httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, limits=limits) as http,

@@ -733,6 +733,27 @@ async def test_the_budget_check_stops_the_run_when_box_and_frontier_spend_reach_
     assert status["spend"] == {"box": 15.0, "model": 11.0} and status["stop_reason"] is None
 
 
+async def test_status_carries_the_orchestrators_cpu_and_loop_lag_every_minute(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch)
+    t.root.mkdir(parents=True)
+    t.orch.monitor.start()
+    t.orch.check_budget(t.clock())  # status.json exists, with no loop numbers yet
+    status = json.loads((t.root / "orchestrator" / "status.json").read_text())
+    assert status["loop"] == {}
+    await asyncio.sleep(0.2)
+    t.clock.t += 61
+    await t.orch.tick()  # the loop step is due a minute after the budget check, and rewrites status.json
+    status = json.loads((t.root / "orchestrator" / "status.json").read_text())
+    loop = status["loop"]
+    assert loop["cpu_s"] >= 0 and loop["cpu_cores"] is not None and loop["lag_samples"] > 0
+    assert set(loop["lag_ms"]) == {"p50", "p95", "max"} and status["spend"]["box"] >= 0
+    before = status["time"]
+    t.clock.t += 5
+    await t.orch.tick()  # not due again
+    assert json.loads((t.root / "orchestrator" / "status.json").read_text())["time"] == before
+    await t.orch.monitor.stop()
+
+
 async def test_the_run_stops_after_its_duration(tmp_path, monkeypatch):
     t = make(tmp_path, monkeypatch, duration_hours=2)
     t.clock.t += 2 * 3600
