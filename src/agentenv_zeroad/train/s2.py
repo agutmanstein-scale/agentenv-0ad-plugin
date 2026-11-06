@@ -54,8 +54,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agentenv_zeroad.train import gates as G
+from agentenv_zeroad.train import poweroff, stats
 from agentenv_zeroad.train import results as rs
-from agentenv_zeroad.train import stats
 from agentenv_zeroad.train.config import RunConfig, check_run, load_config
 
 log = logging.getLogger("s2")
@@ -1080,7 +1080,7 @@ def run(ctx: Ctx, *, shutdown: Callable[[], None] | None) -> int:
 
 
 def power_off() -> None:
-    subprocess.run(["shutdown", "-h", "now"], check=False)
+    poweroff.power_off()
 
 
 # ---- the command line ----------------------------------------------------------------------------

@@ -78,7 +78,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import time
 from collections import Counter, deque
@@ -91,7 +90,7 @@ import httpx
 
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, StrategistModel
 from agentenv_zeroad.spend import SpendCapReached, append_ledger, results_spend
-from agentenv_zeroad.train import budget
+from agentenv_zeroad.train import budget, poweroff
 from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, panel_specs
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
@@ -1139,7 +1138,7 @@ def write_rows(inbox: Path, game_id: str, rows: Sequence[dict[str, Any]]) -> Pat
 
 
 def _power_off() -> None:
-    subprocess.run(["shutdown", "-h", "now"], check=False)
+    poweroff.power_off()
 
 
 # ---- the command line --------------------------------------------------------------------------------------------
