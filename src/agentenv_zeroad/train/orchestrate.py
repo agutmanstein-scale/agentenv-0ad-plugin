@@ -1022,7 +1022,15 @@ class Orchestrator:
         return kept - {0}
 
     async def sync_now(self, *, final: bool = False) -> bool:
-        return await self.syncer.sync(adapters=self.keep_adapters(final=final), checkpoint=self.trips.latest_healthy())
+        learner = isinstance(self.xport, LearnerSide)
+        ok = await self.syncer.sync(
+            adapters=self.keep_adapters(final=final),
+            checkpoint=self.trips.latest_healthy(),
+            extra=("remote/*",) if learner else (),
+        )
+        if ok and isinstance(self.xport, LearnerSide):
+            await asyncio.to_thread(self.xport.sweep_remote, self.syncer.last_start_ok)
+        return ok
 
     def _start_sync(self) -> None:
         """Sync in the background: a slow or hung upload must not hold up the games or the watchdog."""
@@ -1070,7 +1078,7 @@ class Orchestrator:
         if an earlier one fails."""
         if isinstance(self.xport, LearnerSide):
             await self._stage("stop the actors", self.xport.close(reason))
-        if reason in DRAIN_REASONS or (isinstance(self.xport, ActorSide) and reason.startswith("transport:")):
+        if reason in DRAIN_REASONS or (isinstance(self.xport, ActorSide) and reason.startswith("transport-drain:")):
             await self._stage("drain", self._drain(self.cfg.drain_timeout_s))
         await self._stage("cancel", self._cancel_all())
         if isinstance(self.xport, ActorSide):
@@ -1150,8 +1158,12 @@ class Orchestrator:
         not take a draining actor for a dead one."""
         assert isinstance(self.xport, ActorSide)
         while True:
-            await self.xport.ship_pass()
-            await self.xport.beat_pass()
+            try:
+                await self.xport.ship_pass()
+                await self.xport.beat_pass()
+            except Exception:  # noqa: BLE001 - one failed upload must not end the shipping and the heartbeats
+                self.counts["transport_error_keep"] += 1
+                log.exception("a transport pass failed while draining")
             await asyncio.sleep(self.cfg.transport.poll_s)
 
     async def _cancel_all(self) -> None:

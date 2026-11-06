@@ -7,13 +7,15 @@ halfway through anything leaves objects the other side ignores, and nothing need
 
     adapters/v{N}/...  adapters/v{N}/READY   the learner box publishes each new current version; READY lists every
                                              file with its size and sha256 and is written last
-    current.json                             {version, published_at, learner_alive_at}: which version actors should
-                                             serve, and the learner's pulse (rewritten every poll)
+    current.json                             {version, published_at, learner_alive_at, epoch, fingerprint}: which
+                                             version actors should serve, the learner's pulse (rewritten every
+                                             poll), its process's random epoch, and its games config's hash
     games/{actor}/{game}.tgz  .json          a finished game's folder and, written after it, its manifest (version
                                              pinned, opponent, size, sha256)
     actors/{actor}.json                      an actor's heartbeat, every poll: the version it serves, games in flight
                                              and done, box hours and rate, frontier spend, its last error
-    stop.json                                the learner's (or a human's) signal for actors to drain, upload, power off
+    stop.json                                a final stop of the learner (or a human's) for the epoch in current.json:
+                                             {reason, epoch, drain}; actors drain their games, or cancel them
 
 Every multi-object item has its marker object written last (READY, the game's .json) and readers ignore an item without
 one, so a half-uploaded adapter or game is never loaded or credited; a reader also checks every sha256, so a truncated
@@ -28,10 +30,10 @@ strata centring and critic stay single and global), drops games pinned to a vers
 behind, remembers what it has ingested in ROOT/orchestrator/ingested.json, reads the heartbeats into status.json's
 `actors` block and the budget (every actor's box hours at its rate plus its frontier spend count toward `budget_usd`;
 an actor that went quiet without a final heartbeat is counted for at most `actor_stale_minutes` more), and writes
-stop.json when it stops. The actor side (`ActorSide`, `role = "actor"`) pulls each new version into ROOT/adapters
+stop.json at a final stop (complete, duration, budget, tripwire; not for a crash or a restart). The actor side (`ActorSide`, `role = "actor"`) pulls each new version into ROOT/adapters
 atomically, plays the usual game loop with no learner, credit, inbox or panels, ships every finished game with retries
-and backoff, beats, and stops on a stop.json written after it started, on a stale learner pulse, or on its own budget
-or duration.
+and backoff, beats, and stops on a stop.json of the learner epoch it follows, on a stale learner pulse, on a games config that differs from
+the learner's, or on its own budget or duration. `transport flush` ships what an actor could not, after it has ended.
 
 `python -m agentenv_zeroad.train.transport status|stop --uri URI` reads the prefix or writes stop.json by hand.
 """
@@ -45,13 +47,16 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
@@ -62,6 +67,7 @@ from agentenv_zeroad.train import budget
 from agentenv_zeroad.train.config import TransportConfig
 
 if TYPE_CHECKING:
+    from agentenv_zeroad.train.config import RunConfig
     from agentenv_zeroad.train.orchestrate import Orchestrator
     from agentenv_zeroad.train.spec import GameSpec
 
@@ -71,6 +77,9 @@ CURRENT, STOP, READY = "current.json", "stop.json", "READY"
 S3_TIMEOUT_S = 900.0
 MAX_BUNDLES_PER_PASS = 16  # games ingested per pass: a long backlog must not starve the other passes
 BAD_BUNDLE_TRIES = 3  # downloads that fail their sha256 before a game is rejected for good
+FETCH_TRIES = 5  # fetches of one game that fail on the store before it is given up on
+FLUSH_BACKOFF_S = (10.0, 120.0)
+DUPLICATE_WINDOW_S = 60.0  # heartbeats of two identities this close together came from two live boxes
 SHIP_BACKOFF_S = (5.0, 300.0)  # first retry delay and its cap, doubling
 SHIP_ATTEMPTS = 3  # the final flush's tries per game
 TASK_JOIN_S = 120.0
@@ -81,7 +90,11 @@ class StoreError(Exception):
 
 
 class BundleError(Exception):
-    """An object that arrived but is not what its marker says (a sha256 or size mismatch, an unsafe archive)."""
+    """An object that arrived but is not what its marker says (a sha256 or size mismatch)."""
+
+
+class BadBundle(BundleError):
+    """A bundle that can never be used: an unsafe or empty archive, or one with no results.json. Not retried."""
 
 
 class Store(Protocol):
@@ -274,15 +287,25 @@ def fetch_dir(store: Store, prefix: str, dest: Path) -> None:
 
 @dataclass(frozen=True)
 class Current:
+    """current.json: the version to serve, the learner's pulse, and which learner process wrote it. `epoch` is a
+    random id per learner process: an actor obeys only a stop.json of the epoch it is following, so a stop left by an
+    earlier learner or run is never taken for this one's. `fingerprint` is the games config the learner plays."""
+
     version: int
     published_at: float
     learner_alive_at: float
+    epoch: str = ""
+    started_at: float = 0.0
+    fingerprint: str = ""
 
     @classmethod
     def parse(cls, raw: Any) -> Current | None:
         try:
-            return cls(int(raw["version"]), float(raw["published_at"]), float(raw["learner_alive_at"]))
-        except (KeyError, TypeError, ValueError):
+            return cls(
+                int(raw["version"]), float(raw["published_at"]), float(raw["learner_alive_at"]),
+                str(raw.get("epoch", "")), float(raw.get("started_at", 0)), str(raw.get("fingerprint", "")),
+            )  # fmt: skip
+        except (KeyError, TypeError, ValueError, AttributeError):
             return None
 
 
@@ -313,6 +336,29 @@ class Manifest:
             return None
 
 
+def config_fingerprint(cfg: RunConfig) -> str:
+    """A hash of what decides which games are played: [games], [mix], [held_out] and the seed. An actor whose own does
+    not match the learner's would train it on a different game distribution (or on held-out positions)."""
+    material = {
+        "games": asdict(cfg.games), "mix": cfg.mix.shares(), "held_out": asdict(cfg.held_out), "seed": cfg.seed,
+    }  # fmt: skip
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def held_out_violation(cfg: RunConfig, spec: dict[str, Any]) -> str | None:
+    """Why a played game's spec breaks the held-out exclusions, or None. A key the spec lacks is not a violation."""
+    held = cfg.held_out
+    if spec.get("map") in held.maps:
+        return f"map {spec['map']} is held out"
+    for key in ("seed", "ai_seed"):
+        if isinstance(spec.get(key), int) and held.is_held_seed(spec[key]):
+            return f"{key} {spec[key]} is held out"
+    civs = [s.get("civ") for s in spec.get("seats") or () if isinstance(s, dict) and s.get("civ")]
+    if civs and frozenset(civs) in {frozenset(p) for p in held.civ_pairs}:
+        return f"civ pair {sorted(set(civs))} is held out"
+    return None
+
+
 def opponent_of(spec: GameSpec) -> str:
     for seat in spec.seats:
         if not seat.trainable:
@@ -340,20 +386,45 @@ def unpack_game(archive: Path, game_id: str, dest: Path) -> None:
         for m in members:
             parts = Path(m.name).parts
             if not parts or parts[0] != game_id or ".." in parts or Path(m.name).is_absolute():
-                raise BundleError(f"unsafe path {m.name!r} in the archive of {game_id}")
+                raise BadBundle(f"unsafe path {m.name!r} in the archive of {game_id}")
             if not (m.isfile() or m.isdir()):
-                raise BundleError(f"{m.name!r} in the archive of {game_id} is not a plain file")
+                raise BadBundle(f"{m.name!r} in the archive of {game_id} is not a plain file")
+        if not any(m.isfile() for m in members):
+            raise BadBundle(f"the archive of {game_id} has no files")
         tar.extractall(dest, members=members, filter="data")
+
+
+BULKY_TURN_KEYS = ("prompt_token_ids", "token_ids", "logprobs", "user", "text")
+
+
+def slim_game(folder: Path) -> None:
+    """Shrink an ingested game to the record the report reads: results.json without each turn's prompt, token ids and
+    log-probs (the rows are in the inbox, the bundle in the transport prefix), and nothing else of the folder."""
+    path = folder / "results.json"
+    results = json.loads(path.read_text())
+    for seat in (results.get("seats") or {}).values():
+        for turn in seat.get("turns") or []:
+            for key in BULKY_TURN_KEYS:
+                turn.pop(key, None)
+    tmp = folder / ".results.json.tmp"
+    tmp.write_text(json.dumps(results))
+    os.replace(tmp, path)
+    for entry in folder.iterdir():
+        if entry.name != "results.json":
+            shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
 
 
 class LearnerLink:
     """The learner's blocking calls on the store (the orchestrator runs them in threads)."""
 
-    def __init__(self, store: Store, cfg: TransportConfig, now: Callable[[], float] = time.time):
-        self.store, self.cfg, self.now = store, cfg, now
+    def __init__(self, store: Store, cfg: TransportConfig, now: Callable[[], float] = time.time, fingerprint: str = ""):
+        self.store, self.cfg, self.now, self.fingerprint = store, cfg, now, fingerprint
         self._lock = threading.Lock()
         self.version = 0  # the newest version published (0: the base model, nothing to publish)
         self.published_at = now()
+        self.epoch, self.started_at = uuid.uuid4().hex, now()
+        self._tags: dict[str, str] = {}
+        self._bad_manifests: set[tuple[str, str]] = set()
 
     def start(self) -> None:
         """A new learner process: drop the previous stop signal and continue from the published version."""
@@ -367,7 +438,10 @@ class LearnerLink:
         with self._lock:
             put_json(
                 self.store, CURRENT,
-                {"version": self.version, "published_at": self.published_at, "learner_alive_at": self.now()},
+                {
+                    "version": self.version, "published_at": self.published_at, "learner_alive_at": self.now(),
+                    "epoch": self.epoch, "started_at": self.started_at, "fingerprint": self.fingerprint,
+                },
             )  # fmt: skip
 
     def publish(self, version: int, folder: Path) -> None:
@@ -379,6 +453,19 @@ class LearnerLink:
             self.version, self.published_at = max(self.version, version), self.now()
         self.touch()
 
+    def prune_adapters(self, below: int, keep: set[int]) -> int:
+        """Delete published versions under `below` that are not in `keep`; returns how many versions went."""
+        versions: dict[int, list[str]] = {}
+        for key in self.store.list("adapters"):
+            found = re.match(r"adapters/v(\d+)/", key)
+            if found:
+                versions.setdefault(int(found.group(1)), []).append(key)
+        gone = [v for v in versions if v < below and v not in keep]
+        for v in gone:
+            for key in sorted(versions[v], key=lambda k: k.endswith(f"/{READY}"), reverse=True):
+                self.store.delete(key)  # READY goes last-but-first: an unmarked version is already unusable
+        return len(gone)
+
     def heartbeats(self) -> dict[str, dict[str, Any]]:
         found = {}
         for key in self.store.list("actors"):
@@ -387,24 +474,49 @@ class LearnerLink:
                 found[str(beat["actor_id"])] = beat
         return found
 
-    def new_manifests(self, seen: set[str], limit: int = MAX_BUNDLES_PER_PASS) -> list[Manifest]:
-        """Manifests of games not in `seen`, oldest first; a game with a .tgz but no manifest is not listed."""
-        manifests = []
-        for key in self.store.list("games"):
-            if not key.endswith(".json") or key.count("/") != 2:
+    def new_manifests(
+        self, ingested: dict[str, str], dropped: set[str], limit: int = MAX_BUNDLES_PER_PASS
+    ) -> tuple[list[Manifest], list[Manifest]]:
+        """(games not seen yet, games whose manifest changed after they were ingested). New games are taken round-robin
+        across actors so that one actor's backlog, or a few stuck games, cannot starve the rest. A game with a .tgz but
+        no manifest is not listed; a manifest that does not parse is skipped until it is rewritten."""
+        by_actor: dict[str, list[tuple[str, str]]] = {}
+        changed: list[Manifest] = []
+        for key, tag in sorted(self.store.tags("games").items()):
+            parts = key.split("/")
+            if len(parts) != 3 or not key.endswith(".json"):
                 continue
-            _, actor, name = key.split("/")
-            if f"{actor}/{name.removesuffix('.json')}" in seen:
+            game_key = f"{parts[1]}/{parts[2].removesuffix('.json')}"
+            old, self._tags[game_key] = self._tags.get(game_key), tag
+            if game_key in dropped or (game_key, tag) in self._bad_manifests:
                 continue
-            manifest = Manifest.parse(get_json(self.store, key))
-            if manifest is not None and manifest.key == f"{actor}/{name.removesuffix('.json')}":
-                manifests.append(manifest)
-            if len(manifests) >= limit:
-                break
-        return sorted(manifests, key=lambda m: (m.shipped_at, m.key))
+            if game_key in ingested:
+                if old is not None and old != tag:
+                    manifest = Manifest.parse(get_json(self.store, key))
+                    if manifest is not None and manifest.sha256 != ingested[game_key]:
+                        changed.append(manifest)
+                continue
+            by_actor.setdefault(parts[1], []).append((key, tag))
+        manifests: list[Manifest] = []
+        queues = [list(v) for _, v in sorted(by_actor.items())]
+        while queues and len(manifests) < limit:
+            for queue in list(queues):
+                key, tag = queue.pop(0)
+                manifest = Manifest.parse(get_json(self.store, key))
+                game_key = key.removeprefix("games/").removesuffix(".json")
+                if manifest is None or manifest.key != game_key:
+                    self._bad_manifests.add((game_key, tag))
+                else:
+                    manifests.append(manifest)
+                if not queue:
+                    queues.remove(queue)
+                if len(manifests) >= limit:
+                    break
+        return sorted(manifests, key=lambda m: (m.shipped_at, m.key)), changed
 
     def fetch_game(self, manifest: Manifest, remote_root: Path) -> Path:
-        """Download, check and unpack a game into REMOTE_ROOT/ACTOR/GAME. BundleError on a sha256 or size mismatch."""
+        """Download, check and unpack a game into REMOTE_ROOT/ACTOR/GAME. BundleError on a sha256 or size mismatch,
+        BadBundle on one that can never be used."""
         final = remote_root / manifest.actor_id / manifest.game_id
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "game.tgz"
@@ -413,13 +525,18 @@ class LearnerLink:
                 raise BundleError(f"{manifest.key}: the archive does not match its manifest")
             staging = Path(tmp) / "unpacked"
             unpack_game(archive, manifest.game_id, staging)
+            if not (staging / manifest.game_id / "results.json").is_file():
+                raise BadBundle(f"{manifest.key}: the archive has no results.json")
             final.parent.mkdir(parents=True, exist_ok=True)
             shutil.rmtree(final, ignore_errors=True)
             shutil.move(str(staging / manifest.game_id), str(final))
         return final
 
-    def write_stop(self, reason: str, by: str = "learner") -> None:
-        put_json(self.store, STOP, {"reason": reason, "by": by, "time": self.now()})
+    def write_stop(self, reason: str, *, drain: bool, by: str = "learner") -> None:
+        put_json(
+            self.store, STOP,
+            {"reason": reason, "by": by, "time": self.now(), "epoch": self.epoch, "drain": drain},
+        )  # fmt: skip
 
 
 class ActorLink:
@@ -434,6 +551,14 @@ class ActorLink:
     def stop(self) -> dict[str, Any] | None:
         raw = get_json(self.store, STOP)
         return raw if isinstance(raw, dict) else None
+
+    def shipped_ids(self, actor_id: str) -> list[str]:
+        """The ids of the games this actor id has shipped, whoever shipped them."""
+        return [
+            k.rsplit("/", 1)[1].removesuffix(".json")
+            for k in self.store.list(f"games/{actor_id}")
+            if k.endswith(".json")
+        ]
 
     def pull_adapter(self, version: int, adapters: Path) -> bool:
         """Download v{version} into a hidden folder of ROOT/adapters and rename it into place: a `v{N}` there is always
@@ -457,6 +582,10 @@ class ActorLink:
     def heartbeat(self, actor_id: str, payload: dict[str, Any]) -> None:
         put_json(self.store, f"actors/{actor_id}.json", {"actor_id": actor_id, **payload})
 
+    def read_heartbeat(self, actor_id: str) -> dict[str, Any]:
+        beat = get_json(self.store, f"actors/{actor_id}.json")
+        return beat if isinstance(beat, dict) else {}
+
     def ship(self, actor_id: str, folder: Path, version: int, opponent: str) -> None:
         """Upload the game folder as a .tgz, then its manifest (the marker) last."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,6 +596,58 @@ class ActorLink:
             )
             self.store.put(f"games/{manifest.key}.tgz", archive)
         put_json(self.store, f"games/{manifest.key}.json", asdict(manifest))
+
+
+def flush_queue(
+    link: ActorLink,
+    root: Path,
+    actor_id: str,
+    *,
+    timeout_s: float,
+    keep_local: bool,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Ship every game in ROOT/orchestrator/ship.json's queue, retrying with backoff until it is empty or `timeout_s`
+    has passed, then send the actor's final heartbeat saying what is left. Returns how many games are unshipped. This
+    is what an actor box does after its orchestrator has ended (`transport flush`), so a network that was down at the
+    end of the run does not cost the games."""
+    path = root / "orchestrator" / "ship.json"
+    try:
+        saved = json.loads(path.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    queue: dict[str, dict[str, Any]] = dict(saved.get("queue", {}))
+    shipped: list[str] = list(saved.get("shipped", ()))
+    errors: list[str] = []
+    deadline, delay = now() + timeout_s, FLUSH_BACKOFF_S[0]
+    while queue:
+        for game_id in list(queue):
+            folder = root / "games" / game_id
+            try:
+                if not (folder / "results.json").is_file():
+                    raise FileNotFoundError(f"{folder}/results.json")
+                link.ship(actor_id, folder, queue[game_id]["version"], queue[game_id]["opponent"])
+            except (StoreError, OSError) as e:
+                errors.append(f"shipping {game_id}: {e}")
+                log.error("shipping %s failed: %s", game_id, e)
+                continue
+            del queue[game_id]
+            shipped.append(game_id)
+            if not keep_local:
+                shutil.rmtree(folder, ignore_errors=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"queue": queue, "shipped": sorted(set(shipped))}))
+        if not queue or now() + delay > deadline:
+            break
+        sleep(delay)
+        delay = min(FLUSH_BACKOFF_S[1], delay * 2)
+    beat = link.read_heartbeat(actor_id)
+    link.heartbeat(
+        actor_id,
+        {**beat, "time": now(), "final": True, "unshipped": len(queue), "last_error": errors[-1] if errors else None},
+    )
+    return len(queue)
 
 
 Task = Callable[[], Awaitable[None]]
@@ -510,22 +691,46 @@ class _Side:
             await asyncio.wait(tasks, timeout=TASK_JOIN_S)
 
 
+STOPS_FOR_ACTORS = ("complete", "duration")  # the learner ending of its own accord: actors drain their games first
+STOP_PREFIXES = ("budget:", "tripwire:")  # final too, but nothing will ingest what an actor would drain
+
+
 class LearnerSide(_Side):
     def __init__(self, host: Orchestrator, link: LearnerLink):
         super().__init__(host)
         self.link, self.cfg = link, host.cfg.transport
         self.remote = host.root / "remote"
         saved = host._read("ingested.json") or {}
-        self.ingested: set[str] = set(saved.get("ingested", ()))
+        listed = saved.get("ingested", {})
+        self.ingested: dict[str, str] = dict(listed) if isinstance(listed, dict) else {k: "" for k in listed}
         self.dropped: dict[str, str] = dict(saved.get("dropped", {}))
         self.beats: dict[str, dict[str, Any]] = {}
-        self._bad: Counter[str] = Counter()
+        self._fails: Counter[str] = Counter()
+        self._to_slim: list[Path] = []
+        self._idents: dict[str, tuple[Any, float]] = {}
+        self._dup: dict[str, float] = {}
+        self._resolve_intent()
 
     def _passes(self) -> dict[str, Task]:
         return {"publish": self.publish_pass, "live": self.liveness_pass, "ingest": self.ingest_pass}
 
     def start(self) -> None:
         self.link.start()
+
+    def _credited(self, game_id: str) -> bool:
+        inbox = self.host.root / "inbox"
+        return (inbox / f"{game_id}.jsonl").exists() or (inbox / "consumed" / f"{game_id}.jsonl").exists()
+
+    def _resolve_intent(self) -> None:
+        """A crash between writing a game's rows and recording it left an intent: rows in the inbox (or already taken
+        by the learner into consumed/) mean it was credited; otherwise it is ingested again."""
+        intent = self.host._read("intent.json")
+        if not intent:
+            return
+        if self._credited(intent["game_id"]):
+            self.ingested[intent["key"]] = intent.get("sha256", "")
+            self._save()
+        (self.host.odir / "intent.json").unlink(missing_ok=True)
 
     async def publish_pass(self) -> None:
         version = self.host.current
@@ -535,17 +740,34 @@ class LearnerSide(_Side):
         await asyncio.to_thread(self.link.publish, version, folder)
         self.host.counts["published"] += 1
         log.info("published adapter v%d to the transport", version)
+        keep = self.host.keep_adapters()
+        gone = await asyncio.to_thread(self.link.prune_adapters, version - self.cfg.max_version_lag - 2, keep)
+        self.host.counts["transport_pruned"] += gone
 
     async def liveness_pass(self) -> None:
         await asyncio.to_thread(self.link.touch)
         self.beats = await asyncio.to_thread(self.link.heartbeats)
         now = self.host.now()
         for actor, beat in self.beats.items():
+            self._check_identity(actor, beat, now)
             stale = self._stale(beat, now)
+            minutes = self._age(beat, now) / 60
             self.host.alarm(
-                f"actor:{actor}",
-                f"actor {actor} has not reported for {self._age(beat, now) / 60:.0f} min" if stale else None,
+                f"actor:{actor}", f"actor {actor} has not reported for {minutes:.0f} min" if stale else None
             )
+            dup = actor in self._dup and now - self._dup[actor] < self.cfg.actor_stale_minutes * 60
+            self.host.alarm(f"duplicate:{actor}", f"two boxes are heartbeating as actor {actor}" if dup else None)
+
+    def _check_identity(self, actor: str, beat: dict[str, Any], now: float) -> None:
+        """Two live boxes with one actor_id overwrite one heartbeat, so the identity in it flips between polls. A
+        replacement of a dead box is a change too, but minutes after the old one's last beat, not seconds."""
+        ident = (beat.get("instance_id"), beat.get("process_start"))
+        when = float(beat.get("time", 0))
+        before = self._idents.get(actor)
+        if before and before[0] != ident and abs(when - before[1]) < DUPLICATE_WINDOW_S:
+            self._dup[actor] = now
+            log.error("actor %s is being heartbeated by two boxes (%s and %s)", actor, before[0], ident)
+        self._idents[actor] = (ident, when)
 
     def _age(self, beat: dict[str, Any], now: float) -> float:
         return max(0.0, now - float(beat.get("time", 0)))
@@ -554,7 +776,14 @@ class LearnerSide(_Side):
         return not beat.get("final") and self._age(beat, now) > self.cfg.actor_stale_minutes * 60
 
     async def ingest_pass(self) -> None:
-        manifests = await asyncio.to_thread(self.link.new_manifests, self.ingested | set(self.dropped))
+        if self.host.disk_paused:
+            return
+        manifests, changed = await asyncio.to_thread(self.link.new_manifests, self.ingested, set(self.dropped))
+        for manifest in changed:
+            self.host.counts["remote_conflict"] += 1
+            message = f"{manifest.key} was shipped again with different contents; the first copy stands"
+            self.host.alarm(f"conflict:{manifest.key}", message)
+            log.error(message)
         for manifest in manifests:
             if self.closing or self.host.stop_reason is not None:
                 return
@@ -564,6 +793,14 @@ class LearnerSide(_Side):
         self.dropped[manifest.key] = reason
         self.host.counts[f"remote_{reason}"] += 1
         self._save()
+        shutil.rmtree(self.remote / manifest.actor_id / manifest.game_id, ignore_errors=True)
+
+    def _fail(self, manifest: Manifest, reason: str, cap: int) -> None:
+        """A fetch that failed: tried again at the next pass until `cap` failures, then dropped with `reason`."""
+        self._fails[manifest.key] += 1
+        self.host.counts["transport_error_fetch"] += 1
+        if self._fails[manifest.key] >= cap:
+            self._drop(manifest, reason)
 
     async def _ingest(self, manifest: Manifest) -> None:
         host = self.host
@@ -571,38 +808,67 @@ class LearnerSide(_Side):
             self._drop(manifest, "stale")
             log.info("dropped %s: pinned v%d, current is v%d", manifest.key, manifest.version, host.current)
             return
-        if (host.root / "inbox" / f"{manifest.game_id}.jsonl").exists():
-            self.ingested.add(manifest.key)  # a crash between crediting and recording: it was credited
+        if self._credited(manifest.game_id):
+            self.ingested[manifest.key] = manifest.sha256  # a crash after crediting, before it was recorded
             self._save()
             return
         try:
             folder = await asyncio.to_thread(self.link.fetch_game, manifest, self.remote)
             results = json.loads(await asyncio.to_thread((folder / "results.json").read_text))
-        except BundleError as e:
-            self._bad[manifest.key] += 1
-            log.error("%s (try %d of %d)", e, self._bad[manifest.key], BAD_BUNDLE_TRIES)
-            if self._bad[manifest.key] >= BAD_BUNDLE_TRIES:
-                self._drop(manifest, "rejected")
+        except BadBundle as e:
+            log.error("%s: rejected", e)
+            self._drop(manifest, "rejected")
             return
-        except (StoreError, FileNotFoundError):
-            host.counts["transport_error_fetch"] += 1
-            log.exception("fetching %s failed", manifest.key)
+        except BundleError as e:
+            log.error("%s (try %d of %d)", e, self._fails[manifest.key] + 1, BAD_BUNDLE_TRIES)
+            self._fail(manifest, "rejected", BAD_BUNDLE_TRIES)
+            return
+        except (StoreError, FileNotFoundError) as e:
+            log.error("fetching %s failed: %s", manifest.key, e)
+            self._fail(manifest, "unfetchable", FETCH_TRIES)
             return
         except (OSError, ValueError) as e:
             log.error("%s has no usable results.json: %s", manifest.key, e)
             self._drop(manifest, "rejected")
             return
+        violation = held_out_violation(host.cfg, results.get("spec") or {})
+        if violation:
+            log.error("dropped %s: %s (the actor's config differs from the learner's)", manifest.key, violation)
+            self._drop(manifest, "config")
+            return
         host._observe_supply(manifest.game_id, results)
+        host._write("intent.json", {"key": manifest.key, "game_id": manifest.game_id, "sha256": manifest.sha256})
         rows, error = await host._credit_id(manifest.game_id, results)
         host.counts["remote_failed" if error else "remote_credited"] += 1
-        self.ingested.add(manifest.key)
+        self.ingested[manifest.key] = manifest.sha256
         self._save()
-        log.info(
-            "credited %s from %s: %d rows%s", manifest.game_id, manifest.actor_id, rows, f" ({error})" if error else ""
-        )
+        (host.odir / "intent.json").unlink(missing_ok=True)
+        self._shrink(folder)
+        suffix = f" ({error})" if error else ""
+        log.info("credited %s from %s: %d rows%s", manifest.game_id, manifest.actor_id, rows, suffix)
+
+    def _shrink(self, folder: Path) -> None:
+        """Rows are in the inbox: keep only the slim record the report reads. When the run syncs to S3 that waits for a
+        sync that took the folder."""
+        if self.host.cfg.s3_uri is None:
+            slim_game(folder)
+        else:
+            self._to_slim.append(folder)
+
+    def sweep_remote(self, synced_start: float | None) -> None:
+        """After a successful sync: slim the folders it took (the ones not changed since it started)."""
+        if synced_start is None:
+            return
+        kept = []
+        for folder in self._to_slim:
+            if folder.is_dir() and folder.stat().st_mtime > synced_start:
+                kept.append(folder)
+            elif folder.is_dir():
+                slim_game(folder)
+        self._to_slim = kept
 
     def _save(self) -> None:
-        self.host._write("ingested.json", {"ingested": sorted(self.ingested), "dropped": self.dropped})
+        self.host._write("ingested.json", {"ingested": self.ingested, "dropped": self.dropped})
 
     def spend_extra(self, now: float) -> tuple[float, float]:
         """(box dollars, frontier dollars) of every actor from its last heartbeat. One that went quiet without a final
@@ -629,27 +895,51 @@ class LearnerSide(_Side):
                 "lag": self.host.current - version,
                 "in_flight": beat.get("in_flight", 0),
                 "games_done": beat.get("games_done", 0),
+                "unshipped": beat.get("unshipped", 0),
                 "games_per_h": round(beat.get("games_done", 0) / hours, 1) if hours > 0.01 else None,
                 "box_hours": beat.get("box_hours", 0),
                 "box_usd": round(float(beat.get("box_hours", 0)) * float(beat.get("box_usd_per_hour", 0)), 2),
                 "frontier_usd": beat.get("model_usd", 0),
+                "instance_id": beat.get("instance_id"),
                 "last_error": beat.get("last_error"),
             }
         return {
             "published": self.link.version,
+            "epoch": self.link.epoch,
             "ingested": len(self.ingested),
             "dropped": dict(Counter(self.dropped.values())),
             "members": members,
         }
 
     async def close(self, reason: str) -> None:
-        """Write stop.json (the actors drain, upload and power off), then let the passes in flight end."""
+        """At a final stop, write stop.json (epoch-stamped; `drain` says whether the actors play their games out). A
+        crash, SIGTERM or systemd stop writes none: the learner may be back, and actors stop on its stale pulse if it
+        is not. On a draining stop, keep ingesting until every actor has sent its last heartbeat."""
+        final = reason in STOPS_FOR_ACTORS or reason.startswith(STOP_PREFIXES)
+        if final:
+            drain = reason in STOPS_FOR_ACTORS
+            try:
+                await asyncio.to_thread(self.link.write_stop, reason, drain=drain)
+            except Exception:  # noqa: BLE001 - the stop still goes on; the actors stop on the pulse that ends
+                log.exception("writing stop.json failed")
+            if drain:
+                await self._ingest_while_draining()
         self.closing = True
-        try:
-            await asyncio.to_thread(self.link.write_stop, reason)
-        except Exception:  # noqa: BLE001 - the stop still goes on; the actors stop on the pulse that ends
-            log.exception("writing stop.json failed")
         await self.join()
+
+    def _actors_done(self, now: float) -> bool:
+        return all(b.get("final") or self._stale(b, now) for b in self.beats.values())
+
+    async def _ingest_while_draining(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.host.cfg.drain_timeout_s
+        while loop.time() < deadline:
+            await self._guard("live", self.liveness_pass)
+            await self._guard("ingest", self.ingest_pass)
+            if self._actors_done(self.host.now()):
+                break
+            await asyncio.sleep(self.cfg.poll_s)
+        await self._guard("ingest", self.ingest_pass)
 
 
 class ActorSide(_Side):
@@ -657,9 +947,14 @@ class ActorSide(_Side):
         super().__init__(host)
         self.link, self.cfg, self.actor_id = link, host.cfg.transport, host.cfg.transport.actor_id
         self.started = host.now()
-        self.ready = False  # the learner's current.json has been read: games start only then
+        self.instance_id = os.environ.get("ZEROAD_INSTANCE_ID") or socket.gethostname()
+        self.fingerprint = config_fingerprint(host.cfg)
+        self.seen = False  # the learner's current.json has been read
+        self.mismatch: str | None = None
+        self.epoch: str | None = None
         self.learner_version = 0
         self.learner_alive_at: float | None = None
+        self.pull_failures = 0
         self.last_error: str | None = None
         saved = host._read("ship.json") or {}
         self.queue: dict[str, dict[str, Any]] = dict(saved.get("queue", {}))
@@ -669,48 +964,89 @@ class ActorSide(_Side):
         self._ship_lock = asyncio.Lock()
 
     def _passes(self) -> dict[str, Task]:
-        return {"poll": self.poll_pass, "pull": self.pull_pass, "ship": self.ship_pass, "beat": self.beat_pass}
+        return {"poll": self.poll_pass, "ship": self.ship_pass, "beat": self.beat_pass}
+
+    @property
+    def ready(self) -> bool:
+        """Whether games may start: the learner has been read, the games config matches, and this box holds the
+        learner's current version. Only an adapter that keeps failing to download lets it play on an older one, and
+        then only within max_version_lag."""
+        if not self.seen or self.mismatch:
+            return False
+        behind = self.learner_version - self.host.current
+        return behind <= 0 or (self.pull_failures >= 3 and behind <= self.cfg.max_version_lag)
 
     def start(self) -> None:
-        pass
+        """A replacement actor with this id, on a fresh disk, must not reuse the game ids (the learner has them
+        already and would skip the new games) or replay the earlier stream: move past the highest shipped id and
+        reseed the stream with it. A restart on the same disk has factory.json and continues where it was."""
+        prefix = re.compile(rf"^{re.escape(self.host.cfg.game_prefix)}-g(\d+)$")
+        found = [int(m.group(1)) for m in map(prefix.match, self.link.shipped_ids(self.actor_id)) if m]
+        if found and self.host._read("factory.json") is None:
+            self.host.factory.reseed(max(found) + 1)
+        if found:
+            self.host.factory.index = max(self.host.factory.index, max(found) + 1)
 
     async def poll_pass(self) -> None:
         host, now = self.host, self.host.now()
+        current = stop = None
+        errors = []
         try:
             current = await asyncio.to_thread(self.link.current)
+        except StoreError as e:
+            errors.append(f"current.json: {e}")
+        try:
             stop = await asyncio.to_thread(self.link.stop)
         except StoreError as e:
-            self.last_error = f"transport: {e}"
+            errors.append(f"stop.json: {e}")
+        if errors:
+            self.last_error = "transport: " + "; ".join(errors)
             host.counts["transport_error_poll"] += 1
-            log.error("reading the transport failed: %s", e)
-            current, stop = None, None
-        else:
+            log.error("reading the transport failed: %s", self.last_error)
+        elif not self.mismatch:
             self.last_error = None
         if current is not None:
-            self.ready, self.learner_version, self.learner_alive_at = True, current.version, current.learner_alive_at
-        if stop is not None and float(stop.get("time", 0)) >= self.started:
-            host.request_stop(f"transport: stop requested by {stop.get('by', '?')}: {stop.get('reason', '')}")
+            self._follow(current)
+        if stop is not None and self.epoch is not None and stop.get("epoch") == self.epoch:
+            word = "transport-drain" if stop.get("drain") else "transport"
+            host.request_stop(f"{word}: stop requested by {stop.get('by', '?')}: {stop.get('reason', '')}")
         elif self.learner_alive_at is not None and now - self.learner_alive_at > self.cfg.learner_stale_minutes * 60:
             host.request_stop(f"transport: the learner's pulse is {(now - self.learner_alive_at) / 60:.0f} min old")
         elif self.learner_alive_at is None and now - self.started > self.cfg.learner_stale_minutes * 60:
             host.request_stop("transport: no learner has published a pulse")
+        if host.stop_reason is None and self.seen and not self.mismatch:
+            await self.pull_pass()
+
+    def _follow(self, current: Current) -> None:
+        self.seen, self.learner_version = True, current.version
+        self.learner_alive_at, self.epoch = current.learner_alive_at, current.epoch
+        if current.fingerprint and current.fingerprint != self.fingerprint and not self.mismatch:
+            self.mismatch = (
+                f"this actor's [games], [mix], [held_out] or seed differ from the learner's "
+                f"(fingerprint {self.fingerprint}, the learner's {current.fingerprint})"
+            )
+            self.last_error = f"config mismatch: {self.mismatch}"
+            log.error("config mismatch: %s", self.mismatch)
+            self.host.request_stop(f"transport: config mismatch: {self.mismatch}")
 
     async def pull_pass(self) -> None:
         host = self.host
         have = host.adapters.on_disk()
-        if not self.ready or self.learner_version <= (have[-1] if have else 0):
+        if self.learner_version <= (have[-1] if have else 0):
             return
         try:
             got = await asyncio.to_thread(self.link.pull_adapter, self.learner_version, host.adapters.dir)
         except (StoreError, BundleError, OSError) as e:
-            self.last_error = f"adapter v{self.learner_version}: {e}"
-            host.counts["transport_error_pull"] += 1
+            got, self.last_error = False, f"adapter v{self.learner_version}: {e}"
             log.error("pulling adapter v%d failed: %s", self.learner_version, e)
-            return
         if got:
+            self.pull_failures = 0
             host.counts["pulled"] += 1
             host._wake.set()
             log.info("pulled adapter v%d", self.learner_version)
+        else:
+            self.pull_failures += 1
+            host.counts["transport_error_pull"] += 1
 
     def enqueue(self, game_id: str, spec: GameSpec) -> None:
         self.queue[game_id] = {"version": pinned_version(spec), "opponent": opponent_of(spec)}
@@ -754,7 +1090,8 @@ class ActorSide(_Side):
         return True
 
     async def flush(self) -> int:
-        """The final upload: every queued game, retried, ignoring the backoff. Returns how many are still unshipped."""
+        """The orchestrator's own final upload: every queued game, retried, ignoring the backoff. Returns how many are
+        still unshipped (`transport flush` takes those over)."""
         for attempt in range(SHIP_ATTEMPTS):
             await self.ship_pass(force=True)
             if not self.queue or attempt == SHIP_ATTEMPTS - 1:
@@ -774,27 +1111,30 @@ class ActorSide(_Side):
             "run_hours": round(host.clock.hours(now), 4), "box_hours": round(spent.box_hours, 4),
             "box_usd_per_hour": host.cfg.box_usd_per_hour, "model_usd": round(spent.model_usd, 4),
             "last_error": self.last_error or next(iter(host.alarms.values()), None),
-            "stop_reason": host.stop_reason, "final": final,
+            "stop_reason": host.stop_reason, "final": final, "instance_id": self.instance_id,
+            "process_start": self.started, "fingerprint": self.fingerprint,
         }  # fmt: skip
         await asyncio.to_thread(self.link.heartbeat, self.actor_id, payload)
 
     async def close(self, reason: str) -> None:
-        """After the games have drained or been cancelled: ship what is left, then the final heartbeat."""
+        """After the games have drained or been cancelled: ship what is left. The final heartbeat goes out only when
+        nothing is left; otherwise it is an ordinary one saying how much is, and `transport flush` (which actor-run.sh
+        runs next) sends the final one after its own retries."""
         self.closing = True
         await self.join()
         left = await self.flush()
         if left:
-            log.error("%d games could not be shipped and stay on this box's disk", left)
+            log.error("%d games could not be shipped yet", left)
             self.host.alarm("unshipped", f"{left} finished games could not be uploaded; the box stays up")
         with contextlib.suppress(Exception):
-            await self.beat_pass(final=True)
+            await self.beat_pass(final=not left)
 
 
 def build_side(host: Orchestrator, store: Store) -> LearnerSide | ActorSide:
     cfg = host.cfg.transport
     if cfg.actor:
         return ActorSide(host, ActorLink(store, cfg, host.now))
-    return LearnerSide(host, LearnerLink(store, cfg, host.now))
+    return LearnerSide(host, LearnerLink(store, cfg, host.now, config_fingerprint(host.cfg)))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -804,17 +1144,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, text in (
         ("status", "print current.json, stop.json and every actor's heartbeat"),
-        ("stop", "write stop.json"),
+        ("stop", "write stop.json for the learner epoch now running"),
     ):
         p = sub.add_parser(name, help=text)
         p.add_argument("--uri", required=True, help="the run's transport URI ([transport] uri)")
         if name == "stop":
             p.add_argument("--reason", default="stopped by hand")
+            p.add_argument("--drain", action="store_true", help="let the actors play their games out first")
+    flush = sub.add_parser("flush", help="ship an actor's unshipped games, retrying, then send its final heartbeat")
+    flush.add_argument("--config", type=Path, required=True, help="the actor's config")
+    flush.add_argument("--timeout-minutes", type=float, default=30.0)
     args = parser.parse_args(argv)
+    if args.cmd == "flush":
+        from agentenv_zeroad.train.config import load_config
+
+        cfg = load_config(args.config)
+        if not cfg.transport.actor:
+            print("not an actor's config", file=sys.stderr)
+            return 2
+        link = ActorLink(open_store(cfg.transport.uri), cfg.transport)
+        left = flush_queue(
+            link,
+            cfg.root,
+            cfg.transport.actor_id,
+            timeout_s=args.timeout_minutes * 60,
+            keep_local=cfg.s3_uri is not None,
+        )
+        print(f"{left} games left unshipped in {cfg.root}/games" if left else "every game is shipped")
+        return 1 if left else 0
     store = open_store(args.uri)
     if args.cmd == "stop":
-        put_json(store, STOP, {"reason": args.reason, "by": "human", "time": time.time()})
-        print("stop.json written: the actors drain, upload and power off")
+        current = Current.parse(get_json(store, CURRENT))
+        put_json(
+            store, STOP,
+            {"reason": args.reason, "by": "human", "time": time.time(), "epoch": current.epoch if current else "",
+             "drain": args.drain},
+        )  # fmt: skip
+        print("stop.json written: the actors " + ("drain, upload and power off" if args.drain else "stop now"))
         return 0
     now = time.time()
     print("current:", json.dumps(get_json(store, CURRENT)))

@@ -81,6 +81,12 @@ class GameFactory:
             score_rule=g.score_rule,
         )
 
+    def reseed(self, nonce: int) -> None:
+        """A different stream from the same config: an actor that replaces another with its id must not replay the
+        specs the first one played."""
+        self.rng = random.Random(f"{self.cfg.stream_seed}:{nonce}")
+        self._opponents, self._uncapped = [], []
+
     def _draw_opponent(self) -> str:
         if not self._opponents:
             self._opponents = deal(self.cfg.mix.shares(), BLOCK)

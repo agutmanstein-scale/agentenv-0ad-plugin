@@ -594,7 +594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"TRAIN_FRONTIER={int(bool(frontier))}\nTRAIN_ENGINES={cfg.engines}\nTRAIN_CONCURRENCY={cfg.concurrency}\n"
         f"TRAIN_ENGINE_IMAGE={shlex.quote(cfg.engine_image)}\n"
         f"TRAIN_ENGINE_PATCHES={shlex.quote(' '.join(cfg.engine_patches))}\n"
-        f"TRAIN_TRANSPORT_ROLE={cfg.transport.role if cfg.transport.enabled else 'none'}"
+        f"TRAIN_TRANSPORT_ROLE={cfg.transport.role if cfg.transport.enabled else 'none'}\n"
+        f"TRAIN_ACTOR_ID={shlex.quote(cfg.transport.actor_id if cfg.transport.actor else '')}\n"
+        f"TRAIN_SHUTDOWN={int(cfg.shutdown)}\n"
+        f"TRAIN_SERVER_URLS={shlex.quote(' '.join(cfg.servers.urls))}"
     )
     return 0
 
