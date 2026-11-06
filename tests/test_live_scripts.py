@@ -359,6 +359,30 @@ def test_put_secret_sends_the_value_in_a_json_body_on_stdin_never_on_a_command_l
     assert SECRET not in out.stdout + out.stderr
 
 
+def test_put_secret_stores_a_value_piped_in_without_a_trailing_newline(stubs):
+    rules = [["put-parameter", "1\n", 0]]
+    out = run(
+        stubs, "put-secret.sh", "litellm-key", "--yes", stdin=SECRET, extra={"STUB_AWS_RULES": json.dumps(rules)}
+    )  # printf %s "$KEY" | live/put-secret.sh litellm-key --yes
+    assert out.returncode == 0, out.stderr
+    [put] = [c for c in aws_calls(stubs) if c["argv"][:2] == ["ssm", "put-parameter"]]
+    assert json.loads(put["stdin"])["Value"] == SECRET
+    assert "stored /zeroad-live/litellm-key" in out.stderr and SECRET not in out.stdout + out.stderr
+
+
+def test_put_secret_says_why_when_there_is_no_value_or_aws_fails(stubs):
+    out = run(stubs, "put-secret.sh", "litellm-key", "--yes", stdin="")
+    assert out.returncode != 0 and "no value on stdin; nothing stored" in out.stderr and not stubs["log"].exists()
+    out = run(stubs, "put-secret.sh", "litellm-key", "--yes", stdin="\n")
+    assert out.returncode != 0 and "empty value; nothing stored" in out.stderr
+    failing = [["put-parameter", "", 255]]
+    out = run(
+        stubs, "put-secret.sh", "litellm-key", "--yes", stdin=SECRET, extra={"STUB_AWS_RULES": json.dumps(failing)}
+    )
+    assert out.returncode != 0 and "aws ssm put-parameter failed for /zeroad-live/litellm-key" in out.stderr
+    assert "nothing stored" in out.stderr and SECRET not in out.stdout + out.stderr
+
+
 def test_put_secret_refuses_an_rtmp_server_that_is_not_an_rtmp_url_and_the_wrong_account(stubs):
     out = run(stubs, "put-secret.sh", "rtmp-server", "--yes", stdin="https://x.example\n")
     assert out.returncode != 0 and "nothing stored" in out.stderr and not stubs["log"].exists()
@@ -2073,7 +2097,22 @@ def test_the_learner_only_modes_start_the_learner_in_sft_or_probe_mode_and_no_or
     ]
     assert "--probe /x/train/s2/e1/probe-rows.jsonl" in learner and "--sft" not in learner
     assert "orchestrate run" not in out.stdout and "probe.json" in out.stdout
+    out = run_box(
+        stubs, "train-run.sh", str(S2_DIR / "baselines.toml"), "--stats-only", "/x/train/s2/baselines/rows.jsonl",
+        DRY_RUN="1",
+    )  # fmt: skip
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--stats-only /x/train/s2/baselines/rows.jsonl" in learner and "--sft" not in learner
+    assert "--probe" not in learner and "orchestrate run" not in out.stdout and "baseline.json" in out.stdout
     for bad in (
+        ("--stats-only", "/x/y", "--probe", "/x/z"),
+        ("--stats-only", "/x/y", "--sft", "2"),
+        ("--stats-only", "/x/y", "--play-only"),
+        ("--stats-only", "/x/y", "--init", "/x/a"),
+        ("--stats-only", "/x/y", "--baseline", "/x/b"),
+        ("--stats-only", "bad path"),
         ("--sft", "2", "--probe", "/x/y"),
         ("--sft", "2", "--play-only"),
         ("--sft", "0"),

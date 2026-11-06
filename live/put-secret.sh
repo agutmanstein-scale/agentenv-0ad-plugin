@@ -18,14 +18,19 @@ if [ "$DRY_RUN" = 1 ]; then
   plan "aws ssm put-parameter --cli-input-json file://<private temp file>   ({Name: $NAME, Type: SecureString, Overwrite: true, Value: <read>})"
   exit 0
 fi
-read -rsp "value for $NAME: " v; echo >&2
+# read returns 1 at EOF, and so for a value piped in without a trailing newline (printf %s "$KEY" | ...): it still
+# fills v, which is then used. Only a read that got nothing at all is a failure.
+v=
+read -rsp "value for $NAME: " v || [ -n "$v" ] || die "no value on stdin; nothing stored"
+echo >&2
 [ -n "$v" ] || die "empty value; nothing stored"
 [ "$1" != rtmp-server ] || [[ $v =~ ^rtmps?:// ]] || die "rtmp-server must be an rtmp:// or rtmps:// URL; nothing stored"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 (umask 077; printf '%s' "$v" | python3 -c '
 import json, sys
 print(json.dumps({"Name": sys.argv[1], "Type": "SecureString", "Overwrite": True, "Value": sys.stdin.read()}))
-' "$NAME" > "$tmp/body.json")
+' "$NAME" > "$tmp/body.json") || die "could not write the request body for $NAME; nothing stored"
 unset v
-aws_run "" ssm put-parameter --cli-input-json "file://$tmp/body.json" --query Version --output text >/dev/null
+aws_run "" ssm put-parameter --cli-input-json "file://$tmp/body.json" --query Version --output text >/dev/null \
+  || die "aws ssm put-parameter failed for $NAME (sso login expired? VPN?); nothing stored"
 log "stored $NAME"

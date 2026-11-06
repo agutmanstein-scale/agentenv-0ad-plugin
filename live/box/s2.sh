@@ -99,7 +99,7 @@ case $CMD in
     echo "--- progress"; tail -n "$N" "$S2/progress.log" 2>/dev/null || true
     step=$(jq -r '.step // empty' "$S2/status.json" 2>/dev/null || true)
     case $step in
-      e1) dir=e1 ;; e2) dir=e2 ;; baselines|calibration|labels) dir=baselines ;; sft|sft_panels|init) dir=sft ;; run1) dir=run1 ;; *) dir= ;;
+      e1) dir=e1 ;; e2) dir=e2 ;; baselines|calibration|tripwire|labels) dir=baselines ;; sft|sft_panels|init) dir=sft ;; run1) dir=run1 ;; *) dir= ;;
     esac
     if [ -n "$dir" ]; then
       echo "--- $dir orchestrator"; jq -c '{run_hours, spend, current, counts, panels, briefs, alarms, stop_reason}' "$S2/$dir/orchestrator/status.json" 2>/dev/null || echo "(none)"

@@ -1,6 +1,8 @@
 # Each SFT epoch's adapter plays the first `panel_games` of the held-out panel (play-only, panels only). The sequence
 # appends one [[panels]] table per epoch, named sft-epoch1, sft-epoch2 ..., pinned to that epoch's adapter version, and
-# writes the result to ROOT/generated/sft-panels.toml. Same root as sft.toml, so the epochs and the panels are read together.
+# writes the result to ROOT/generated/sft-panels.toml. Then the chosen epoch plays the remaining held-out configs as a
+# panel named sft-rest (`start` = panel_games), from ROOT/generated/sft-rest.toml: this file plus that one panel. Same
+# root as sft.toml, so the epochs and the panels are read together. duration_hours bounds each of the two runs.
 panels_only = true
 stop_when_done = true
 run_id = "s2-sft-panels"

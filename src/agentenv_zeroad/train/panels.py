@@ -5,8 +5,9 @@ mix (`opponents`, Petra levels, the scripted bot, the frozen base model), every 
 held-out maps, civ pairs and seeds (`positions = "training"` draws from the training ones instead, which a short control
 arm that must resemble a training run uses). The opponent of game `j` is dealt by running apportionment, so any prefix
 of the panel is balanced across the mix, and the position of game `j` depends only on `j` and the run's seed, never on
-the panel's size or its opponents: a 48-game v1 subset, a 192-game SFT-epoch panel and the 384-game panel see the same
-maps, seeds and civ pairs in the same order (and the frozen policy seat takes the side `j` alternates it to).
+the panel's size or its opponents (`start` offsets the index): a 48-game v1 subset, a 192-game SFT-epoch panel and the
+384-game panel see the same maps, seeds and civ pairs in the same order (and the frozen policy seat takes the side `j`
+alternates it to).
 
 `frontier`: each teacher in the panel plays the policy seat for its own `games` games at the policy's lockstep latency,
 on the same positions, sides alternating. The policy seat is trainable and pinned to the panel's version, so the report
@@ -121,10 +122,13 @@ def _policy(cfg: RunConfig, panel: PanelConfig, civ: str) -> SeatSpec:
 
 
 def heldout_specs(cfg: RunConfig, panel: PanelConfig) -> list[GameSpec]:
-    """`panel.games` games of the policy seat against the panel's opponent mix, on held-out (or training) positions."""
+    """`panel.games` games of the policy seat against the panel's opponent mix, on held-out (or training) positions.
+    With `panel.start` the panel plays games start .. start + games - 1 of the same sequence: the positions and
+    opponents the larger panel would have given those indices, under this panel's name."""
     interface = _interface(cfg, panel)
     specs = []
-    for j, opponent in enumerate(schedule(panel.opponents, panel.games)):
+    dealt = schedule(panel.opponents, panel.start + panel.games)
+    for j, opponent in enumerate(dealt[panel.start :], panel.start):
         pos = position(cfg, panel.positions, j)
         policy = _policy(cfg, panel, pos.policy_civ)
         if opponent == "bot":

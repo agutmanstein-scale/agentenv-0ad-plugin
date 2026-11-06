@@ -30,7 +30,8 @@
     teachers = [{ name = "astra", model = "openai/gpt-6-astra" }, { name = "opus", model = "..." }]
 
 Panels need no spec file when they are generated (`train/panels.py`): `kind = "heldout"` (`games`, `opponents`,
-`interface`, `positions`, `time_cap_minutes`) is the policy seat against an opponent mix on held-out positions,
+`interface`, `positions`, `time_cap_minutes`, `start`) is the policy seat against an opponent mix on held-out positions
+(`start` = the index of its first game, so a panel can play the rest of another panel's configs),
 `kind = "frontier"` has each teacher in `teachers` play the policy seat for its own `games`.
 `[held_out] seed_ranges = [[low, high]]` holds out a block of seeds for panels of hundreds of games. A baseline or
 panel-only run sets `panels_only` (no training games), `stop_when_done` (end with reason "complete" once every panel
@@ -210,6 +211,9 @@ class PanelConfig:
         "held_out"  # kinds heldout and frontier: draw maps, civs and seeds from the held-out ones or the training ones
     )
     time_cap_minutes: float | None = None  # None: games.time_cap_minutes
+    start: int = (
+        0  # kind heldout: index of its first game; games j = start .. start + games - 1 of the panel's sequence
+    )
 
     def __post_init__(self) -> None:
         if not self.name or "/" in self.name or self.name.startswith("."):
@@ -238,7 +242,11 @@ class PanelConfig:
                 raise ValueError(f"panel {self.name}: opponents are weights over {', '.join(OPPONENTS)}")
             if self.games < 1:
                 raise ValueError(f"panel {self.name}: games is at least 1")
+            if self.start < 0:
+                raise ValueError(f"panel {self.name}: start is not negative")
         else:
+            if self.start:
+                raise ValueError(f"panel {self.name}: start is for held-out panels")
             if not self.teachers or any(t.games < 1 for t in self.teachers):
                 raise ValueError(f"panel {self.name}: a frontier panel needs teachers, each with games of at least 1")
             if len({t.name for t in self.teachers}) != len(self.teachers):

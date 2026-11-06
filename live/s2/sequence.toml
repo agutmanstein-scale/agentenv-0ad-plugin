@@ -23,7 +23,12 @@ min_decisions_per_s_per_gpu = 3.0
 max_learner_s_per_decision = 2.0
 max_logprob_gap = 0.05
 
-[e2]                       # positive control
+[tripwire]                 # v0's health records (no training) on the baseline games' decisions: the tripwire baseline
+cap_hours = 0.5            # the learner's start-up, then 10 or more forward-only batches of 256 on 2 GPUs
+expected_hours = 0.3
+min_records = 10           # the baseline file must come from at least this many records of 256 decisions; E2 and Run 1 refuse to start without it
+
+[e2]                       # positive control; runs after the baselines so it can be given the baseline
 config = "e2.toml"
 cap_hours = 2.6            # e2.toml's duration_hours (2) + its drain and upload
 expected_hours = 2.3
@@ -65,11 +70,13 @@ expected_hours = 0.8
 epochs = 2
 lr = 1e-4
 
-[sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel
+[sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel; the chosen one then plays the rest
 config = "sft-panels.toml"
-cap_hours = 2.0
-expected_hours = 1.4
-panel_games = 192
+cap_hours = 3.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games
+expected_hours = 2.1
+panel_games = 192          # per epoch: enough to choose between epochs
+heldout_games = 384        # the held-out panel's size (baselines.toml): the chosen epoch plays heldout_games - panel_games more,
+                           # so the init decision is on the same 384 configs v0 played
 min_entropy_ratio = 0.7
 min_games = 20
 max_p = 0.05               # Run 1 starts from the chosen epoch only if it beats v0 at this one-sided level

@@ -106,6 +106,13 @@ a restart rebuilds the dataset from inbox/consumed/ and carries on from there; a
 is reused when it holds this version's weights and refused otherwise. After the last epoch the learner writes
 ROOT/sft-done.json and exits.
 
+Stats-only mode (--stats-only ROWS), for the tripwire baseline. Reads v0 decision rows (the inbox format), measures them
+in batches of `decisions_per_update` (256) with the same row_stats, entropy and KL-to-base code an update uses, writes
+one health-shaped record per batch to ROOT/baseline-records.jsonl and then baseline_from() of them, in the format
+--baseline reads, to ROOT/baseline.json, and exits. The weights never change (no optimizer step, no publish, no
+checkpoint); a short last batch is dropped, so every record is comparable with a training batch. Run it on the base
+model, without --init.
+
 Run in the trainer image (vLLM's image with PEFT), after training starts:
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 [--init ADAPTER] --known-tools a,b,c
       [--baseline baseline.json]
@@ -869,6 +876,19 @@ class Learner:
         self._persist(health)
         return health
 
+    def measure(self, rows: list[Decision]) -> dict[str, Any]:
+        """The health record an update on `rows` would write, without training: the same row statistics, entropy and KL
+        to base, no step, no version, no publish. Every rank takes part; the weights are untouched."""
+        cfg, comm = self.cfg, self.comm
+        started, version, lr = time.time(), self.version, self.effective_lr()
+        rows = [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in rows]
+        owned = [[r for i, r in enumerate(mb) if i % comm.world == comm.rank] for mb in self._minibatches(rows)]
+        totals: Counter[str] = Counter()
+        self._prox_pass(rows, owned, totals)
+        reduced = self._reduce(totals)
+        health = self._health(rows, reduced, (0, 0, [], None), {}, (started, version, lr))
+        return health | self._aux_health(reduced, Schedule(0.0, 0.0), 0)
+
     def _tripwires(self, health: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         """This update's trips and alarms over the newest records; an SFT run samples nothing, so it has none."""
         if self.cfg.sft:
@@ -1393,6 +1413,39 @@ def baseline_from(records: Sequence[dict[str, Any]], window: int = 10) -> dict[s
     return baseline
 
 
+def stats_only(learner: Learner, rows_path: Path) -> dict[str, int]:
+    """The tripwire baseline of the policy the learner holds (the base model, v0): health records of the rows in
+    `rows_path` in batches of `decisions_per_update`, without changing the weights. Rank 0 reads the file and writes
+    ROOT/baseline-records.jsonl, then ROOT/baseline.json (baseline_from over the records, as --baseline reads it);
+    returns {records, decisions, dropped} on every rank. A file under one batch is refused."""
+    size = learner.cfg.decisions_per_update
+    rows: list[Decision] | None = None
+    if learner.comm.rank == 0:
+        rows = [
+            parse_row(json.loads(line), learner.cfg.max_len)
+            for line in rows_path.read_text().splitlines()
+            if line.strip()
+        ]
+    rows = learner.comm.broadcast(rows)
+    assert rows is not None
+    if len(rows) < size:
+        raise SystemExit(f"{rows_path} has {len(rows)} rows: stats-only needs at least one batch of {size}")
+    batches = [rows[i : i + size] for i in range(0, len(rows) - size + 1, size)]
+    records = []
+    for i, batch in enumerate(batches):
+        records.append(learner.measure(batch))
+        log.info("baseline record %d of %d", i + 1, len(batches))
+    if learner.comm.rank == 0:
+        learner.cfg.root.mkdir(parents=True, exist_ok=True)
+        text = "".join(json.dumps(r) + "\n" for r in records)
+        write_file_atomically(learner.cfg.root / "baseline-records.jsonl", lambda p: p.write_text(text))
+        write_file_atomically(
+            learner.cfg.root / "baseline.json", lambda p: p.write_text(json.dumps(baseline_from(records)))
+        )
+    learner.comm.barrier()
+    return {"records": len(records), "decisions": len(batches) * size, "dropped": len(rows) - len(batches) * size}
+
+
 def probe(
     learner: Learner, rows_path: Path, *, agree_rows: int = 5, batch_rows: int = 32, warmup_rows: int = 8
 ) -> dict[str, Any]:
@@ -1535,6 +1588,9 @@ def parse() -> argparse.Namespace:
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
     p.add_argument(
+        "--stats-only", default="", help="the tripwire baseline: health records of these v0 rows, no training, exit"
+    )
+    p.add_argument(
         "--probe", default="", help="the box-day gates: read these sampled rows, write ROOT/probe.json, exit"
     )
     return p.parse_args()
@@ -1572,6 +1628,10 @@ def main() -> None:
     comm.sync_params([p for p in model.parameters() if p.requires_grad])
     tokenizer = AutoTokenizer.from_pretrained(cfg.base)
     learner = Learner(cfg, model, lambda ids: tokenizer.decode(ids, skip_special_tokens=False), comm, baseline=baseline)
+    if args.stats_only:
+        log.info("stats-only: %s", stats_only(learner, Path(args.stats_only)))
+        comm.close()
+        return
     if args.probe:
         result = probe(learner, Path(args.probe))
         if comm.rank == 0:

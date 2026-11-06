@@ -11,15 +11,20 @@ if the gates of the one before passed:
   e1          GPU gates: log-prob alignment on every vLLM server (`smoke`), decisions per second per GPU at 16 to 64
               calls in flight on real v2 prompts (`probe`, gate >= 3), and the learner's seconds per trained decision
               (<= 2) and log-prob gap to vLLM (< 0.05 nats per token) from `learner.py --probe`
-  e2          the positive control: an RL run on the army-at-minute-10 reward against a frozen-v0 arm played beside it
-              (`gates.positive_control_gates`); its adapters stay in its own root and are never used again
   baselines   play-only v0 on interface v2: the held-out panel, a base-v1 subset, the frontier panel, the teacher
               calibration panel and enough ordinary games to hold the distillation briefs
   calibration the teacher is picked (`stats.pick_teacher`)
+  tripwire    the learner's banded-tripwire baseline: v0's health records over the ordinary baseline games' decisions
+              (`train.baseline` rows through the same credit, `learner.py --stats-only`, no training) into
+              ROOT/s2/baseline.json, which E2 and Run 1 are given as `--baseline`
+  e2          the positive control: an RL run on the army-at-minute-10 reward against a frozen-v0 arm played beside it
+              (`gates.positive_control_gates`); its adapters stay in its own root and are never used again
   labels      `distill.py`: the teacher relabels the briefs under a spend cap
   sft         the learner in --sft mode, a checkpoint per epoch
-  sft_panels  each epoch's adapter plays its share of the held-out panel; `stats.select_sft_checkpoint` picks one
-  init        Run 1's starting point: the chosen adapter if it beats v0 (one-sided p < 0.05), else the base model
+  sft_panels  each epoch's adapter plays the first panel_games of the held-out panel; `stats.select_sft_checkpoint`
+              picks one, which then plays the remaining configs, so it has all 384 that v0 has
+  init        Run 1's starting point: the chosen adapter if it beats v0 on all 384 paired configs (one-sided p < 0.05),
+              else the base model
   run1        the RL run, panels at its end; then the report, the final S3 upload and (unless --no-shutdown) the box's
               own `shutdown -h now`, which stops it (it is never terminated from here)
 
@@ -36,6 +41,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -55,9 +61,12 @@ from agentenv_zeroad.train.config import RunConfig, check_run, load_config
 log = logging.getLogger("s2")
 
 STOPPED_BY_HAND = "stopped by hand (SIGTERM)"
-STEPS = ("e1", "e2", "baselines", "calibration", "labels", "sft", "sft_panels", "init", "run1")
+STEPS = ("e1", "baselines", "calibration", "tripwire", "e2", "labels", "sft", "sft_panels", "init", "run1")
 GRACE_S = 2400.0  # an orchestrator told to stop uploads for up to 3 x 10 minutes (sync.SYNC_TIMEOUT_S)
 SFT_PREFIX = "sft-epoch"
+SFT_REST = "sft-rest"  # the chosen epoch's second panel: the held-out configs the epoch panels did not play
+BASELINE_FILE = "baseline.json"  # ROOT/s2/baseline.json, the tripwire baseline; its records are in the baselines root
+DECISIONS_PER_UPDATE = 256  # the learner's batch: one health record per this many decisions
 
 # Every table of sequence.toml with its keys and their defaults; a key not listed is an error.
 SCHEMA: dict[str, dict[str, Any]] = {
@@ -97,6 +106,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "calibration_panel": "teacher-calibration",
         "planned_usd": 45.0,
     },
+    "tripwire": {"cap_hours": 0.5, "expected_hours": 0.3, "min_records": 10},
     "distill": {
         "cap_hours": 1.0,
         "expected_hours": 0.4,
@@ -112,9 +122,10 @@ SCHEMA: dict[str, dict[str, Any]] = {
     "sft": {"config": "sft.toml", "cap_hours": 1.25, "expected_hours": 0.8, "epochs": 2, "lr": 1e-4},
     "sft_panels": {
         "config": "sft-panels.toml",
-        "cap_hours": 2.0,
-        "expected_hours": 1.4,
-        "panel_games": 192,
+        "cap_hours": 3.0,
+        "expected_hours": 2.1,
+        "panel_games": 192,  # per epoch, to choose between epochs; the chosen one then plays the other 192
+        "heldout_games": 384,  # the held-out panel's size: the chosen epoch has this many configs, like v0
         "min_entropy_ratio": 0.7,
         "min_games": 20,
         "max_p": 0.05,
@@ -221,6 +232,16 @@ def render_sft_panels(template: str, versions: Mapping[int, int], games: int) ->
     return template.rstrip() + "\n" + blocks
 
 
+def render_rest_panel(template: str, version: int, start: int, games: int) -> str:
+    """The chosen epoch's second config: the template plus one held-out panel of the configs `start` .. `start + games`
+    of the held-out sequence (the ones the epoch panels did not play), pinned to the chosen adapter version."""
+    return (
+        template.rstrip()
+        + f'\n\n[[panels]]\nname = "{SFT_REST}"\nkind = "heldout"\nat_hours = 0\nversion = {version}\n'
+        + f"start = {start}\ngames = {games}\n"
+    )
+
+
 class ConfigDir:
     """The step configs of a config directory, loaded and checked."""
 
@@ -270,6 +291,16 @@ def check_dir(path: Path, budget: float | None = None) -> dict[str, Any]:
     _check_panel_names(configs, settings)
     if configs.load("e2").credit.get("positive_control") is not True:
         raise ValueError("e2: [credit] positive_control must be true")
+    sp = settings["sft_panels"]
+    if not 0 < int(sp["panel_games"]) < int(sp["heldout_games"]):
+        raise ValueError(
+            "sft_panels: panel_games must be under heldout_games, so the chosen epoch has configs left to play"
+        )
+    held = next(p for p in configs.load("baselines").panels if p.name == settings["baselines"]["heldout_panel"])
+    if held.games != int(sp["heldout_games"]):
+        raise ValueError(
+            f"sft_panels heldout_games {sp['heldout_games']} is not the baselines' held-out panel's {held.games} games"
+        )
     if configs.load("sft").root != configs.load("sft_panels").root:
         raise ValueError("sft and sft_panels must share one root: the epochs and the panels are read together")
     return {
@@ -566,7 +597,7 @@ def armies(folder: Path, minute: float, *, trained_only: bool, last: int | None 
 
 def step_e2(ctx: Ctx) -> Outcome:
     s, cfg = ctx.settings["e2"], ctx.cfg("e2")
-    ctx.train_run(ctx.configs.file("e2"), label="control run")
+    ctx.train_run(ctx.configs.file("e2"), baseline_flags(ctx), label="control run")
     minute = float(s["minute"])
     policy = armies(cfg.root / "games", minute, trained_only=True, last=int(s["window_games"]))
     control = armies(cfg.root / "panels" / str(s["control_panel"]), minute, trained_only=False)
@@ -656,6 +687,65 @@ def step_calibration(ctx: Ctx) -> Outcome:
     return out
 
 
+def baseline_records(ctx: Ctx) -> int:
+    """Health records behind ROOT/s2/baseline.json (the stats-only learner's, in the baselines root); 0 if none."""
+    path = ctx.cfg("baselines").root / "baseline-records.jsonl"
+    with contextlib.suppress(OSError):
+        return sum(1 for line in path.read_text().splitlines() if line.strip())
+    return 0
+
+
+def baseline_flags(ctx: Ctx) -> list[str]:
+    """`--baseline ROOT/s2/baseline.json` for a training run, or a step failure: a run without it has the banded
+    collapse tripwires (length, calls, exact and distinct completions, entropy) switched off."""
+    need = int(ctx.settings["tripwire"]["min_records"])
+    path = ctx.s2 / BASELINE_FILE
+    have = baseline_records(ctx)
+    if not path.is_file() or have < need:
+        raise StepFailed(
+            f"no tripwire baseline: {path} {'exists' if path.is_file() else 'is missing'} with {have} of {need} records"
+        )
+    return ["--baseline", str(path)]
+
+
+def step_tripwire(ctx: Ctx) -> Outcome:
+    """v0's health records without training: its decisions in the ordinary (non-panel) baseline games, credited as Run 1
+    credits them, measured by the learner in batches of 256 on the base model (`learner.py --stats-only`), then
+    `baseline_from` into ROOT/s2/baseline.json. The gate: that file with at least `min_records` records."""
+    from agentenv_zeroad.train import baseline
+
+    s, base = ctx.settings["tripwire"], ctx.cfg("baselines")
+    need = int(s["min_records"])
+    rows = base.root / "baseline-rows.jsonl"
+    for stale in (rows, base.root / BASELINE_FILE, base.root / "baseline-records.jsonl"):
+        stale.unlink(missing_ok=True)
+    made = baseline.v0_rows(base.root / "games", rows, baseline.credit_for(ctx.cfg("run1")))
+    out = Outcome(detail={"rows": made})
+    out.gates.append(
+        G.Gate(
+            "v0 decisions for the tripwire baseline",
+            float(made["rows"]),
+            ">=",
+            float(need * DECISIONS_PER_UPDATE),
+            f"{made['rows']} rows from {made['games']} games ({made['skipped']} skipped)",
+        )
+    )
+    if not out.gates[-1].passed:
+        return out
+    rc = ctx.train_run(ctx.configs.file("baselines"), ["--stats-only", str(rows)], "stats-only learner")
+    produced = base.root / BASELINE_FILE
+    records = baseline_records(ctx)
+    out.detail["records"] = records
+    out.gates.append(G.Gate("health records of v0", float(records), ">=", float(need)))
+    if rc != 0 or not produced.is_file():
+        out.reason = f"the stats-only learner made no baseline (exit {rc}; see logs/tripwire-stats-only-learner.log)"
+        return out
+    ctx.s2.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(produced, ctx.s2 / BASELINE_FILE)
+    out.detail["baseline"] = read_json(ctx.s2 / BASELINE_FILE)
+    return out
+
+
 def step_labels(ctx: Ctx) -> Outcome:
     d, base = ctx.settings["distill"], ctx.cfg("baselines")
     sft = ctx.cfg("sft")
@@ -737,20 +827,50 @@ def epoch_versions(root: Path) -> dict[int, int]:
 
 
 def step_sft_panels(ctx: Ctx) -> Outcome:
+    """Each epoch plays the first `panel_games` configs of the held-out panel and the best one is chosen; the chosen
+    epoch then plays the remaining configs (`SFT_REST`), so the init decision has v0's 384 paired configs."""
+    from agentenv_zeroad.train import report
+
     s, template = ctx.settings["sft_panels"], ctx.cfg("sft")
     versions = epoch_versions(template.root)
     if not versions:
         raise StepFailed("no SFT epoch manifests to play")
+    text = ctx.configs.file("sft_panels").read_text()
     rendered = ctx.s2 / "generated" / "sft-panels.toml"
     rendered.parent.mkdir(parents=True, exist_ok=True)
-    rendered.write_text(render_sft_panels(ctx.configs.file("sft_panels").read_text(), versions, int(s["panel_games"])))
+    rendered.write_text(render_sft_panels(text, versions, int(s["panel_games"])))
     cfg = load_config(rendered)
     ctx.train_run(rendered, ["--play-only"], "epoch panels")
     gates = [
         ended_normally(cfg.root, ("complete", "duration")),
         *panel_gates(cfg.root, [p.name for p in cfg.panels], 0.9),
     ]
-    return Outcome(gates, {"versions": versions})
+    detail: dict[str, Any] = {"versions": versions}
+    if all(g.passed for g in gates):
+        selection = report.select_sft(
+            template.root / "epochs",
+            template.root / "panels",
+            None,
+            SFT_PREFIX,
+            float(s["min_entropy_ratio"]),
+            int(s["min_games"]),
+        )
+        detail["selection"] = selection
+        chosen = selection.get("chosen")
+        if chosen:
+            first, total = int(s["panel_games"]), int(s["heldout_games"])
+            rest = ctx.s2 / "generated" / "sft-rest.toml"
+            rest.write_text(
+                render_rest_panel(text, versions[int(str(chosen).removeprefix("epoch"))], first, total - first)
+            )
+            ctx.say(f"sft_panels: {chosen} plays the other {total - first} held-out configs")
+            ctx.train_run(rest, ["--play-only"], "chosen epoch rest")
+            rest_cfg = load_config(rest)
+            gates += [
+                ended_normally(rest_cfg.root, ("complete", "duration")),
+                *panel_gates(rest_cfg.root, [SFT_REST], 0.9),
+            ]
+    return Outcome(gates, detail)
 
 
 def played(folder: Path) -> list[Any]:
@@ -761,6 +881,11 @@ def played(folder: Path) -> list[Any]:
 
 def as_stats(games: Sequence[Any]) -> list[stats.Game]:
     return [stats.Game(p.version, 0.0, p.opponent, p.result, p.margin) for p in games]
+
+
+def config_ids(games: Sequence[Any], panel: str) -> set[str]:
+    """The configs a panel's games played, as the panel-independent tail of the game id: 0007-petra-2."""
+    return {g.game_id.removeprefix(panel + "-") for g in games}
 
 
 def step_init(ctx: Ctx) -> Outcome:
@@ -776,8 +901,9 @@ def step_init(ctx: Ctx) -> Outcome:
     name = selection.get("chosen")
     if name:
         panel_name = f"{SFT_PREFIX}{name.removeprefix('epoch')}"
-        chosen_games = played(panels / panel_name)
-        ids = {g.game_id.removeprefix(panel_name + "-") for g in chosen_games}  # the same configs: 0007-petra-2
+        first, rest = played(panels / panel_name), played(panels / SFT_REST)
+        chosen_games = [*first, *rest]
+        ids = config_ids(first, panel_name) | config_ids(rest, SFT_REST)  # the same configs: 0007-petra-2
         base_games = [g for g in played(base_panel) if g.game_id.removeprefix(base_panel.name + "-") in ids]
     decision = G.init_decision(selection, as_stats(base_games), as_stats(chosen_games), max_p=float(s["max_p"]))
     init = str(sft.root / "epochs" / decision["init"]) if decision["init"] else None
@@ -789,11 +915,11 @@ def step_init(ctx: Ctx) -> Outcome:
 def step_run1(ctx: Ctx) -> Outcome:
     cfg = ctx.cfg("run1")
     init = (ctx.record.data["steps"].get("init", {}).get("detail") or {}).get("init_path")
-    flags: list[str] = []
+    flags: list[str] = baseline_flags(ctx)
     if init:
         if not Path(init).is_relative_to(ctx.cfg("sft").root):
             raise StepFailed(f"Run 1's init {init} is not an SFT checkpoint: no E2 adapter may carry over")
-        flags = ["--init", init, "--anchor", init]
+        flags += ["--init", init, "--anchor", init]
     ctx.say(f"run1: {'from ' + init if init else 'from the base model'}")
     ctx.train_run(ctx.configs.file("run1"), flags, "rl run")
     reason = final_reason(cfg.root)
@@ -803,9 +929,10 @@ def step_run1(ctx: Ctx) -> Outcome:
 
 STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
     "e1": step_e1,
-    "e2": step_e2,
     "baselines": step_baselines,
     "calibration": step_calibration,
+    "tripwire": step_tripwire,
+    "e2": step_e2,
     "labels": step_labels,
     "sft": step_sft,
     "sft_panels": step_sft_panels,
