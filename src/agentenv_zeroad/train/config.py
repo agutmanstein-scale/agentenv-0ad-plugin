@@ -593,7 +593,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"TRAIN_DURATION_HOURS={cfg.duration_hours:g}\nTRAIN_BOX_USD_PER_HOUR={cfg.box_usd_per_hour:g}\n"
         f"TRAIN_FRONTIER={int(bool(frontier))}\nTRAIN_ENGINES={cfg.engines}\nTRAIN_CONCURRENCY={cfg.concurrency}\n"
         f"TRAIN_ENGINE_IMAGE={shlex.quote(cfg.engine_image)}\n"
-        f"TRAIN_ENGINE_PATCHES={shlex.quote(' '.join(cfg.engine_patches))}"
+        f"TRAIN_ENGINE_PATCHES={shlex.quote(' '.join(cfg.engine_patches))}\n"
+        f"TRAIN_TRANSPORT_ROLE={cfg.transport.role if cfg.transport.enabled else 'none'}"
     )
     return 0
 
