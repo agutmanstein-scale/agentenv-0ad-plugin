@@ -3,16 +3,20 @@
 Distillation (`train/distill.py`) needs a teacher, and the best one is the frontier model that plays this game best,
 not the one that happened to beat the base Qwen. The calibration panel measures that where the policy is measured: each
 configured teacher (Astra, Opus, any LiteLLM model name) plays Petra-3 and Petra-4 on interface v2 in lockstep at the
-policy's own latency `L` (`games.latency_ms`, unless the panel sets one), turn-logged like every lockstep game, about 10
+policy's own latency `L` (`games.latency_ms`, unless the panel sets one), turn-logged like every lockstep game, 16
 games in all by default. The Petra seat is the same v1 controller a training game's is. The games run under the
 orchestrator's frontier spend caps (`game_cap_usd` per seat, then the run's budget) and land in ROOT/panels/NAME, kept
 off the training board; `report.py` summarises them (win rate per teacher and rung with Wilson intervals) and
 `distill.py --calibration` picks the teacher from that folder.
 
-The games are dealt one cell per teacher and rung, rung-major so that a short count's extra games go to the lowest rung
-that decides the pick (Petra-3), and the j-th game of every cell shares its map, seeds and civ pair, so the teachers
-face the same positions. Held-out civ pairs, maps and seeds are used when the config has them, else the training
-ones. Which side a teacher takes alternates.
+The games are dealt one cell per teacher and rung. The pick is made on Petra-3, so each teacher is first given up to
+`MIN_PRIMARY_GAMES` (6) games against it, the rest go round the other rungs (the tie-break), then Petra-3 again: 16
+games for two teachers is 6 and 6 against Petra-3 and 2 and 2 against Petra-4. Six games still cannot separate two
+teachers whose win rates differ by less than about 0.4, which `report.json` says (`best.separated`). A frontier game
+costs a few dollars at these models (the S2 budget line of about $26 assumed ~10 games), so 16 games is roughly $15
+more, and each seat is capped at `ZEROAD_MATCH_CAP_USD`. The j-th game of every cell shares its map, seeds and civ
+pair, so the teachers face the same positions. Held-out civ pairs, maps and seeds are used when the config has them,
+else the training ones. Which side a teacher takes alternates.
 """
 
 from __future__ import annotations
@@ -22,10 +26,11 @@ import random
 import re
 from collections.abc import Mapping
 
-from agentenv_zeroad.train.config import PanelConfig, RunConfig, TeacherConfig
+from agentenv_zeroad.train.config import MIN_PRIMARY_GAMES, PanelConfig, RunConfig, TeacherConfig
 from agentenv_zeroad.train.spec import GameSpec, SeatSpec, load_specs
 
 LITELLM_URL_ENV = "LITELLM_BASE_URL"
+PRIMARY_RUNG = 3  # stats.CALIBRATION_RUNG's difficulty
 UNSET_URL = "http://litellm.invalid/v1"  # in a spec made where no endpoint is configured (a config check)
 
 
@@ -41,7 +46,7 @@ def calibration_specs(cfg: RunConfig, panel: PanelConfig, environ: Mapping[str, 
     """`panel.games` games: every teacher against every rung, at the policy's latency, same positions each."""
     environ = os.environ if environ is None else environ
     cells = [(rung, teacher) for rung in panel.rungs for teacher in panel.teachers]
-    per_cell = [panel.games // len(cells) + (i < panel.games % len(cells)) for i in range(len(cells))]
+    per_cell = allocate_games(panel.games, [rung for rung, _ in cells])
     base_url = panel.base_url or environ.get(LITELLM_URL_ENV) or UNSET_URL
     latency = panel.latency_ms if panel.latency_ms is not None else cfg.games.latency_ms
     positions = _positions(cfg, max(per_cell), panel.name)
@@ -67,6 +72,29 @@ def calibration_specs(cfg: RunConfig, panel: PanelConfig, environ: Mapping[str, 
                 )
             )
     return specs
+
+
+def allocate_games(total: int, rungs: list[int]) -> list[int]:
+    """Games per cell (`rungs[i]` is cell i's Petra rung), `total` in all, at least one each.
+
+    Cells against `PRIMARY_RUNG` (the rung the teacher is picked on) are filled to `MIN_PRIMARY_GAMES` first, then the
+    others one at a time round the cells, the rest-of-the-rungs first and the primary ones last."""
+    counts = [1] * len(rungs)
+    left = total - len(rungs)
+    primary = [i for i, r in enumerate(rungs) if r == PRIMARY_RUNG]
+    others = [i for i in range(len(rungs)) if i not in primary]
+    while left > 0 and any(counts[i] < MIN_PRIMARY_GAMES for i in primary):
+        for i in primary:
+            if left > 0 and counts[i] < MIN_PRIMARY_GAMES:
+                counts[i] += 1
+                left -= 1
+    order = [*others, *primary]
+    turn = 0
+    while left > 0:
+        counts[order[turn % len(order)]] += 1
+        left -= 1
+        turn += 1
+    return counts
 
 
 def _teacher_seat(teacher: TeacherConfig, civ: str, base_url: str, key_env: str, cfg: RunConfig) -> SeatSpec:

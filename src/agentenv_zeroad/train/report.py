@@ -100,6 +100,7 @@ def build(
     sft_epochs: Path | None = None,
     sft_panel_prefix: str = SFT_PANEL_PREFIX,
     min_entropy_ratio: float = stats.MIN_ENTROPY_RATIO,
+    min_sft_games: int = stats.MIN_SFT_GAMES,
 ) -> dict[str, Any]:
     """The report for a run's folders, as of `now` (default: the clock)."""
     now = time.time() if now is None else now
@@ -134,12 +135,13 @@ def build(
         "panel": _panel(panels, panel, learners, hours_of),
         "teacher_calibration": teacher_calibration(panels / calibration) if panels else None,
         "sft_selection": (
-            select_sft(sft_epochs, panels, learners, sft_panel_prefix, min_entropy_ratio)
+            select_sft(sft_epochs, panels, learners, sft_panel_prefix, min_entropy_ratio, min_sft_games)
             if sft_epochs and panels
             else None
         ),
         "behaviour": _behaviour(played, hours_of),
         "health": _health(health, start),
+        "hard_states": _hard_states(health, ledger),
         "throughput": _throughput(played, health, start, horizon),
         "spend": _spend(played, ledger),
     }
@@ -363,7 +365,12 @@ def teacher_calibration(folder: Path) -> dict[str, Any] | None:
 
 
 def select_sft(
-    epochs: Path, panels: Path, learners: Sequence[str] | None, prefix: str, min_entropy_ratio: float
+    epochs: Path,
+    panels: Path,
+    learners: Sequence[str] | None,
+    prefix: str,
+    min_entropy_ratio: float,
+    min_games: int = stats.MIN_SFT_GAMES,
 ) -> dict[str, Any]:
     """`stats.select_sft_checkpoint` over the epoch checkpoints in `epochs` (the SFT learner's ROOT/epochs), each one's
     win rate read from the panel folder `PREFIX{epoch}` and its entropy ratio from the epoch's manifest."""
@@ -374,7 +381,7 @@ def select_sft(
         played, _ = read_games(panels / f"{prefix}{manifest['epoch']}", learners)
         rate = statistics.fmean(p.result for p in played) if played else None
         candidates.append(stats.SftCandidate(path.parent.name, rate, len(played), manifest.get("entropy_ratio")))
-    out = stats.select_sft_checkpoint(candidates, min_entropy_ratio=min_entropy_ratio)
+    out = stats.select_sft_checkpoint(candidates, min_entropy_ratio=min_entropy_ratio, min_games=min_games)
     out["versions"] = {p.parent.name: json.loads(p.read_text())["version"] for p in manifests}
     return out
 
@@ -390,6 +397,19 @@ def _health(health: Sequence[Mapping[str, Any]], start: float) -> dict[str, Any]
         series.append(row)
     latest = health[-1].get("tripwires") if health else None
     return {"updates": series, "latest": latest, "tripped": sum(bool(r["trips"]) for r in series)}
+
+
+def _hard_states(health: Sequence[Mapping[str, Any]], ledger: Path | None) -> dict[str, Any]:
+    """What the teacher labels cost beside the weight the learner puts on them: the ledger's `hard-state labels`
+    dollars, the learner's latest aux_alpha (the orchestrator stops buying labels under its floor), the rows it trained
+    on and the updates that had any."""
+    alphas = [r["aux_alpha"] for r in health if r.get("aux_alpha") is not None]
+    return {
+        "labels_usd": round(spend_module.ledger_total(ledger, prefix="hard-state labels"), 4) if ledger else None,
+        "aux_alpha": alphas[-1] if alphas else None,
+        "aux_rows_trained": sum(int(r.get("aux_rows") or 0) for r in health),
+        "aux_updates": sum(bool(r.get("aux_rows")) for r in health),
+    }
 
 
 def _throughput(
@@ -435,6 +455,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--sft-epochs", type=Path, help="the SFT learner's ROOT/epochs: pick the epoch checkpoint to keep")
     p.add_argument("--sft-panel-prefix", default=SFT_PANEL_PREFIX)
     p.add_argument("--min-entropy-ratio", type=float, default=stats.MIN_ENTROPY_RATIO)
+    p.add_argument("--min-sft-games", type=int, default=stats.MIN_SFT_GAMES, help="panel games a checkpoint needs")
     a = p.parse_args(argv)
     panel = None
     if a.panel:
@@ -446,7 +467,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     report = build(
         a.games, a.learner, learners=learners, panels=a.panels, panel=panel, ledger=a.ledger, bootstrap=a.bootstrap,
         calibration=a.calibration, sft_epochs=a.sft_epochs, sft_panel_prefix=a.sft_panel_prefix,
-        min_entropy_ratio=a.min_entropy_ratio,
+        min_entropy_ratio=a.min_entropy_ratio, min_sft_games=a.min_sft_games,
     )  # fmt: skip
     write(a.out, report)
 

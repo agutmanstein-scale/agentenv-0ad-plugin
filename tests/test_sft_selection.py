@@ -44,6 +44,15 @@ def test_nothing_chosen_means_no_sft_start_and_unplayed_checkpoints_are_never_ch
     assert [c["rejected"] for c in pick["candidates"]][1:] == ["not played on the panel", "no entropy measured"]
 
 
+def test_a_checkpoint_needs_the_minimum_panel_games_and_every_candidate_the_same_number():
+    few = stats.select_sft_checkpoint([C("epoch1", 0.3, 40, 0.9), C("epoch2", 0.9, 10, 0.9)])
+    assert few["chosen"] == "epoch1" and "10 panel games is under the 20 needed" in few["candidates"][1]["rejected"]
+    assert few["min_games"] == stats.MIN_SFT_GAMES == 20
+    unequal = stats.select_sft_checkpoint([C("epoch1", 0.3, 20, 0.9), C("epoch2", 0.5, 40, 0.9)])
+    assert unequal["chosen"] == "epoch2" and "not the 40" in unequal["candidates"][0]["rejected"]
+    assert stats.select_sft_checkpoint([C("epoch1", 0.9, 5, 0.9)], min_games=5)["chosen"] == "epoch1"
+
+
 def test_the_rule_has_no_loss_input_to_choose_by():
     assert {f.name for f in dataclasses.fields(C)} == {"name", "win_rate", "games", "entropy_ratio"}
     assert "never the SFT loss" in stats.select_sft_checkpoint([])["rule"]
@@ -73,7 +82,7 @@ def test_the_report_reads_each_epochs_panel_and_manifest_and_rejects_the_collaps
     epoch_manifest(epochs, 2, 6, 0.5)
     panel_games(panels, "sft-epoch1", ["won", "lost", "lost", "lost"])
     panel_games(panels, "sft-epoch2", ["won", "won", "won", "lost"])
-    chosen = R.select_sft(epochs, panels, None, "sft-epoch", 0.7)
+    chosen = R.select_sft(epochs, panels, None, "sft-epoch", 0.7, min_games=4)
     assert chosen["chosen"] == "epoch1" and chosen["versions"] == {"epoch1": 3, "epoch2": 6}
     rows = {c["name"]: c for c in chosen["candidates"]}
     assert rows["epoch1"]["win_rate"] == 0.25 and rows["epoch2"]["win_rate"] == 0.75 and rows["epoch2"]["rejected"]
@@ -85,7 +94,7 @@ def test_the_report_has_the_selection_only_when_given_the_epochs_and_orders_epoc
     for n in (2, 10):
         epoch_manifest(epochs, n, n, 0.9)
         panel_games(panels, f"sft-epoch{n}", ["won"])
-    built = R.build(games, panels=panels, sft_epochs=epochs, now=1.0, bootstrap=0)
+    built = R.build(games, panels=panels, sft_epochs=epochs, now=1.0, bootstrap=0, min_sft_games=1)
     assert [c["name"] for c in built["sft_selection"]["candidates"]] == ["epoch2", "epoch10"]
     assert built["sft_selection"]["chosen"] == "epoch2"
     assert R.build(games, panels=panels, now=1.0, bootstrap=0)["sft_selection"] is None

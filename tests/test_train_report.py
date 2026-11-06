@@ -260,3 +260,30 @@ def test_every_field_the_dashboard_reads_from_a_v2_report_exists_in_one(tmp_path
         rows = report["behaviour"]["by_hour"] + report["health"]["updates"]
         assert any(key in row for row in rows), key
     assert re.search(r'data\.schema === "v2"', page) and report["schema"] == "v2"
+
+
+def test_report_json_shows_the_label_spend_beside_the_aux_alpha(tmp_path):
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(
+        "\n".join(
+            json.dumps(e)
+            for e in [
+                {"what": "hard-state labels h0", "usd_est": 1.25},
+                {"what": "hard-state labels h1", "usd_est": 0.75},
+                {"what": "panel mid", "usd_est": 9.0},
+            ]
+        )
+        + "\n"
+    )
+    health = [
+        {"aux_alpha": 0.2, "aux_rows": 0},
+        {"aux_alpha": 0.2, "aux_rows": 8},
+        {"aux_alpha": 0.199, "aux_rows": 5},
+        {"aux_alpha": 0.198, "aux_rows": 0},
+    ]
+    assert R._hard_states(health, ledger) == {
+        "labels_usd": 2.0, "aux_alpha": 0.198, "aux_rows_trained": 13, "aux_updates": 2,
+    }  # fmt: skip
+    assert R._hard_states([], None) == {"labels_usd": None, "aux_alpha": None, "aux_rows_trained": 0, "aux_updates": 0}
+    built = R.build(tmp_path / "games", ledger=ledger, now=1.0, bootstrap=0)
+    assert built["hard_states"]["labels_usd"] == 2.0

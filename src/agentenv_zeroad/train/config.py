@@ -155,6 +155,8 @@ class TeacherConfig:
 
 
 PANEL_KINDS = ("specs", "teacher_calibration")
+DEFAULT_CALIBRATION_GAMES = 16  # 2 teachers x Petra-3 and Petra-4: 6 and 6 against Petra-3, 2 and 2 against Petra-4
+MIN_PRIMARY_GAMES = 6  # at least this many games per teacher against the rung the pick is made on (Petra-3)
 
 
 @dataclass(frozen=True)
@@ -170,7 +172,7 @@ class PanelConfig:
     kind: str = "specs"
     teachers: tuple[TeacherConfig, ...] = ()
     rungs: tuple[int, ...] = (3, 4)  # the Petra difficulties a teacher plays
-    games: int = 10
+    games: int = DEFAULT_CALIBRATION_GAMES
     latency_ms: int | None = None  # None: games.latency_ms, the policy's
     base_url: str = ""  # "": LITELLM_BASE_URL, which the box's with-model.sh puts in the environment
     api_key_env: str = "LITELLM_API_KEY"
@@ -226,6 +228,7 @@ class HardStateConfig:
     concurrency: int = 4
     interval_s: float = 60.0  # how often a labelling pass is considered
     max_pool: int = 4000  # decisions kept waiting; the oldest go first
+    alpha_floor: float = 0.01  # no labels are bought once the learner's aux_alpha has decayed below this
 
     def __post_init__(self) -> None:
         if self.window < 1 or not 1 <= self.min_games <= self.window:
@@ -236,6 +239,8 @@ class HardStateConfig:
             raise ValueError("hard_states.per_hour, batch, per_game, concurrency and max_pool are at least 1")
         if self.cap_usd_per_hour <= 0 or self.interval_s <= 0:
             raise ValueError("hard_states.cap_usd_per_hour and interval_s must be positive")
+        if self.alpha_floor < 0:
+            raise ValueError("hard_states.alpha_floor is not negative")
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,13 @@ import pytest
 from agentenv_zeroad.llm import StrategistModel
 from agentenv_zeroad.train import report as R
 from agentenv_zeroad.train import stats
-from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, UNSET_URL, calibration_specs, panel_specs
+from agentenv_zeroad.train.calibration import (
+    LITELLM_URL_ENV,
+    UNSET_URL,
+    allocate_games,
+    calibration_specs,
+    panel_specs,
+)
 from agentenv_zeroad.train.config import RunConfig, check_run, load_config
 from agentenv_zeroad.train.game import build_model
 from agentenv_zeroad.train.spec import SeatSpec
@@ -42,16 +48,32 @@ def petra_seat(spec):
 
 
 # ---- the specs --------------------------------------------------------------------------------------------------
-def test_ten_games_are_dealt_over_each_teacher_and_rung_with_the_extras_on_petra_3(tmp_path):
-    cfg = cfg_with(tmp_path)
-    specs = calibration_specs(cfg, cfg.panels[0], {})
-    assert len(specs) == 10
+def cells_of(specs):
     cells = {}
     for spec in specs:
         key = (teacher_seat(spec).name, petra_seat(spec).difficulty)
         cells[key] = cells.get(key, 0) + 1
-    assert cells == {("astra", 3): 3, ("opus", 3): 3, ("astra", 4): 2, ("opus", 4): 2}
-    assert len({s.game_id for s in specs}) == 10
+    return cells
+
+
+def test_sixteen_games_by_default_give_each_teacher_six_against_petra_3_and_two_against_petra_4(tmp_path):
+    cfg = cfg_with(tmp_path)
+    specs = calibration_specs(cfg, cfg.panels[0], {})
+    assert cfg.panels[0].games == 16 and len(specs) == 16
+    assert cells_of(specs) == {("astra", 3): 6, ("opus", 3): 6, ("astra", 4): 2, ("opus", 4): 2}
+    assert len({s.game_id for s in specs}) == 16
+
+
+def test_a_short_count_still_fills_petra_3_first_and_a_long_one_spreads_the_rest(tmp_path):
+    ten = cfg_with(tmp_path / "a", {"games": 10})
+    assert cells_of(calibration_specs(ten, ten.panels[0], {})) == {
+        ("astra", 3): 4, ("opus", 3): 4, ("astra", 4): 1, ("opus", 4): 1,
+    }  # fmt: skip
+    assert allocate_games(4, [3, 3, 4, 4]) == [1, 1, 1, 1]
+    for total in (14, 20, 24, 25, 40):
+        counts = allocate_games(total, [3, 3, 4, 4])
+        assert sum(counts) == total and min(counts[:2]) >= 6 and min(counts[2:]) >= 1
+    assert allocate_games(24, [3, 3, 4, 4]) == [8, 8, 4, 4]  # past the six, the tie-break rung is filled first
 
 
 def test_teachers_play_llm_v2_seats_and_petra_plays_its_v1_controller_at_the_policys_latency(tmp_path):
@@ -102,7 +124,7 @@ def test_panel_specs_reads_a_spec_file_panel_as_before_and_makes_the_calibration
     )
     cfg = run_config(tmp_path / "run", panels=[{"name": "mid", "at_hours": 1, "specs": str(spec_file)}, PANEL])
     assert [s.game_id for s in panel_specs(cfg, cfg.panels[0])] == ["p0"]
-    assert len(panel_specs(cfg, cfg.panels[1], {})) == 10
+    assert len(panel_specs(cfg, cfg.panels[1], {})) == 16
 
 
 # ---- the config -------------------------------------------------------------------------------------------------
@@ -289,3 +311,15 @@ def test_a_drawn_game_counts_half_and_the_interval_of_no_games_is_everything():
     assert stats.wilson_interval(0, 0) == (0.0, 1.0)
     lo, hi = stats.wilson_interval(10, 10)
     assert hi == 1.0 and lo > 0.7
+
+
+def test_best_says_whether_its_petra_3_interval_overlaps_the_runner_ups():
+    close = summary_of({"astra": {"petra-3": [1, 1, 1, 0, 0, 0]}, "opus": {"petra-3": [1, 1, 0, 0, 0, 0]}})
+    best = close["best"]
+    assert best["name"] == "astra" and best["runner_up"] == "opus"
+    assert best["overlaps_runner_up"] is True and best["separated"] is False  # six games each: nothing is separated
+    clear = summary_of({"astra": {"petra-3": [1] * 30}, "opus": {"petra-3": [0] * 30}})
+    assert clear["best"]["overlaps_runner_up"] is False and clear["best"]["separated"] is True
+    alone = summary_of({"astra": {"petra-3": [1, 0]}})
+    assert alone["best"]["runner_up"] is None and alone["best"]["overlaps_runner_up"] is None
+    assert summary_of({"astra": {"petra-4": [1]}})["best"] is None
