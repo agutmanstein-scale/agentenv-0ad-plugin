@@ -36,7 +36,7 @@ S1=$STATE/s1
 INPUTS=$S1/inputs
 OUT=$S1/out
 UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; a dry run elsewhere may have it elsewhere
-export PATH="/usr/local/bin:/usr/bin:/bin${UV_BIN:+:${UV_BIN%/*}}"
+export PATH="${UV_BIN:+${UV_BIN%/*}:}/usr/local/bin:/usr/bin:/bin"
 PY=(uv run --project "$REPO" --frozen --no-dev python)
 [[ $CAL_ARGS =~ ^[A-Za-z0-9._,=:/\ -]*$ ]] || die "--cal-args has characters outside A-Za-z0-9._,=:/ -"
 ENGINES_PER_WORKER=${S1_ENGINES_PER_WORKER:-4}
