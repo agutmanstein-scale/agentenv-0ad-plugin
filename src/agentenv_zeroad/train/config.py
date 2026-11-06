@@ -16,6 +16,7 @@
     [held_out]                                  # civ_pairs, maps, seeds: never in a training game
     [s3]
     uri = "s3://bucket/prefix/run1"
+    [hard_states]                               # optional: teacher labels on all-loss opponents (off)
     [credit]                                    # optional: train.credit.CreditConfig fields (margin_scale ...)
     [credit.critic]                             # optional: train.critic.CriticConfig fields; absent: no critic
     [[panels]]
@@ -200,6 +201,44 @@ class PanelConfig:
 
 
 @dataclass(frozen=True)
+class HardStateConfig:
+    """Teacher labels on hard states during RL (`train.hardstate`), off by default.
+
+    Where the policy's rolling win rate against an opponent is below `threshold` (every group of games against it is an
+    all-loss group, so the policy-gradient signal there is zero), up to `per_hour` of the decisions in those games are
+    relabelled by the calibrated teacher, through distillation's labelling path, and sent to the learner as rows flagged
+    sft, trained on by its auxiliary cross-entropy term. Labelling is capped at `cap_usd_per_hour`, and counts toward
+    the run's budget through the ledger."""
+
+    enabled: bool = False
+    window: int = 40  # the policy's last this-many games against an opponent make its rolling win rate
+    min_games: int = 20  # fewer than this many in the window: not enough to call an opponent hard
+    threshold: float = 0.05  # hard: rolling win rate below this (draws count half)
+    per_hour: int = 200  # decisions sampled for labelling per run hour
+    cap_usd_per_hour: float = 10.0
+    teacher: str = "auto"  # a LiteLLM model name, or auto: the calibration panel's best (best vs Petra-3, ties Petra-4)
+    calibration: str = ""  # that panel's folder; "" is ROOT/panels/teacher-calibration (S2's, when copied here)
+    tokenizer: str = "Qwen/Qwen3-8B"  # the policy's: the labels become completion token ids
+    base_url: str = ""  # "": LITELLM_BASE_URL, which with-model.sh puts in the environment
+    api_key_env: str = "LITELLM_API_KEY"
+    batch: int = 20  # decisions asked per labelling pass
+    per_game: int = 8  # most decisions taken from one game
+    concurrency: int = 4
+    interval_s: float = 60.0  # how often a labelling pass is considered
+    max_pool: int = 4000  # decisions kept waiting; the oldest go first
+
+    def __post_init__(self) -> None:
+        if self.window < 1 or not 1 <= self.min_games <= self.window:
+            raise ValueError("hard_states.min_games must be from 1 to window")
+        if not 0 <= self.threshold <= 1:
+            raise ValueError("hard_states.threshold is a win rate, 0 to 1")
+        if min(self.per_hour, self.batch, self.per_game, self.concurrency, self.max_pool) < 1:
+            raise ValueError("hard_states.per_hour, batch, per_game, concurrency and max_pool are at least 1")
+        if self.cap_usd_per_hour <= 0 or self.interval_s <= 0:
+            raise ValueError("hard_states.cap_usd_per_hour and interval_s must be positive")
+
+
+@dataclass(frozen=True)
 class RunConfig:
     run_id: str
     root: Path
@@ -211,6 +250,7 @@ class RunConfig:
     mix: MixConfig = field(default_factory=MixConfig)
     held_out: HeldOut = field(default_factory=HeldOut)
     panels: tuple[PanelConfig, ...] = ()
+    hard_states: HardStateConfig = field(default_factory=HardStateConfig)
     s3_uri: str | None = None
     shutdown: bool = False
     engines: int = 0  # engine containers; 0 = the box's physical cores
@@ -328,6 +368,7 @@ class RunConfig:
             p["rungs"] = tuple(p.get("rungs", PanelConfig.rungs))
             if "specs" in p:
                 p["specs"] = Path(p["specs"])
+        hard = _checked(top.pop("hard_states", {}), HardStateConfig, "hard_states")
         credit = dict(top.pop("credit", {}))
         critic = credit.pop("critic", None)
         s3 = top.pop("s3", {})
@@ -352,6 +393,7 @@ class RunConfig:
                 seeds=tuple(held.get("seeds", ())),
             ),
             panels=tuple(PanelConfig(**p) for p in panels),
+            hard_states=HardStateConfig(**hard),
             s3_uri=s3_uri,
             credit=credit,
             critic=dict(critic) if critic is not None else None,
@@ -390,6 +432,8 @@ def check_run(cfg: RunConfig) -> list[str]:
                 and not (s.model or "").startswith(LOCAL_PREFIX)
             }
     GameFactory(cfg).next(0, cfg.servers.urls[0]).match_config()
+    if cfg.hard_states.enabled:
+        keys.add(cfg.hard_states.api_key_env)
     return sorted(keys)
 
 

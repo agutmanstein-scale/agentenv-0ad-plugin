@@ -1082,6 +1082,14 @@ def test_the_box_train_run_starts_the_learner_on_the_training_gpus_and_then_the_
         and f"--init {state}/train/start" in learner
     )
     assert "agentenv_zeroad.train.orchestrate run --config" in text and "--play-only" not in text
+    out = run_box(
+        stubs, "train-run.sh", str(TRAIN_CONFIG), "--init", f"{state}/train/sft", "--anchor", f"{state}/train/sft",
+        DRY_RUN="1",
+    )  # fmt: skip
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert f"--init {state}/train/sft --anchor {state}/train/sft" in learner  # the KL anchor is the frozen SFT adapter
     out = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--play-only", DRY_RUN="1")
     assert (
         "zeroad-learner" not in out.stdout and "orchestrate run --config" in out.stdout and "--play-only" in out.stdout
@@ -1144,6 +1152,8 @@ def test_a_run_that_would_pass_the_budget_or_names_a_path_outside_the_train_fold
     ledger.unlink()
     out = start_train(box_stubs, "--init", "/etc/passwd")
     assert out.returncode != 0 and "needs a path under" in out.stderr
+    out = start_train(box_stubs, "--anchor", "/etc/passwd")
+    assert out.returncode != 0 and "--anchor needs a path under" in out.stderr
     assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# train-run.sh CONFIG [--init DIR] [--baseline FILE] [--play-only]: the zeroad-train unit's process (train.sh starts it).
+# train-run.sh CONFIG [--init DIR] [--anchor DIR] [--baseline FILE] [--play-only]: the zeroad-train unit's process (train.sh starts it).
 # Starts the learner in the trainer image on the training GPUs (torchrun, one process per GPU, its --root the run's
 # folder, which the config names and which must be under $STATE/train: that folder is also what the vLLM containers
 # mount at /train to hot-load adapters from), then runs the orchestrator with vLLM's key from its root-only file, in
@@ -9,7 +9,7 @@
 # reads the LiteLLM key from SSM into its environment only (never printed, written or put on a command line).
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
-CONFIG=${1:?usage: train-run.sh CONFIG [--init DIR] [--baseline FILE] [--play-only]}; shift
+CONFIG=${1:?usage: train-run.sh CONFIG [--init DIR] [--anchor DIR] [--baseline FILE] [--play-only]}; shift
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 TRAIN=$STATE/train
 UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; elsewhere (a dry run, the tests' stubs) it goes first
@@ -19,7 +19,7 @@ PLAY_ONLY=0 LEARNER=()
 while [ $# -gt 0 ]; do
   case $1 in
     --play-only) PLAY_ONLY=1; shift ;;
-    --init|--baseline) LEARNER+=("$1" "$2"); shift 2 ;;
+    --init|--anchor|--baseline) LEARNER+=("$1" "$2"); shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done

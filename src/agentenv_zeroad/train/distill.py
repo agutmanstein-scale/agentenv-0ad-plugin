@@ -58,7 +58,7 @@ import os
 import random
 import statistics
 from collections import defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -298,12 +298,14 @@ async def label(
     policies: Mapping[str, Policy],
     *,
     concurrency: int = 8,
+    on_asked: Callable[[Brief], None] | None = None,
 ) -> tuple[list[Label], dict[str, Any]]:
     """The teacher's usable tool calls for each brief it could be asked, and what happened (counts, spend, stop).
 
     Each brief is asked under its own interface's `policies` entry. A call reserves its bound (`spend.bound`) before
     it is sent and releases it once the guard has recorded its cost, so concurrent calls cannot jointly pass the
-    cap; the first call that does not fit ends the labelling."""
+    cap; the first call that does not fit ends the labelling. `on_asked(brief)` is called for each brief the teacher
+    was actually sent (answered or failed), so a caller can tell the ones the cap left unasked."""
     gate = asyncio.Semaphore(concurrency)
     reserve = asyncio.Lock()
     reserved = 0.0
@@ -335,6 +337,8 @@ async def label(
                 return
             except (httpx.HTTPError, ValueError, KeyError) as e:
                 stats["asked"] += 1
+                if on_asked:
+                    on_asked(brief)
                 stats["failed"] += 1
                 stats.setdefault("errors", []).append(f"{type(e).__name__}: {str(e)[:120]}")
                 return
@@ -342,6 +346,8 @@ async def label(
                 async with reserve:
                     reserved -= most
         stats["asked"] += 1
+        if on_asked:
+            on_asked(brief)
         calls = usable_calls(reply, tools)
         if calls:
             labels[i] = Label(brief, calls)

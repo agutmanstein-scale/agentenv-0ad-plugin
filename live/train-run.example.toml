@@ -56,3 +56,35 @@ uri = "s3://BUCKET/zeroad-train/run/run1"
 # name = "end"
 # at_hours = 9.5
 # specs = "/opt/zeroad-live/repo/live/panels/end.jsonl"   # GameSpec lines; `trainable` seats are pinned to the version
+
+# ---- S2 only: the TEACHER CALIBRATION panel (uncomment for the box-day-1 run; needs the LiteLLM key and endpoint) ----
+# Frontier teachers play Petra-3 and Petra-4 in lockstep at the policy's own latency (games.latency_ms), ~10 games in
+# all, under the frontier spend caps (ZEROAD_MATCH_CAP_USD per seat, then budget_usd). Games and specs land in
+# ROOT/panels/teacher-calibration; report.json summarises win rate per teacher and rung with Wilson intervals, and
+# distillation picks the teacher with the best win rate against Petra-3 (ties: Petra-4):
+#   python -m agentenv_zeroad.train.distill --calibration ROOT/panels/teacher-calibration ...
+# [[panels]]
+# name = "teacher-calibration"
+# kind = "teacher_calibration"
+# at_hours = 0
+# games = 10
+# rungs = [3, 4]
+# teachers = [
+#   { name = "astra", model = "openai/gpt-6-astra" },
+#   { name = "opus", model = "anthropic/claude-opus-5-5" },
+# ]
+
+# ---- S3 only: HARD-STATE TEACHER LABELS during RL (uncomment; needs the S2 calibration and the LiteLLM key) ----
+# Against an opponent the policy loses to nearly every time (rolling win rate below `threshold`, so every group of
+# games is all losses and RL has no signal), up to `per_hour` of its decisions an hour are relabelled by the calibrated
+# teacher under an hourly dollar cap, and sent to the learner as rows flagged sft: an auxiliary cross-entropy that
+# decays as alpha0 x 0.995^update. Off unless enabled. Start the learner from the distilled SFT checkpoint with
+# `train.sh ID start CONFIG --init PATH --anchor PATH`: its KL penalty (beta0 0.1, x 0.999^update) holds RL near it.
+# [hard_states]
+# enabled = true
+# window = 40                    # the policy's last 40 games against an opponent
+# threshold = 0.05               # hard: rolling win rate below this, with at least min_games games
+# per_hour = 200                 # decisions labelled per run hour
+# cap_usd_per_hour = 10          # the labels' spend cap per run hour (counts toward budget_usd through the ledger)
+# teacher = "auto"               # or a LiteLLM model name; auto: the calibration panel's best against Petra-3
+# calibration = ""               # that panel's folder when it is not ROOT/panels/teacher-calibration (S2's, copied)

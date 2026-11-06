@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# train.sh put-config B64 | start [--config PATH] [--init DIR] [--baseline FILE] [--play-only] --budget USD | status [LINES] | stop
+# train.sh put-config B64 | start [--config PATH] [--init DIR] [--anchor DIR] [--baseline FILE] [--play-only] --budget USD | status [LINES] | stop
 # A post-training run on this box (bootstrapped with bootstrap.sh --train), in the transient unit zeroad-train
 # (train-run.sh: the learner container on the training GPUs, then the orchestrator, src/agentenv_zeroad/train/orchestrate.py).
 # `put-config` writes the run config (base64, as the laptop script sends it) to $STATE/train/config.toml and checks it.
 # `start` refuses while a run is going, while a vLLM instance is down, when the run config's box_usd_per_hour is not this
 # box's rate (ZEROAD_BOX_USD_PER_HOUR), or when budget.sh says --budget would be passed by the box hours and ledger so
-# far plus the config's whole duration_hours at the rate; --init is a PEFT adapter to start the learner from, --baseline the tripwire baseline (JSON from baseline_from), both
-# under $STATE/train; --play-only starts no learner and credits nothing (a baseline or panel run). `status` prints the
+# far plus the config's whole duration_hours at the rate; --init is a PEFT adapter to start the learner from, --anchor the frozen
+# adapter its KL penalty holds the policy near (the distilled SFT adapter; none: the base model), --baseline the tripwire
+# baseline (JSON from baseline_from), all under $STATE/train; --play-only starts no learner and credits nothing (a baseline or panel run). `status` prints the
 # unit, the orchestrator's status, the learner's latest health records, the containers, the GPUs, vLLM and the spend.
 # `stop` sends SIGTERM: the orchestrator stops the learner, uploads the run (each of its 3 tries is cut off after 10 min;
 # the unit's TimeoutStopSec is 40 min) and ends.
@@ -32,7 +33,7 @@ case $CMD in
     while [ $# -gt 0 ]; do
       case $1 in
         --config) CONFIG=${2:?--config needs a path}; shift 2 ;;
-        --init|--baseline)
+        --init|--anchor|--baseline)
           [[ ${2:-} == "$TRAIN"/* && ${2:-} =~ ^[A-Za-z0-9._/-]+$ ]] || die "$1 needs a path under $TRAIN"
           ARGS+=("$1" "$2"); shift 2 ;;
         --play-only) ARGS+=(--play-only); shift ;;

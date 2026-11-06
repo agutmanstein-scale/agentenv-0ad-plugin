@@ -274,3 +274,17 @@ def test_each_epoch_reshuffles_the_dataset_and_the_entropy_sample_is_fixed(tmp_p
         pass
     inbox.next_epoch()
     assert inbox.finished and not inbox.epoch_done()
+
+
+def test_the_orchestrators_hard_state_rows_are_auxiliary_rows_to_an_rl_learner():
+    from agentenv_zeroad.train import distill
+
+    class Chars:
+        def encode(self, text, add_special_tokens=True):
+            return [ord(c) % 90 for c in text]
+
+    brief = distill.Brief("g1", "1", 1000, "brief", (1, 2, 3), "losing", opponent="petra-3")
+    (row,) = distill.sft_rows([distill.Label(brief, [("army", {"action": "attack"})])], Chars(), "opus")
+    parsed = L.parse_row(json.loads(json.dumps(row)), 10_000)
+    assert parsed.aux and parsed.prompt == [1, 2, 3] and parsed.advantage == 0.0 and parsed.completion
+    assert not L.parse_row(json.loads(json.dumps(row)), 10_000, sft=True).aux  # the SFT learner just reads the ids

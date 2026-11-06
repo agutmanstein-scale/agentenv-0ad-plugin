@@ -835,8 +835,9 @@ def test_credit_rows_parse_as_rl_rows_and_distill_rows_as_sft_rows():
     brief = distill.Brief("g", "1", 0, "b", (1, 2, 3), "other")
     sft = distill.sft_rows([distill.Label(brief, [("hold", {})])], types_tokenizer(), "opus")
     assert L.parse_row(sft[0], 8192, sft=True).completion == [ord(c) for c in distill.completion_text([("hold", {})])]
+    assert L.parse_row(sft[0], 8192).aux  # flagged sft: an RL learner takes it as an auxiliary teacher label
     with pytest.raises(L.RowRejected):
-        L.parse_row(sft[0], 8192)
+        L.parse_row({k: v for k, v in sft[0].items() if k != "sft"}, 8192)  # unflagged, it lacks log-probs
 
 
 def types_tokenizer():
