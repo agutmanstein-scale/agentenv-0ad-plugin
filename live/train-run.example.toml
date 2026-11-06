@@ -52,6 +52,19 @@ seeds = [900001, 900002, 900003]
 [s3]
 uri = "s3://BUCKET/zeroad-train/run/run1"
 
+# ---- S4 only: MORE BOXES. Uncomment on the LEARNER's config; each actor box has its own (live/actors/actor.example.toml) ----
+# Actors only play: they pull this box's adapters and ship finished games through S3, which this box credits in its own
+# credit path (so the baselines and the critic stay single). budget_usd then counts every actor box's hours and frontier
+# spend too; at the end of the run this box tells the actors to drain, upload and power off. The uri is under the prefix
+# train-iam.sh gave every box's role.
+# [transport]
+# enabled = true
+# uri = "s3://BUCKET/zeroad-train/run/run1/transport"
+# role = "learner"
+# max_version_lag = 4            # a game pinned to a version more than this behind the current one is dropped
+# poll_s = 15
+# actor_stale_minutes = 10       # an actor with no heartbeat for this long shows as stale in status.json
+
 # [[panels]]
 # name = "end"
 # at_hours = 9.5

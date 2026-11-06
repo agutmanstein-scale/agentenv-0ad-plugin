@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pilot-bootstrap.sh PAYLOAD_URL REPO_URL [--train]
+# pilot-bootstrap.sh PAYLOAD_URL REPO_URL [--train|--actor]
 # Run as root on a fresh GPU box (g6e.12xlarge or g6e.8xlarge, Deep Learning Base OSS NVIDIA driver AMI, Ubuntu 22.04)
 # by live/bootstrap.sh --pilot. Makes it a post-training pilot box: no display, relay or stream; instead the headless
 # env image (`agent-env zeroad setup`, the engine from the PPA) and the agents, vLLM serving Qwen with runtime LoRA
@@ -13,11 +13,14 @@
 # generation config, 8 LoRA slots on the GPU and 32 in CPU memory, and runtime LoRA updating on; GPU 2 and 3 stay free
 # for the learner. Both mount $STATE/train read-only at /train, where each run keeps its adapters. It ends with
 # train.smoke against both: every reply must carry one log-prob per generated token.
+# With --actor it makes a rollout-actor box for a multi-box run (live/actor.sh, docs/s4-actors.md): the same, but every GPU
+# serves (one vLLM instance per GPU from `nvidia-smi -L`, ports 8000, 8001, ...), there is no learner and so no trainer
+# image, and the power-off check at the end is the same. A box of any size with one or more 40 GB GPUs will do.
 set -euo pipefail
 PAYLOAD_URL=${1:?usage: pilot-bootstrap.sh PAYLOAD_URL REPO_URL}
 REPO_URL=${2:?usage: pilot-bootstrap.sh PAYLOAD_URL REPO_URL [--train]}
-TRAIN=0
-case ${3:-} in --train) TRAIN=1 ;; "") ;; *) echo "unknown argument: $3" >&2; exit 2 ;; esac
+TRAIN=0 ACTOR=0
+case ${3:-} in --train) TRAIN=1 ;; --actor) TRAIN=1 ACTOR=1 ;; "") ;; *) echo "unknown argument: $3" >&2; exit 2 ;; esac
 # A training box also installs the `train` extra (numpy, scikit-learn): the orchestrator's critic and board statistics
 # run in the venv; a pilot or play-only box keeps the base install.
 EXTRA=(); [ "$TRAIN" = 0 ] || EXTRA=(--extra train)
@@ -41,8 +44,11 @@ if [ "$DRY_RUN" = 0 ]; then
   [ "$GPUS" -ge 1 ] || { echo "no GPU" >&2; exit 1; }
   command -v nvidia-ctk >/dev/null || { echo "no NVIDIA container toolkit: use the Deep Learning Base OSS NVIDIA driver AMI" >&2; exit 1; }
   for _ in $(seq 1 60); do fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1 || break; sleep 5; done
-  if [ "$TRAIN" = 1 ] && { [ "$GPUS" -lt 4 ] || [ "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)" -lt 40000 ]; }; then
+  if [ "$TRAIN" = 1 ] && [ "$ACTOR" = 0 ] && { [ "$GPUS" -lt 4 ] || [ "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)" -lt 40000 ]; }; then
     echo "--train needs 4 GPUs of 40 GB or more (a g6e.12xlarge)" >&2; exit 1
+  fi
+  if [ "$ACTOR" = 1 ] && [ "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)" -lt 40000 ]; then
+    echo "--actor needs GPUs of 40 GB or more (an L40S box)" >&2; exit 1
   fi
 fi
 run systemctl disable --now unattended-upgrades apt-daily.timer apt-daily-upgrade.timer
@@ -101,6 +107,10 @@ VLLM_FLAGS=(--max-loras 4 --max-cpu-loras 16 ${QUANT[@]+"${QUANT[@]}"})
 if [ "$TRAIN" = 1 ]; then
   INSTANCES=("zeroad-vllm-0|0|8000|1" "zeroad-vllm-1|1|8001|1")
   SERVE=0,1 TRAIN_GPUS=2,3 SHARE=0
+  if [ "$ACTOR" = 1 ]; then  # every GPU serves, one instance each; nothing is left for a learner
+    INSTANCES=(); SERVE=$(seq -s, 0 $((GPUS - 1))) TRAIN_GPUS=
+    for g in $(seq 0 $((GPUS - 1))); do INSTANCES+=("zeroad-vllm-$g|$g|$((8000 + g))|1"); done
+  fi
   MOUNT="$STATE/train:/train:ro"
   VLLM_FLAGS=(--dtype bfloat16 --generation-config vllm --max-loras 8 --max-cpu-loras 32)
   # The learner (trainer/learner.py max_len) rejects a decision longer than 8192 tokens: nothing longer is played.
@@ -135,8 +145,10 @@ for instance in "${INSTANCES[@]}"; do
   fi
 done
 
-step "the trainer image (trainer/ on $VLLM_IMAGE, with PEFT; train-run.sh rebuilds it at every start)"
-run docker build -q -t zeroad-trainer --build-arg "VLLM_IMAGE=$VLLM_IMAGE" "$BOX_HOME/repo/trainer"
+if [ "$ACTOR" = 0 ]; then
+  step "the trainer image (trainer/ on $VLLM_IMAGE, with PEFT; train-run.sh rebuilds it at every start)"
+  run docker build -q -t zeroad-trainer --build-arg "VLLM_IMAGE=$VLLM_IMAGE" "$BOX_HOME/repo/trainer"
+fi
 
 if [ "$TRAIN" = 1 ]; then
   step "the training engine (zeroad-engine:0.28-rt, labelled zeroad.patches; the PPA source build takes ~15 min, none when already built)"
@@ -173,7 +185,9 @@ else
 fi
 step "power-off armed (zeroad-poweroff, from the launch deadline)"
 run "$BOX_HOME/box/poweroff.sh" check
-if [ "$TRAIN" = 1 ]; then
+if [ "$ACTOR" = 1 ]; then
+  echo "actor box done; nothing is played (live/train-iam.sh create ID --yes, then live/actor.sh ID start CONFIG --yes)"
+elif [ "$TRAIN" = 1 ]; then
   echo "training box done; nothing is played or trained (live/train.sh ID start CONFIG --yes)"
 else
   echo "pilot bootstrap done; nothing is played or trained (live/pilot.sh ID start --baseline)"

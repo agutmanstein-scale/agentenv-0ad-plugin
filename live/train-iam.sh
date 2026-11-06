@@ -5,5 +5,8 @@
 # zeroad-train-box: AmazonSSMManagedInstanceCore, read/write on s3://LIVE_BUCKET/LIVE_S3_PREFIX/run/* and read on the
 # LIVE_SSM_PREFIX parameters only, and puts it on each box ID in place of its current profile. delete puts each running
 # box back on LIVE_INSTANCE_PROFILE and removes the role. This is pilot-iam.sh with --train. Run with
-# LIVE_ENV=live/train.env. A dry run unless --yes.
+# LIVE_ENV=live/train.env. A dry run unless --yes. The rollout-actor boxes of a multi-box run (live/actor.sh) need the same
+# role, for the same prefix: the transport URI in their config must be under s3://LIVE_BUCKET/LIVE_S3_PREFIX/run/, so
+# `train-iam.sh create LEARNER_ID ACTOR_ID...` covers them all (IAM is global: an actor in another region needs nothing
+# more). `delete` is pilot-iam.sh's too: name every box.
 exec bash "$(dirname "$0")/pilot-iam.sh" "$@" --train
