@@ -25,6 +25,11 @@ What it does, each on its own interval:
   to ROOT/voided, no rows are credited, and it is replayed (same map, civs, opponent and seeds) up to `max_requeues`
   times. A request that failed on its own (a read timeout on a healthy server) leaves the game standing: the
   commander records a missed decision and the game is credited as played.
+- Hard-state labels (off unless `[hard_states] enabled`, `train/hardstate.py`). It tracks the policy's rolling win rate
+  against each opponent; against one below the threshold (every group of games is all losses, so RL has no signal) it
+  samples up to `per_hour` decisions an hour from those games, has the calibrated teacher relabel them under an hourly
+  dollar cap (the ledger counts it) and writes them to the learner's inbox as rows flagged sft, for the learner's
+  auxiliary cross-entropy term. The windows and the hour's counters are saved in ROOT/orchestrator/hard.json.
 - Tripwires. It tails ROOT/health.jsonl (`control.TripWatch`): a trip sends the learner a rollback to the last green
   checkpoint (which also halves its learning rate); two trips within `trip_window_h` pause the learner, upload and stop.
   No new health record or adapter for `learner_stall_minutes` while `stall_rows` rows wait in the inbox alarms and
@@ -43,7 +48,10 @@ What it does, each on its own interval:
   champion is `ROOT/champion.json`'s `version`.
 - Panels. At each panel's `at_hours` it plays the pre-registered configs (a JSONL of game specs whose `trainable` seats
   are pinned to the panel's version, or the current one) ahead of the training games, into ROOT/panels/NAME. A panel's
-  games are never credited, never reach the inbox and are never part of the training board.
+  games are never credited, never reach the inbox and are never part of the training board. A `teacher_calibration`
+  panel has no spec file: `calibration.py` makes its games (frontier teachers against Petra-3 and Petra-4 at the
+  policy's lockstep latency, recorded in ROOT/panels/NAME/specs.jsonl); no adapter is involved, so it runs on the base
+  model's instance slot and under the frontier spend caps like any frontier seat.
 - Restarts. Everything that must not start over is saved in ROOT/orchestrator after the step that changes it: the
   tripwatch (`tripwatch.json`), credit (`credit.json`), the game stream's random state (`factory.json`), and the
   panels, queues, games in flight and counts (`state.json`, with `keep.json`'s hourly adapters). A restarted process
@@ -77,13 +85,14 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, StrategistModel
 from agentenv_zeroad.spend import SpendCapReached, append_ledger, results_spend
 from agentenv_zeroad.train import budget
+from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, panel_specs
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
 from agentenv_zeroad.train.game import ModelFactory, build_model
@@ -91,8 +100,11 @@ from agentenv_zeroad.train.loopstats import LoopMonitor
 from agentenv_zeroad.train.mix import GameFactory, repin
 from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
-from agentenv_zeroad.train.spec import GameSpec, load_specs
+from agentenv_zeroad.train.spec import GameSpec
 from agentenv_zeroad.train.sync import Syncer
+
+if TYPE_CHECKING:
+    from agentenv_zeroad.train.hardstate import HardStates
 
 log = logging.getLogger(__name__)
 
@@ -217,11 +229,14 @@ class Orchestrator:
         power_off: Callable[[], None] | None = None,
         learner: bool = True,
         free_gb: Callable[[], float] | None = None,
+        hard_states: HardStates | None = None,
     ):
         self.cfg, self.fleet, self.play, self.credit, self.syncer, self.http = cfg, fleet, play, credit, syncer, http
         self.now = now
         self.power_off = power_off or _power_off
         self.learner = learner
+        self.hard = hard_states
+        self._hard_task: asyncio.Task[None] | None = None
         self.root = cfg.root
         self.odir = self.root / "orchestrator"
         self.free_gb = free_gb or self._free_gb
@@ -304,6 +319,8 @@ class Orchestrator:
             await self._step("housekeeping", lambda: self.housekeeping(now))
         if self.counts["started"] and self._due("sync", now, self.cfg.sync_interval_s):
             self._start_sync()
+        if self.hard is not None and self._due("hard", now, self.cfg.hard_states.interval_s):
+            self._start_hard_labels(int(self.clock.hours(now)))
         await self._step("fill", self.fill)
 
     async def _serve_pass(self) -> None:
@@ -370,6 +387,12 @@ class Orchestrator:
             except (ValueError, KeyError, TypeError) as e:
                 log.error("credit state not restored (%s): its baselines start over", e)
                 self.counts["credit_state_lost"] += 1
+        hard = self._read("hard.json")
+        if hard and self.hard is not None:
+            try:
+                self.hard.load_state_dict(hard)
+            except (ValueError, KeyError, TypeError) as e:
+                log.error("hard-state windows not restored (%s): they start over", e)
         critic = self._read("critic.json")
         holder = getattr(self.credit, "critic", None)
         if critic and hasattr(holder, "load_state_dict"):
@@ -633,7 +656,9 @@ class Orchestrator:
     async def _credit_game(self, game: Game, results: dict[str, Any]) -> tuple[int, str | None]:
         try:
             async with self._credit_lock:
-                return await asyncio.to_thread(self._credit, game.spec.game_id, results), None
+                rows = await asyncio.to_thread(self._credit, game.spec.game_id, results)
+            self._observe_hard(game.spec.game_id, results)
+            return rows, None
         except Exception as e:  # noqa: BLE001 - credit.rows raises its own errors; none of them may end the run
             self.counts["credit_failed"] += 1
             log.exception("credit failed for %s", game.spec.game_id)
@@ -645,6 +670,19 @@ class Orchestrator:
         self.counts["rows"] += len(rows)
         self.save_credit()
         return len(rows)
+
+    def _observe_hard(self, game_id: str, results: dict[str, Any]) -> None:
+        """Count a credited game toward its opponent's window, on the event loop: the labelling pass mutates the same
+        pool and counters between its awaits, so this must not run in a worker thread beside it."""
+        if self.hard is None:
+            return
+        try:
+            if self.hard.observe(results, game_id):
+                self.counts["hard_games"] += 1
+            self._write("hard.json", self.hard.state_dict())
+        except Exception:  # noqa: BLE001 - the labels are an extra: the credited game stands
+            self.counts["hard_errors"] += 1
+            log.exception("hard-state bookkeeping failed for %s", game_id)
 
     def _record_spend(self, game: Game, results: dict[str, Any] | None, *, void: bool) -> None:
         """The game's frontier spend into the box ledger, whatever became of the game: a void or failed game was paid
@@ -749,6 +787,7 @@ class Orchestrator:
                 "counts": dict(self.counts),
                 "instances": [{"url": i.url, "up": i.up, "adapters": sorted(i.loaded)} for i in self.fleet.instances],
                 "panels": {n: {"version": p.version, "remaining": p.remaining} for n, p in self.panels.items()},
+                "hard_states": self.hard.status(int(self.clock.hours(now))) if self.hard is not None else None,
                 "alarms": dict(self.alarms),
                 "paused_for_disk": self.disk_paused,
                 "sync": {"last_ok": self.syncer.last_ok, "failures": self.syncer.failures},
@@ -847,13 +886,16 @@ class Orchestrator:
         for panel in self.cfg.panels:
             if panel.name in self.panels or hours < panel.at_hours:
                 continue
-            version = panel.version if panel.version is not None else self.current
+            calibration = panel.kind == "teacher_calibration"
+            version = 0 if calibration else panel.version if panel.version is not None else self.current
             if version and version not in self.adapters.on_disk():
                 log.error("panel %s: adapter v%d is not on disk; skipping it", panel.name, version)
                 self.panels[panel.name] = PanelRun(panel, version, 0, 0)
                 self.save_state()
                 continue
-            specs = load_specs(panel.specs)
+            specs = panel_specs(self.cfg, panel)
+            if calibration:
+                self._write_panel_specs(panel, specs)
             self.adapters.pin(version)
             self.panels[panel.name] = PanelRun(panel, version, len(specs), len(specs))
             for spec in specs:
@@ -861,6 +903,12 @@ class Orchestrator:
                 self.panel_queue.append(Pending(spec, "panel", base_id, panel.name, version))
             self.save_state()
             log.info("panel %s: %d games on v%d", panel.name, len(specs), version)
+
+    def _write_panel_specs(self, panel: PanelConfig, specs: Sequence[GameSpec]) -> None:
+        """A generated panel's specs, kept beside its games: what was played stays on record."""
+        folder = self.root / "panels" / panel.name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "specs.jsonl").write_text("".join(json.dumps(s.to_json()) + "\n" for s in specs))
 
     def _panel_done(self, game: Game, *, finished: bool) -> None:
         run = self.panels.get(game.panel or "")
@@ -913,6 +961,30 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             log.exception("the background sync failed")
 
+    def _start_hard_labels(self, hour: int) -> None:
+        """One labelling pass in the background: a slow teacher must not hold up the games or the watchdog."""
+        if self._hard_task is None or self._hard_task.done():
+            self._hard_task = asyncio.create_task(self._hard_labels(hour))
+
+    async def _hard_labels(self, hour: int) -> None:
+        assert self.hard is not None
+        try:
+            rows, info = await self.hard.label(hour, latest_aux_alpha(self.root / "health.jsonl"))
+            if rows:
+                write_rows(self.root / "inbox", f"hard-{hour:03d}-{self.hard.passes:05d}", rows)
+                self.counts["hard_rows"] += len(rows)
+            self.counts["hard_asked"] += info["asked"]
+            self._write("hard.json", self.hard.state_dict())
+            if info["asked"]:
+                log.info("hard-state labels: %s", info)
+        except Exception:  # noqa: BLE001 - labels are an extra: a failed pass is counted and the run goes on
+            self.counts["hard_errors"] += 1
+            log.exception("a hard-state labelling pass failed")
+
+    async def join_hard(self) -> None:
+        if self._hard_task is not None:
+            await asyncio.shield(self._hard_task)
+
     async def join_sync(self) -> None:
         """Wait for a sync in progress (tests, and the final upload, which must not overlap it)."""
         if self._sync_task is not None:
@@ -928,6 +1000,7 @@ class Orchestrator:
         if self.learner:
             await self._stage("stop the learner", self._stop_learner())
         await self._stage("save critic", self.save_critic())
+        await self._stage("hard-state labels", self.join_hard())
         now = self.now()
         spent: budget.Spend | None = None
         with contextlib.suppress(Exception):
@@ -1055,6 +1128,63 @@ def load_credit(cfg: RunConfig | None = None) -> Credit:
     return RealCredit(config, critic=critic)
 
 
+def teacher_settings(cfg: RunConfig, model: str) -> tuple[str | None, int]:
+    """The (effort, max_tokens) the calibration panel played `model` with: a label is asked the way the games that
+    picked the teacher were. A model the panels do not list gets the distillation CLI's (low, 1024)."""
+    for panel in cfg.panels:
+        for teacher in panel.teachers:
+            if model in (teacher.model, teacher.name):
+                return teacher.effort, teacher.max_tokens
+    return "low", 1024
+
+
+def latest_aux_alpha(health: Path) -> float | None:
+    """The learner's newest `aux_alpha` from the tail of its health log (None: no update has logged one yet)."""
+    try:
+        with health.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("aux_alpha") is not None:
+            return float(record["aux_alpha"])
+    return None
+
+
+def load_hard_states(cfg: RunConfig, tools: Sequence[Any], http: httpx.AsyncClient) -> HardStates | None:
+    """The hard-state labeller of a run whose config enables it: the policy's prompt and order tools, a teacher client
+    on the LiteLLM endpoint (its key from the environment, never printed; its effort and max_tokens those the
+    calibration panel played the model with) and the policy's tokenizer, loaded here once so that a missing or
+    unreachable tokenizer stops the run at its start, before any label is paid for. Blocking (the tokenizer download):
+    call it in a thread from async code."""
+    hard = cfg.hard_states
+    if not hard.enabled:
+        return None
+    from agentenv_zeroad import brains
+    from agentenv_zeroad.spend import SpendGuard
+    from agentenv_zeroad.train.distill import HubTokenizer, Policy
+    from agentenv_zeroad.train.hardstate import HardStates
+
+    iface = cfg.games.interface
+    policies = {iface: Policy(brains.strategist_system(iface), tuple(brains.offered_tools(tools, iface)))}
+    url, key = hard.base_url or os.environ[LITELLM_URL_ENV], os.environ[hard.api_key_env]
+
+    def make_teacher(model: str, guard: SpendGuard) -> StrategistModel:
+        effort, max_tokens = teacher_settings(cfg, model)
+        return StrategistModel(model, url, key, guard, effort=effort, max_tokens=max_tokens, http=http)
+
+    return HardStates(
+        hard, root=cfg.root, ledger=cfg.ledger_path, policies=policies, make_teacher=make_teacher,
+        tokenizer=HubTokenizer(hard.tokenizer), seed=cfg.seed,
+    )  # fmt: skip
+
+
 async def serve(args: argparse.Namespace) -> str:
     from agentenv_zeroad.pool import EnginePool
     from agentenv_zeroad.server import tool_specs
@@ -1066,6 +1196,10 @@ async def serve(args: argparse.Namespace) -> str:
     except ValueError as e:
         raise SystemExit(f"the run config does not make a runnable run: {e}") from e
     missing = [k for k in [cfg.servers.api_key_env, *frontier_keys] if not os.environ.get(k)]
+    needs_url = any(p.kind == "teacher_calibration" and not p.base_url for p in cfg.panels)
+    needs_url = needs_url or (cfg.hard_states.enabled and not cfg.hard_states.base_url)
+    if needs_url and not os.environ.get(LITELLM_URL_ENV):
+        missing.append(LITELLM_URL_ENV)
     if missing:
         raise SystemExit(f"not set: {', '.join(missing)}")
     credit = PlayOnly() if args.play_only else load_credit(cfg)
@@ -1094,6 +1228,7 @@ async def serve(args: argparse.Namespace) -> str:
             syncer=Syncer(cfg.root, cfg.s3_uri),
             http=http,
             learner=not args.play_only,
+            hard_states=None if args.play_only else await asyncio.to_thread(load_hard_states, cfg, tools, http),
         )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):

@@ -100,6 +100,7 @@ First fix the interface so skill can show, freeze it, and re-baseline the base m
   - Played in lockstep at equal latency.
   - The S2 baseline panel is 8 Opus, 8 Sonnet and 4 Astra games, about $26, repeated at the end of Run 1.
   - Frontier rungs (Opus, then Astra) are tested at champion promotions in later stages.
+  - **Teacher calibration (S2).** A `teacher_calibration` panel plays each configured teacher (Astra, Opus, any LiteLLM model name) against Petra-3 and Petra-4 on interface v2 in lockstep at the policy's own latency L, 16 games in all (at least 6 per teacher against Petra-3), turn-logged, under the frontier spend caps. Results stay in `ROOT/panels/teacher-calibration/`, and `report.json` carries each teacher's win rate per rung with Wilson intervals (a few games say little, and the intervals show it; `best.separated` says whether the best teacher's Petra-3 interval is clear of the runner-up's). The teacher for distillation and for hard-state labels is the one with the best win rate against Petra-3, ties broken by Petra-4, not the one that beat Qwen.
 
 ### 6. Evaluation and graphs
 
@@ -130,7 +131,7 @@ First fix the interface so skill can show, freeze it, and re-baseline the base m
 |---|---|---|---|---|
 | S0 Build | Items below | CI green on the new unit tests; interface v2 frozen; offline learner dry run on pilot decisions; prompt ≤ 2.6k p90 | ~15 engineering days, ~8–10 calendar days in 3 agent streams | $0 |
 | S1 Ceiling check | On a CPU box: bot v1 vs v2 (field failures −80%, villagers at 15 min +30%, less idle production); Qwen's logged order streams replayed through the v2 executor (median army at 10 min ≥ 8); engine core-s, RSS and step time by minute | All pass, or fix the executor first | ~2 h | ~$5 |
-| S2 Box day 1 | GPU gates (≥ 3 decisions/s per GPU with the real adapter mix, ≤ 2 s per trained decision, log-prob agreement < 0.05); positive control through the full scoring path; v0 384-game panel, base-v1 subset, frontier baseline; optional distillation probe | Gates met and the control learns | ~6.5 h on a g6e.12xlarge | ~$68 box + ~$26 frontier + ~$63 distillation labels ≈ $157 (≈ $94 without the probe) |
+| S2 Box day 1 | GPU gates (≥ 3 decisions/s per GPU with the real adapter mix, ≤ 2 s per trained decision, log-prob agreement < 0.05); positive control through the full scoring path; v0 384-game panel, base-v1 subset, frontier baseline; teacher calibration panel (16 games, Astra and Opus against Petra-3 and Petra-4, inside the frontier line); optional distillation probe | Gates met and the control learns | ~6.5 h on a g6e.12xlarge | ~$68 box + ~$26 frontier + ~$63 distillation labels ≈ $157 (≈ $94 without the probe) |
 | S3 Run 1 | 10 h of continuous RL from v0 or the distilled adapter | Pre-registered GO / ITERATE / NO-GO | 10 h | ~$105 box + ~$26 frontier ≈ $131 |
 | S4 Run 2 | 24 h: one box, or two replicate runs, or a 3-box actor-learner | Slope still positive; a milestone passed; health clean | 24 h | ~$252–760 + ≤ $50/day frontier |
 | S5 Livestream | Continual learning on stream | Ongoing, under a daily cap | Days | ~$335/day in one-box mode |
@@ -139,10 +140,15 @@ The total to the first GO decision is about $295 with the distillation probe and
 
 ### The distillation probe (optional, recommended)
 
-- **Teacher choice:** whichever of Opus or Astra does better at equal latency in the S2 frontier panel.
-- **Labels:** the teacher relabels about 3,000 stratified v2 briefs from the v0 baseline games, at about $57, plus $6 for a label-noise check.
-- **Training:** SFT a separate adapter, about 40 min on 2 GPUs, then play it on the panel.
-- **Rule, written in advance:** if it beats v0 at p < 0.05, Run 1 starts from it with its own baseline row.
+The literature review (`sft-warmup-lit.md`, fetched notes kept out of the repo) says what makes imitation pay off: RL tied to the imitation policy by a KL term (AlphaStar gained about 380 Elo from the KL, and VPT is the same story), not the SFT itself, which caps near the teacher. Teacher labels on the student's own states (DAgger, LEAP) beat SFT on the teacher's games, big or over-trained SFT hurts, and teacher signal belongs only where RL has none. The probe is built that way.
+
+- **Teacher choice:** the best win rate against Petra-3 in the S2 teacher calibration panel, ties broken by Petra-4 (`distill.py --calibration`).
+- **Labels:** the teacher relabels 3,000 briefs from the student's own v0 baseline games, at about $57, plus $6 for a label-noise check. The default weights are 60% losing positions (net worth behind at decision time in a game lost to Petra-2 or Petra-3), 20% late-game turns and 20% turns with a rejected order; `--weights` changes them.
+- **Training:** SFT a separate adapter for 1 to 2 epochs (default 2, `--sft-epochs`), about 40 min on 2 GPUs. The learner publishes a checkpoint after each epoch with its mean token entropy against the base model's. Each checkpoint plays the held-out panel.
+- **Which checkpoint:** by held-out win rate, with an entropy floor: a checkpoint whose mean token entropy fell below 0.7 of the base model's is rejected, and the SFT loss never decides (`stats.select_sft_checkpoint`, shown as `sft_selection` in `report.json`). If none passes, Run 1 starts from the base model.
+- **Rule, written in advance:** if the chosen checkpoint beats v0 at p < 0.05, Run 1 starts from it with its own baseline row.
+- **Run 1 stays tied to it:** the learner gets `--init` pointing at the chosen checkpoint and anchors to it (`--anchor` defaults to `--init`; `--anchor base` anchors to the base model, and with no `--init` there is nothing else to anchor to). Its loss adds a per-token KL penalty to that frozen anchor (k3 estimator, beta 0.1 decaying by 0.999 an update), while KL-to-base remains the health alarm.
+- **Teacher signal only where RL has none:** with `[hard_states]` enabled, the orchestrator tracks the policy's rolling win rate (last 40 games) per opponent. Against an opponent below 5% it relabels up to 200 decisions an hour with the calibrated teacher, capped at $10 an hour, and the learner trains on them with a small decaying cross-entropy term (0.2, decaying by 0.995 an update). Off by default.
 - **Honest story either way:** base → distilled → RL. If outcome-only RL comes out flat, which is about as likely as not, this is still a labelled step.
 
 ## Engineering (S0), about 15 focused days

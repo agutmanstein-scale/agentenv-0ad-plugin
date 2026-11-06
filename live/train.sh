@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# train.sh ID start CONFIG [--init PATH] [--baseline PATH] [--play-only] | status [LINES] | stop  [--yes|--dry-run]
+# train.sh ID start CONFIG [--init PATH] [--anchor PATH|base] [--baseline PATH] [--play-only] | status [LINES] | stop  [--yes|--dry-run]
 # A post-training run on box ID (bootstrapped with bootstrap.sh --train), through box/train.sh. `start` sends the run
 # config file CONFIG (TOML, train/config.py) to the box, checks it there, and starts the learner and the orchestrator,
-# refused when LIVE_BUDGET_USD would be passed or a vLLM instance is down; --init and --baseline name files under
-# /var/lib/zeroad-live/train on the box, --play-only starts no learner and credits nothing (a baseline or a panel run).
+# refused when LIVE_BUDGET_USD would be passed or a vLLM instance is down; --init, --anchor and --baseline name files under
+# /var/lib/zeroad-live/train on the box (--anchor defaults to --init; `--anchor base` anchors to the base model), --play-only starts no learner and credits nothing (a baseline or a panel run).
 # `stop` SIGTERMs the orchestrator, which stops the learner, uploads the run to its s3 prefix and ends (the box stays up:
 # `aws ec2 stop-instances`, live/stop-box.sh, when the upload is checked). `status` is read-only. start and stop are dry
 # runs unless --yes; status runs unless --dry-run. The run copies itself to S3 with the box's role (train-iam.sh).
