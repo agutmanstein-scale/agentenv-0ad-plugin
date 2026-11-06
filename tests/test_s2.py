@@ -390,13 +390,13 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 
 
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
-    numbers = S.check_dir(LIVE_S2, 350)
+    numbers = S.check_dir(LIVE_S2, 450)
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
     assert 19 <= numbers["expected_hours"] <= 20 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
-    assert cost < 350
+    assert cost < 450
 
 
 @pytest.mark.parametrize(
@@ -404,7 +404,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
     [("e2.toml", "positive_control = true", "positive_control = false", "positive_control must be true"),
      ("run1.toml", "shutdown = false", "shutdown = true", "shutdown must be false"),
      ("run1.toml", "box_usd_per_hour = 10.49", "box_usd_per_hour = 15.07", "different box rates"),
-     ("e1.toml", "budget_usd = 350", "budget_usd = 400", "above the stage budget"),
+     ("e1.toml", "budget_usd = 450", "budget_usd = 500", "above the stage budget"),
      ("run1.toml", "duration_hours = 10", "duration_hours = 12", "past its cap_hours"),
      ("baselines.toml", 'uri = "s3://BUCKET/zeroad-train/run/s2-baselines"', "", "s3.uri is required"),
      ("sft-panels.toml", 's2/sft"', 's2/other"', "share one root"),
@@ -419,7 +419,7 @@ def test_a_config_directory_that_would_break_the_sequence_is_refused(tmp_path, f
     assert old in path.read_text(), old
     path.write_text(path.read_text().replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 350)
+        S.check_dir(cdir, 450)
 
 
 def test_every_step_is_recorded_with_its_start_and_end_and_the_next_starts_only_if_the_gate_passed(

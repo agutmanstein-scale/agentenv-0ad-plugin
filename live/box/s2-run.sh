@@ -22,7 +22,7 @@ done
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 TRAIN=$STATE/train
 UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; a dry run elsewhere may have it elsewhere
-export PATH="/usr/local/bin:/usr/bin:/bin${UV_BIN:+:${UV_BIN%/*}}"
+export PATH="${UV_BIN:+${UV_BIN%/*}:}/usr/local/bin:/usr/bin:/bin"
 export XDG_STATE_HOME=$STATE/agentenv AGENT_ENV_CONFIG=$ETC/agent-env.toml
 export ZEROAD_MIN_FREE_GB=${ZEROAD_MIN_FREE_GB:-8} ZEROAD_MATCH_CAP_USD=${ZEROAD_MATCH_CAP_USD:-9}
 export LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
