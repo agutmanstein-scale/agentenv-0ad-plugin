@@ -1393,6 +1393,51 @@ def baseline_from(records: Sequence[dict[str, Any]], window: int = 10) -> dict[s
     return baseline
 
 
+def probe(
+    learner: Learner, rows_path: Path, *, agree_rows: int = 5, batch_rows: int = 32, warmup_rows: int = 8
+) -> dict[str, Any]:
+    """The box-day GPU gates of the learner (docs/s2-box-day.md), on rows vLLM sampled (the inbox format, with its
+    log-probs): how far the learner's log-prob of each sampled token is from vLLM's (the mean absolute gap over the
+    first `agree_rows` rows' tokens, before any update, so the adapter is still the base model), and how long one update
+    takes per trained decision on a synthetic batch of `batch_rows` rows with advantages of plus and minus one (after a
+    warm-up update of `warmup_rows`, whose first CUDA calls are slow). Rank 0 reads the file and the rows are broadcast;
+    every rank takes part in the updates; rank 0 returns the numbers."""
+    rows: list[Decision] | None = None
+    if learner.comm.rank == 0:
+        rows = [
+            parse_row(json.loads(line), learner.cfg.max_len)
+            for line in rows_path.read_text().splitlines()
+            if line.strip()
+        ]
+    rows = learner.comm.broadcast(rows)
+    assert rows is not None
+    if len(rows) < max(agree_rows, batch_rows):
+        raise SystemExit(f"{rows_path} has {len(rows)} rows: the probe needs at least {max(agree_rows, batch_rows)}")
+    result: dict[str, Any] = {}
+    if learner.comm.rank == 0:
+        gaps = []
+        for row in rows[:agree_rows]:
+            logp, _ = learner.logps(row, grad=False)
+            gaps.append((logp.float().cpu() - torch.tensor(row.logprobs)).abs())
+        every = torch.cat(gaps)
+        result["agreement"] = {
+            "rows": agree_rows, "tokens": int(every.numel()), "mean_abs_gap": float(every.mean()),
+            "max_abs_gap": float(every.max()),
+        }  # fmt: skip
+    signed = [replace(r, advantage=1.0 if i % 2 == 0 else -1.0) for i, r in enumerate(rows)]
+    learner.update(signed[:warmup_rows])
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    started = time.time()
+    health = learner.update(signed[warmup_rows : warmup_rows + batch_rows] or signed[:batch_rows])
+    elapsed = time.time() - started
+    learner.comm.barrier()
+    result["timing"] = {
+        "decisions": health["trained"], "seconds": elapsed, "seconds_per_decision": elapsed / max(health["trained"], 1),
+        "world": learner.comm.world,
+    }  # fmt: skip
+    return result
+
+
 def serve(
     learner: Learner,
     inbox: Inbox | None,
@@ -1489,6 +1534,9 @@ def parse() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
+    p.add_argument(
+        "--probe", default="", help="the box-day gates: read these sampled rows, write ROOT/probe.json, exit"
+    )
     return p.parse_args()
 
 
@@ -1524,6 +1572,14 @@ def main() -> None:
     comm.sync_params([p for p in model.parameters() if p.requires_grad])
     tokenizer = AutoTokenizer.from_pretrained(cfg.base)
     learner = Learner(cfg, model, lambda ids: tokenizer.decode(ids, skip_special_tokens=False), comm, baseline=baseline)
+    if args.probe:
+        result = probe(learner, Path(args.probe))
+        if comm.rank == 0:
+            (cfg.root / "probe.json").write_text(json.dumps(result))
+            log.info("probe: %s", result)
+        comm.barrier()
+        comm.close()
+        return
     if learner.resume():
         log.info("resumed at version %d", learner.version)
     serve(learner, Inbox(cfg) if comm.rank == 0 else None, poll=args.poll)

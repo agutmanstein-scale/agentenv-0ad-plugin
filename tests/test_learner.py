@@ -848,3 +848,37 @@ def types_tokenizer():
             return [ord(c) for c in text]
 
     return Tokenizer()
+
+
+# --- the box-day probe ---
+
+
+def probe_file(tmp_path: Path, learner: L.Learner, n: int = 12, *, offset: float = 0.0) -> Path:
+    """Rows as the throughput probe writes them: the learner's own log-probs plus `offset` stand in for vLLM's."""
+    out = []
+    for r in rows(n):
+        logp, _ = learner.logps(r, grad=False)
+        out.append({
+            "game_id": r.game_id, "version": 0, "prompt_token_ids": r.prompt, "token_ids": r.completion,
+            "logprobs": [float(x) + offset for x in logp], "advantage": 0.0,
+        })  # fmt: skip
+    path = tmp_path / "probe-rows.jsonl"
+    path.write_text("".join(json.dumps(x) + "\n" for x in out))
+    return path
+
+
+def test_the_probe_reports_the_log_prob_gap_to_vllm_and_the_seconds_per_trained_decision(tmp_path):
+    learner = make_learner(tmp_path)
+    path = probe_file(tmp_path, learner, offset=-0.03)
+    result = L.probe(learner, path, agree_rows=5, batch_rows=8, warmup_rows=2)
+    assert result["agreement"]["mean_abs_gap"] == pytest.approx(0.03, abs=1e-4) and result["agreement"]["rows"] == 5
+    assert result["agreement"]["tokens"] == sum(len(r.completion) for r in rows(5))
+    timing = result["timing"]
+    assert timing["decisions"] == 8 and timing["seconds_per_decision"] == pytest.approx(timing["seconds"] / 8)
+    assert learner.version == 2  # the warm-up update and the timed one, in a throwaway root
+
+
+def test_a_probe_with_too_few_rows_refuses_instead_of_timing_nothing(tmp_path):
+    learner = make_learner(tmp_path)
+    with pytest.raises(SystemExit, match="needs at least 32"):
+        L.probe(learner, probe_file(tmp_path, learner, 6))
