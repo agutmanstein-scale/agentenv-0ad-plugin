@@ -2,20 +2,28 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
 
 --- a/source/main.cpp
 +++ b/source/main.cpp
-@@ -703,7 +703,10 @@
- 			if (isVisual)
- 				Frame(rlInterface ? &*rlInterface : nullptr);
- 			else if(rlInterface)
-+			{
- 				rlInterface->TryApplyMessage();
-+				rlInterface->WaitForMessage(std::chrono::milliseconds{2});
-+			}
- 			else
- 				NonVisualFrame();
- 		}
+@@ -762,7 +762,10 @@
+ 					Frame(rlInterface ? &*rlInterface : nullptr, fixedFrameFrequency);
+ #endif
+ 				else if(rlInterface)
++				{
+ 					rlInterface->TryApplyMessage();
++					rlInterface->WaitForMessage(std::chrono::milliseconds{2});
++				}
+ 				else
+ 					NonVisualFrame();
+ 			}
 --- a/source/rlinterface/RLInterface.cpp
 +++ b/source/rlinterface/RLInterface.cpp
-@@ -66,8 +66,20 @@
+@@ -43,6 +43,7 @@
+ #include "simulation2/system/TurnManager.h"
+ 
+ #include <cstdlib>
++#include <cstring>
+ #include <js/RootingAPI.h>
+ #include <js/TypeDecls.h>
+ #include <js/Value.h>
+@@ -79,13 +80,25 @@
  	std::unique_lock<std::mutex> msgLock(m_MsgLock);
  	ENSURE(m_GameMessage.type == GameMessageType::None);
  	m_GameMessage = std::move(msg);
@@ -26,34 +34,77 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
 +	m_Wake.notify_one();
  	m_MsgApplied.wait(msgLock, [this]() { return m_GameMessage.type == GameMessageType::None; });
  	return m_ReturnValue;
-+}
-+
-+void Interface::WaitForMessage(std::chrono::milliseconds timeout)
-+{
-+	std::unique_lock<std::mutex> wakeLock(m_WakeLock);
-+	m_Wake.wait_for(wakeLock, timeout, [this]() { return m_Posted.load(); });
-+	m_Posted = false;
  }
  
- std::string Interface::Step(std::vector<GameCommand>&& commands)
+-std::string Interface::Step(std::vector<GameCommand>&& commands)
++void Interface::WaitForMessage(std::chrono::milliseconds timeout)
+ {
++	std::unique_lock<std::mutex> wakeLock(m_WakeLock);
++	m_Wake.wait_for(wakeLock, timeout, [this]() { return m_Posted.load(); });
++}
++
++std::string Interface::Step(std::vector<GameCommand>&& commands, bool wantState)
++{
+ 	std::lock_guard<std::mutex> lock(m_Lock);
++	m_WantState = wantState;
+ 	return SendGameMessage({ GameMessageType::Commands, std::move(commands) });
+ }
+ 
+@@ -208,7 +221,17 @@
+ 				cmd.json_cmd = line.substr(splitPos + 1);
+ 				commands.push_back(std::move(cmd));
+ 			}
+-			const std::string gameState = interface->Step(std::move(commands));
++			// /step?state=0 skips serialising the game state: a lockstep client that reads state through /evaluate
++			// never looks at the 0.2-0.3 MB reply.
++			bool wantState = true;
++			if (request_info->query_string != nullptr)
++			{
++				const char* query = request_info->query_string;
++				char state[4];
++				if (mg_get_var(query, std::strlen(query), "state", state, sizeof(state)) > 0 && state[0] == '0')
++					wantState = false;
++			}
++			const std::string gameState = interface->Step(std::move(commands), wantState);
+ 			if (gameState.empty())
+ 			{
+ 				mg_printf(conn, "%s", notRunningResponse);
+@@ -313,6 +336,7 @@
+ 	{
+ 		msg = m_GameMessage;
+ 		m_GameMessage = {GameMessageType::None};
++		m_Posted = false;
+ 		return true;
+ 	}
+ 	return false;
+@@ -419,7 +443,7 @@
+ 				g_Game->Update(deltaRealTime);
+ 			m_Stepped = true;
+ 
+-			m_ReturnValue = GetGameState();
++			m_ReturnValue = m_WantState ? GetGameState() : std::string("{}");
+ 			m_MsgApplied.notify_one();
+ 			m_MsgLock.unlock();
+ 			break;
 --- a/source/rlinterface/RLInterface.h
 +++ b/source/rlinterface/RLInterface.h
-@@ -21,6 +21,8 @@
+@@ -22,6 +22,8 @@
  #include "simulation2/helpers/Player.h"
  #include "third_party/mongoose/mongoose.h"
  
 +#include <atomic>
 +#include <chrono>
  #include <condition_variable>
+ #include <exception>
  #include <mutex>
- #include <vector>
-@@ -87,6 +89,13 @@
+@@ -97,6 +99,14 @@
  	~Interface();
  
  	/**
 +	 * Block the calling (main) thread until a message is posted or @param timeout passes, whichever is first.
 +	 * The nonvisual main loop calls this after each TryApplyMessage() instead of spinning, so an engine
-+	 * waiting for its next /step uses no CPU. The timeout bounds the wait for the game-start poll in TryApplyMessage.
++	 * waiting for its next /step uses no CPU. In nonvisual mode the timeout only bounds the loop, so it re-checks
++	 * g_Shutdown. The flag the wait watches is cleared when TryGetGameMessage takes a message, not by the wait.
 +	 */
 +	void WaitForMessage(std::chrono::milliseconds timeout);
 +
@@ -61,7 +112,25 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  	 * Non-blocking call to process any pending messages from the RL client.
  	 * Updates m_ReturnValue to the gamestate after messages have been processed.
  	 */
-@@ -158,6 +167,9 @@
+@@ -115,9 +125,10 @@
+ 
+ 	/**
+ 	 * Process commands, update the simulation by one turn.
+-	 * @return the gamestate after processing commands.
++	 * @param wantState false (/step?state=0) skips serialising the state.
++	 * @return the gamestate after processing commands, or "{}" when @param wantState is false.
+ 	 */
+-	std::string Step(std::vector<GameCommand>&& commands);
++	std::string Step(std::vector<GameCommand>&& commands, bool wantState);
+ 
+ 	/**
+ 	 * Reset the game state according to scenario, cleaning up existing games if required.
+@@ -171,10 +182,14 @@
+ 	ScenarioConfig m_ScenarioConfig;
+ 	std::string m_ReturnValue;
+ 	bool m_NeedsGameState = false;
++	bool m_WantState = true;
+ 
  	mutable std::mutex m_Lock;
  	std::mutex m_MsgLock;
  	std::condition_variable m_MsgApplied;

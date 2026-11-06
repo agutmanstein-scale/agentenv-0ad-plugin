@@ -18,7 +18,8 @@ from pathlib import Path
 
 import click
 
-from agentenv_zeroad.engine import DEFAULT_IMAGE, reap_orphans
+from agentenv_zeroad.engine import DEFAULT_IMAGE, PATCHES_LABEL, reap_orphans
+from agentenv_zeroad.pool import TRAIN_PATCHES
 
 ENVIRONMENT_NAME = "zeroad"
 LIVE_ENV = "zeroad-live"
@@ -59,10 +60,25 @@ def image_exists(image: str) -> bool:
         raise click.ClickException(f"docker is not available: {e}") from e
 
 
+def rt_image_current() -> bool:
+    """Whether the rt engine image exists and carries every patch the build applies (its `zeroad.patches` label); an
+    older rt image built without one keeps the tag, so existence alone is not enough to skip the build."""
+    try:
+        done = subprocess.run(
+            ["docker", "image", "inspect", "-f", f'{{{{index .Config.Labels "{PATCHES_LABEL}"}}}}', RT_IMAGE],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as e:
+        raise click.ClickException(f"docker is not available: {e}") from e
+    return done.returncode == 0 and done.stdout.split() == list(TRAIN_PATCHES)
+
+
 def live_build_commands(root: Path, image: str) -> list[list[str]]:
-    """The docker builds `setup --live` runs: the rt engine when missing, the env image on it, the live image on top."""
+    """The docker builds `setup --live` runs: the rt engine when missing or built without the current patches, the env
+    image on it, the live image on top."""
     cmds = []
-    if not image_exists(RT_IMAGE):
+    if not rt_image_current():
         cmds.append([str(root / "scripts/build-engine.sh"), "rt"])
     env_image = f"{image}-rt-base"
     cmds += build_commands(root, env_image, RT_IMAGE)

@@ -24,7 +24,7 @@ import asyncio
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,11 +32,14 @@ from typing import Literal
 
 from agentenv_zeroad.engine import (
     DEFAULT_IMAGE,
+    IDLE_WAIT_PATCH,
     PORT_STOP,
     Engine,
+    EngineError,
     EngineOptions,
     RunningEngine,
     free_ports,
+    image_patches,
     reap_orphans,
     start_engine,
 )
@@ -45,22 +48,47 @@ log = logging.getLogger(__name__)
 
 BASE_PORT = 16000
 
-TRAIN_IMAGE = "zeroad-engine:0.28-rt"  # 0.28 rebuilt with patches/rl-idle-wait.patch: an idle engine sleeps
+TRAIN_IMAGE = "zeroad-engine:0.28-rt"  # 0.28 rebuilt with the patches below; `scripts/build-engine.sh rt` builds it
+TRAIN_PATCHES = ("rl-realtime", "rl-idle-wait")  # its zeroad.patches label: an idle engine sleeps, /step?state=0 works
+
+
+def _topology_key(cpu: Path) -> str | None:
+    """What identifies the physical core a logical CPU belongs to: the list of CPUs sharing it (every hyperthread of a
+    core reads the same list), else its package and core id."""
+    for name in ("core_cpus_list", "thread_siblings_list"):
+        try:
+            return (cpu / "topology" / name).read_text().strip()
+        except OSError:
+            continue
+    try:
+        package = (cpu / "topology/physical_package_id").read_text().strip()
+        core = (cpu / "topology/core_id").read_text().strip()
+    except OSError:
+        return None
+    return f"{package}:{core}"
+
+
+def _allowed_cpus() -> set[int] | None:
+    """The CPUs this process may run on (a cgroup cpuset or `taskset` shrinks it), None where that can't be asked."""
+    try:
+        return set(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
 
 
 def physical_cores(cpu_root: Path = Path("/sys/devices/system/cpu")) -> int:
-    """Physical cores of this machine (hyperthreads counted once), from sysfs; half the logical CPUs when sysfs has no
-    topology (a laptop, a container without it), at least 1. Engines beyond this share cores with each other and with
-    the Python workers, so it is the pool's default size."""
-    cores: set[tuple[str, str]] = set()
+    """Physical cores this process may use (hyperthreads of one core counted once), from sysfs and the affinity mask;
+    half the allowed logical CPUs when sysfs has no topology (a laptop, a container without it), at least 1. Engines
+    beyond this share cores with each other and with the Python workers, so it is the pool's default size."""
+    allowed = _allowed_cpus()
+    cores: set[str] = set()
     for cpu in cpu_root.glob("cpu[0-9]*"):
-        try:
-            package = (cpu / "topology/physical_package_id").read_text().strip()
-            core = (cpu / "topology/core_id").read_text().strip()
-        except OSError:
+        if allowed is not None and int(cpu.name.removeprefix("cpu")) not in allowed:
             continue
-        cores.add((package, core))
-    return len(cores) or max(1, (os.cpu_count() or 2) // 2)
+        key = _topology_key(cpu)
+        if key is not None:
+            cores.add(key)
+    return len(cores) or max(1, (len(allowed) if allowed else os.cpu_count() or 2) // 2)
 
 
 StartOne = Callable[[EngineOptions, Path | None], Awaitable[RunningEngine]]
@@ -114,6 +142,7 @@ class EnginePool:
         keep_replays: bool = False,
         ready_timeout: float = 120.0,
         start_one: StartOne | None = None,
+        require_patches: Sequence[str] = (),
     ):
         if size < 1:
             raise ValueError("an engine pool needs at least one engine")
@@ -125,6 +154,9 @@ class EnginePool:
         self.home_root = home_root
         self.keep_replays = keep_replays
         self.ready_timeout = ready_timeout
+        self.require_patches = tuple(require_patches)
+        self.no_state_step = False  # set from the image's label when the pool starts docker engines itself
+        self._checks_image = start_one is None and mode == "docker"
         self._start_one = start_one or self._start_engine
         self._free: asyncio.Queue[_Slot] = asyncio.Queue()
         self._slots: list[_Slot] = []
@@ -138,7 +170,9 @@ class EnginePool:
         await self.close()
 
     async def start(self) -> None:
-        """Reap dead owners' containers once, pick the ports, and start every engine concurrently."""
+        """Check the image, reap dead owners' containers once, pick the ports, and start every engine concurrently."""
+        if self._checks_image:
+            await self._check_image()
         if self.mode == "docker":
             await reap_orphans()
         elif self.home_root is None:
@@ -153,6 +187,20 @@ class EnginePool:
             raise failed[0]
         for slot in self._slots:
             self._free.put_nowait(slot)
+
+    async def _check_image(self) -> None:
+        """Refuse an image that is not built here, or lacks a patch this run needs (an older unpatched image under the
+        patched tag); an image with the idle-wait patch gets `/step?state=0`."""
+        patches = await image_patches(self.image)
+        if patches is None:
+            raise EngineError(f"engine image {self.image} is not built here: scripts/build-engine.sh rt")
+        missing = [p for p in self.require_patches if p not in patches]
+        if missing:
+            raise EngineError(
+                f"engine image {self.image} lacks the patches {', '.join(missing)} (its zeroad.patches label is "
+                f"{' '.join(patches) or 'empty'}): rebuild it with `REBUILD=1 scripts/build-engine.sh rt`"
+            )
+        self.no_state_step = IDLE_WAIT_PATCH in patches
 
     async def close(self) -> None:
         slots, self._slots = self._slots, []
@@ -197,4 +245,5 @@ class EnginePool:
             ready_timeout=self.ready_timeout,
             docker={"reap": False},
             home=home,
+            no_state_step=self.no_state_step,
         )

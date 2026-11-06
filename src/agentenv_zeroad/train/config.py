@@ -52,7 +52,7 @@ from agentenv_zeroad import grading
 from agentenv_zeroad.clock import DEFAULT_LATENCY_MS
 from agentenv_zeroad.interface import INTERFACES, Interface
 from agentenv_zeroad.pilot.games import CIVS
-from agentenv_zeroad.pool import TRAIN_IMAGE, physical_cores
+from agentenv_zeroad.pool import TRAIN_IMAGE, TRAIN_PATCHES, physical_cores
 
 RUN1_MIX = {"bot": 0.10, "petra-1": 0.35, "petra-2": 0.35, "petra-3": 0.10, "base": 0.10}
 TRAIN_MOUNT = "/train"  # where the vLLM containers see the box's train folder
@@ -164,7 +164,10 @@ class RunConfig:
     shutdown: bool = False
     engines: int = 0  # engine containers; 0 = the box's physical cores
     concurrency: int = 0  # games in flight; 0 = all the engines
-    engine_image: str = TRAIN_IMAGE  # the engine image: one built with patches/rl-idle-wait.patch
+    engine_image: str = TRAIN_IMAGE  # the engine image: one built with the patches/ below
+    engine_patches: tuple[str, ...] = (
+        TRAIN_PATCHES  # its zeroad.patches label must name these; () accepts the PPA image
+    )
     seed: int = 0
     ledger: Path | None = None  # frontier spend, as budget.sh's spend.jsonl; default ROOT/spend.jsonl
     sync_interval_s: float = 900.0
@@ -192,6 +195,7 @@ class RunConfig:
             raise ValueError("budget_usd, box_usd_per_hour and duration_hours must be positive")
         if self.s3_uri is not None and not self.s3_uri.startswith("s3://"):
             raise ValueError("s3.uri must start with s3://")
+        object.__setattr__(self, "engine_patches", tuple(self.engine_patches))
         if self.engines < 0 or self.concurrency < 0:
             raise ValueError("engines and concurrency can't be negative")
         if not self.engines:
@@ -343,7 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"TRAIN_RUN_ID={shlex.quote(cfg.run_id)}\nTRAIN_ROOT={shlex.quote(str(cfg.root))}\n"
         f"TRAIN_DURATION_HOURS={cfg.duration_hours:g}\nTRAIN_BOX_USD_PER_HOUR={cfg.box_usd_per_hour:g}\n"
         f"TRAIN_FRONTIER={int(bool(frontier))}\nTRAIN_ENGINES={cfg.engines}\nTRAIN_CONCURRENCY={cfg.concurrency}\n"
-        f"TRAIN_ENGINE_IMAGE={shlex.quote(cfg.engine_image)}"
+        f"TRAIN_ENGINE_IMAGE={shlex.quote(cfg.engine_image)}\n"
+        f"TRAIN_ENGINE_PATCHES={shlex.quote(' '.join(cfg.engine_patches))}"
     )
     return 0
 

@@ -18,7 +18,10 @@ every docker start (unless the caller reaps once itself, as the engine pool does
 session: a runner killed mid-test no longer leaves engines running.
 
 `step_raw` is `step` without decoding the reply: a 200 ms turn answers with a 0.2-0.3 MB state JSON, and a lockstep
-training game that reads state through `/evaluate` queries never looks at it.
+training game that reads state through `/evaluate` queries never looks at it. On an engine built with
+patches/rl-idle-wait.patch (`no_state_step=True`, set by the pool from the image's `zeroad.patches` label) it posts
+`/step?state=0`, which skips building and serialising that state and answers `{}`; the PPA and stream images ignore
+the query, so they are never told to.
 
 `FakeEngine` has the same async interface for unit tests: deterministic state, no process, records every step. Like
 the real engine, whose startup autostart game is already running, it accepts `step` and `evaluate` before any reset.
@@ -47,6 +50,8 @@ log = logging.getLogger(__name__)
 
 TURN_MS = 200
 DEFAULT_IMAGE = "zeroad-engine:0.28"
+PATCHES_LABEL = "zeroad.patches"  # on an image built from patched sources: the patches, space-separated (Dockerfile.rt)
+IDLE_WAIT_PATCH = "rl-idle-wait"  # the patch that adds /step?state=0 (and the idle wait)
 DOCKER_PYROGENESIS = "/usr/games/pyrogenesis"
 SIM_TIME_JS = "Engine.QueryInterface(SYSTEM_ENTITY, IID_Timer).GetTime()"
 # `TemplateExists` looks the file up without loading it, so an absent name logs nothing; `/templates` (GetTemplate) logs
@@ -102,9 +107,15 @@ class Engine:
     """Async client for one engine's RL interface."""
 
     def __init__(
-        self, url: str = "http://127.0.0.1:6000", *, timeout: float = 120.0, client: httpx.AsyncClient | None = None
+        self,
+        url: str = "http://127.0.0.1:6000",
+        *,
+        timeout: float = 120.0,
+        client: httpx.AsyncClient | None = None,
+        no_state_step: bool = False,
     ):
         self.url = url.rstrip("/")
+        self.no_state_step = no_state_step
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
 
@@ -117,7 +128,7 @@ class Engine:
         return json.loads(await self._post("step", format_commands(commands)))
 
     async def step_raw(self, commands: Commands = ()) -> None:
-        await self._post("step", format_commands(commands))
+        await self._post("step?state=0" if self.no_state_step else "step", format_commands(commands))
 
     async def evaluate(self, code: str) -> Any:
         return json.loads(await self._post("evaluate", code))
@@ -450,6 +461,18 @@ async def reap_orphans() -> list[str]:
     return reaped
 
 
+async def image_patches(image: str) -> tuple[str, ...] | None:
+    """The patches an engine image was built with (its `zeroad.patches` label; empty for the PPA's image), or None when
+    docker has no such image."""
+    code, out = await _run(
+        ["docker", "image", "inspect", "-f", f'{{{{index .Config.Labels "{PATCHES_LABEL}"}}}}', image]
+    )
+    if code != 0:
+        return None
+    label = out.strip()
+    return () if label in ("", "<no value>") else tuple(label.split())
+
+
 async def _run(cmd: list[str]) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out, _ = await proc.communicate()
@@ -484,14 +507,16 @@ async def start_engine(
     ready_timeout: float = 120.0,
     docker: Mapping[str, Any] | None = None,
     home: Path | None = None,
+    no_state_step: bool = False,
 ) -> RunningEngine:
-    """Start an engine and wait for its port; the caller must `close()` it. `home` is a local engine's own HOME.
+    """Start an engine and wait for its port; the caller must `close()` it. `home` is a local engine's own HOME;
+    `no_state_step` makes its `step_raw` ask for no state (only for an engine built with patches/rl-idle-wait.patch).
 
     The port must be free before the start, and our process must still be alive once the port answers; otherwise the
     `Engine` could be talking to some other server (a leftover engine on host networking) while ours has died.
     """
     options = options or EngineOptions()
-    engine = Engine(options.url)
+    engine = Engine(options.url, no_state_step=no_state_step)
     if await engine.answers():
         await engine.aclose()
         raise EngineError(f"{options.url} is already in use by another server; pick a free port")

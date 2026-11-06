@@ -285,3 +285,95 @@ async def test_a_raw_step_posts_the_commands_and_never_decodes_the_reply():
     assert seen == [("/step", '1;{"type":"stop","entities":[9]}')]
     with pytest.raises(ValueError):
         await engine.step()
+
+
+# ---- the image's patches: what the pool refuses and what it turns on ------------------------------------------------
+def fake_image_patches(monkeypatch, result):
+    async def inspect(image):
+        return result
+
+    monkeypatch.setattr(pool_module, "image_patches", inspect)
+
+
+async def started_docker_pool(monkeypatch, **options):
+    async def no_reap():
+        return []
+
+    monkeypatch.setattr(pool_module, "reap_orphans", no_reap)
+    monkeypatch.setattr(pool_module, "free_ports", lambda count, start, stop: [21_700 + i for i in range(count)])
+    seen = []
+
+    async def fake_start(opts, **kwargs):
+        seen.append(kwargs)
+        raise EngineError("stop here")
+
+    monkeypatch.setattr(pool_module, "start_engine", fake_start)
+    pool = EnginePool(1, mode="docker", **options)
+    with pytest.raises(EngineError, match="stop here"):
+        await pool.start()
+    return pool, seen
+
+
+async def test_a_pool_refuses_an_image_docker_does_not_have(monkeypatch):
+    fake_image_patches(monkeypatch, None)
+    with pytest.raises(EngineError, match="not built here"):
+        await EnginePool(1, mode="docker", image="img:1").start()
+
+
+async def test_a_pool_refuses_an_image_without_the_patches_it_requires(monkeypatch):
+    fake_image_patches(monkeypatch, ("rl-realtime",))  # an rt image from before the idle patch
+    with pytest.raises(EngineError, match="lacks the patches rl-idle-wait") as e:
+        await EnginePool(
+            1, mode="docker", image=pool_module.TRAIN_IMAGE, require_patches=pool_module.TRAIN_PATCHES
+        ).start()
+    assert "REBUILD=1" in str(e.value)
+    fake_image_patches(monkeypatch, ())  # the PPA image under any tag
+    with pytest.raises(EngineError, match="lacks the patches rl-realtime, rl-idle-wait"):
+        await EnginePool(1, mode="docker", require_patches=pool_module.TRAIN_PATCHES).start()
+
+
+async def test_an_image_with_the_idle_patch_gets_step_without_state_and_the_ppa_image_does_not(monkeypatch):
+    fake_image_patches(monkeypatch, pool_module.TRAIN_PATCHES)
+    pool, seen = await started_docker_pool(monkeypatch, require_patches=pool_module.TRAIN_PATCHES)
+    assert pool.no_state_step is True and seen[0]["no_state_step"] is True
+    fake_image_patches(monkeypatch, ())
+    pool, seen = await started_docker_pool(monkeypatch)  # a comparison run on the PPA image requires nothing
+    assert pool.no_state_step is False and seen[0]["no_state_step"] is False
+
+
+async def test_a_pool_with_its_own_starter_does_not_ask_docker_about_the_image(monkeypatch):
+    def forbidden(image):
+        raise AssertionError("docker was asked")
+
+    monkeypatch.setattr(pool_module, "image_patches", forbidden)
+    async with EnginePool(1, mode="local", start_one=FakeStarter(), require_patches=pool_module.TRAIN_PATCHES):
+        pass
+
+
+async def test_step_raw_asks_for_no_state_only_on_an_engine_built_for_it():
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, text="{}")
+
+    for no_state in (True, False):
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        engine = Engine("http://e:6000", client=client, no_state_step=no_state)
+        await engine.step_raw({1: [{"type": "stop", "entities": [1]}]})
+        await engine.step({})
+    assert seen == ["http://e:6000/step?state=0", "http://e:6000/step", "http://e:6000/step", "http://e:6000/step"]
+
+
+async def test_image_patches_reads_the_label_and_tells_missing_from_unlabelled(monkeypatch):
+    answers = iter([(0, "rl-realtime rl-idle-wait\n"), (0, "\n"), (0, "<no value>\n"), (1, "no such image")])
+
+    async def run(cmd):
+        assert cmd[:3] == ["docker", "image", "inspect"] and "zeroad.patches" in cmd[4]
+        return next(answers)
+
+    monkeypatch.setattr(engine_module, "_run", run)
+    assert await engine_module.image_patches("i") == ("rl-realtime", "rl-idle-wait")
+    assert await engine_module.image_patches("i") == ()
+    assert await engine_module.image_patches("i") == ()
+    assert await engine_module.image_patches("i") is None
