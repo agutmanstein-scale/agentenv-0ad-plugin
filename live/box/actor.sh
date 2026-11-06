@@ -8,8 +8,9 @@
 # config's box_usd_per_hour is not this box's rate (ZEROAD_BOX_USD_PER_HOUR), or when budget.sh says --budget would be
 # passed by the box hours and ledger so far plus the config's whole duration_hours at the rate. `status` prints the unit,
 # the orchestrator's status, the containers, the GPUs, vLLM and the spend. `stop` sends SIGTERM: the orchestrator
-# cancels the games in flight, ships what is finished, sends its last heartbeat and ends (the learner's stop.json is
-# the gentler stop: the actor drains its games first).
+# cancels the games in flight, ships what is finished (then `transport flush` retries for up to 30 minutes what could
+# not go), sends its last heartbeat and ends (a learner's stop.json at the end of a run, or `transport stop --drain`, lets
+# the actor play its games out first).
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
 CMD=${1:-}; shift || true
@@ -52,6 +53,10 @@ case $CMD in
       cfg_vars=$("${PYRUN[@]}" -m agentenv_zeroad.train.config "$CONFIG") || die "the actor config $CONFIG is not a runnable run"
       eval "$cfg_vars"
       [ "$TRAIN_TRANSPORT_ROLE" = actor ] || die "$CONFIG is not an actor's config ([transport] enabled, role = \"actor\")"
+      if [ "$DRY_RUN" = 0 ]; then
+        have=$(sort "$ETC/vllm.urls" 2>/dev/null | tr '\n' ' ') want=$(tr ' ' '\n' <<<"$TRAIN_SERVER_URLS" | sort | tr '\n' ' ')
+        [ "$have" = "$want" ] || die "the config's [servers] urls ($want) are not this box's vLLM instances ($have in $ETC/vllm.urls): one url per GPU, as bootstrap.sh --actor made them"
+      fi
     else
       TRAIN_DURATION_HOURS=0.5 TRAIN_BOX_USD_PER_HOUR=${ZEROAD_BOX_USD_PER_HOUR:-0}
       say "(dry run: no config at $CONFIG yet; planning half an hour)"
@@ -63,8 +68,8 @@ case $CMD in
       || die "the actor config's box_usd_per_hour ($TRAIN_BOX_USD_PER_HOUR) is not this box's rate ($ZEROAD_BOX_USD_PER_HOUR in $CONF): price it at its own"
     "$BOX_HOME/box/budget.sh" check --planned-usd 0 --planned-hours "$TRAIN_DURATION_HOURS" --budget "$BUDGET"
     say "actor ${TRAIN_ACTOR_ID:-?} from $CONFIG: ${TRAIN_ENGINES:-?} engines (${TRAIN_CONCURRENCY:-?} games at once) on ${TRAIN_ENGINE_IMAGE:-?}"
-    # TimeoutStopSec: a drain (the config's drain_timeout_s, 15 minutes) and the final upload's retries.
-    run systemd-run --unit zeroad-actor --collect -p KillMode=control-group -p TimeoutStopSec=1800 \
+    # TimeoutStopSec: the orchestrator's final upload and then `transport flush`'s 30 minutes of retries (actor-run.sh).
+    run systemd-run --unit zeroad-actor --collect -p KillMode=control-group -p TimeoutStopSec=4200 \
       -p "After=network-online.target docker.service" -p "Wants=network-online.target docker.service" \
       -p "WorkingDirectory=$REPO" "$BOX_HOME/box/actor-run.sh" "$CONFIG"
     say "started; follow it with live/actor.sh ID status"

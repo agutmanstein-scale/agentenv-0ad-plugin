@@ -6,8 +6,8 @@
 # is refused when LIVE_BUDGET_USD would be passed or a vLLM instance is down. The actor plays games on every GPU, pulls the
 # learner's adapters and ships each finished game through the transport prefix; the learner box has to be running first
 # (train.sh with a [transport] role = "learner" config), or the actor gives up after learner_stale_minutes. `stop` ends
-# this actor now (games in flight are cancelled, finished ones shipped; the learner's stop.json is the gentler stop for
-# every actor). `status` is read-only. `fetch` copies the actor's orchestrator files and log to
+# this actor now (games in flight are cancelled, finished ones shipped, with up to 30 minutes of retries for any that
+# could not go; the learner's stop.json at the end of a run is the gentler stop for every actor). `status` is read-only. `fetch` copies the actor's orchestrator files and log to
 # live/fetched/actor-<time>/ (the games are in the transport prefix on S3). start, stop and fetch are dry runs unless
 # --yes; status runs unless --dry-run.
 # shellcheck source=lib/common.sh
@@ -29,7 +29,7 @@ case $SUB in
     ssm_box "$ID" 300 actor.sh start --budget "$LIVE_BUDGET_USD" ;;
   stop)
     [ $# -eq 0 ] || die "stop takes no argument"
-    ssm_box "$ID" 1800 actor.sh stop ;;
+    ssm_box "$ID" 4200 actor.sh stop ;;
   status)
     [ $# -le 1 ] || die "status takes at most LINES"
     ssm_box "$ID" 120 actor.sh status "$@" ;;
