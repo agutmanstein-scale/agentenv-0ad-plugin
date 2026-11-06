@@ -22,6 +22,11 @@
     name = "mid"
     at_hours = 5
     specs = "/path/panel.jsonl"                 # the pre-registered configs: GameSpec lines, `trainable` seats pinned
+    [[panels]]                                  # the teacher calibration: frontier seats against Petra, same latency
+    name = "teacher-calibration"
+    kind = "teacher_calibration"
+    at_hours = 0
+    teachers = [{ name = "astra", model = "openai/gpt-6-astra" }, { name = "opus", model = "..." }]
 
 `python -m agentenv_zeroad.train.config CONFIG` checks a config (`check_run`: the panel spec files load, and one
 training game can be made from the mix) and prints `TRAIN_RUN_ID=`, `TRAIN_ROOT=`, `TRAIN_DURATION_HOURS=`,
@@ -135,17 +140,63 @@ class HeldOut:
 
 
 @dataclass(frozen=True)
+class TeacherConfig:
+    """A frontier model that plays the teacher calibration panel (and may then label briefs)."""
+
+    name: str  # what the report calls it: astra, opus
+    model: str  # the LiteLLM model name
+    effort: str | None = "low"
+    max_tokens: int = 1024
+
+    def __post_init__(self) -> None:
+        if not self.name or "/" in self.name or self.name.startswith(".") or not self.model:
+            raise ValueError(f"a teacher needs a plain name and a model, not {self.name!r} / {self.model!r}")
+
+
+PANEL_KINDS = ("specs", "teacher_calibration")
+
+
+@dataclass(frozen=True)
 class PanelConfig:
+    """A panel of games played at `at_hours`: a file of game specs (`specs`), or the teacher calibration, whose specs
+    `train.calibration` makes from the `teachers`: each plays Petra at `rungs` at the policy's own lockstep latency,
+    `games` in all, so distillation picks the teacher that does best against Petra-3 (ties: Petra-4)."""
+
     name: str
     at_hours: float
-    specs: Path
+    specs: Path | None = None
     version: int | None = None  # None: whichever version is current when the panel starts
+    kind: str = "specs"
+    teachers: tuple[TeacherConfig, ...] = ()
+    rungs: tuple[int, ...] = (3, 4)  # the Petra difficulties a teacher plays
+    games: int = 10
+    latency_ms: int | None = None  # None: games.latency_ms, the policy's
+    base_url: str = ""  # "": LITELLM_BASE_URL, which the box's with-model.sh puts in the environment
+    api_key_env: str = "LITELLM_API_KEY"
 
     def __post_init__(self) -> None:
         if not self.name or "/" in self.name or self.name.startswith("."):
             raise ValueError(f"panel name must be a plain folder name, not {self.name!r}")
         if self.at_hours < 0:
             raise ValueError("a panel's at_hours is not negative")
+        if self.kind not in PANEL_KINDS:
+            raise ValueError(f"panel kind must be one of {', '.join(PANEL_KINDS)}, not {self.kind!r}")
+        if self.kind == "specs" and self.specs is None:
+            raise ValueError(f"panel {self.name}: specs is required")
+        if self.kind == "teacher_calibration":
+            self._check_calibration()
+
+    def _check_calibration(self) -> None:
+        if not self.teachers or not self.rungs:
+            raise ValueError(f"panel {self.name}: a teacher calibration needs teachers and rungs")
+        if len({t.name for t in self.teachers}) != len(self.teachers):
+            raise ValueError(f"panel {self.name}: teacher names must be unique")
+        if not all(0 <= r <= 5 for r in self.rungs):
+            raise ValueError(f"panel {self.name}: rungs are Petra difficulties, 0 to 5")
+        if self.games < len(self.teachers) * len(self.rungs):
+            raise ValueError(f"panel {self.name}: games is below one per teacher and rung")
+        if self.latency_ms is not None and self.latency_ms <= 0:
+            raise ValueError(f"panel {self.name}: latency_ms must be positive")
 
 
 @dataclass(frozen=True)
@@ -271,6 +322,12 @@ class RunConfig:
         mix = top.pop("mix", None)
         held = _checked(top.pop("held_out", {}), HeldOut, "held_out")
         panels = [_checked(p, PanelConfig, "panel") for p in top.pop("panels", ())]
+        for p in panels:
+            teachers = [_checked(t, TeacherConfig, "teacher") for t in p.pop("teachers", ())]
+            p["teachers"] = tuple(TeacherConfig(**t) for t in teachers)
+            p["rungs"] = tuple(p.get("rungs", PanelConfig.rungs))
+            if "specs" in p:
+                p["specs"] = Path(p["specs"])
         credit = dict(top.pop("credit", {}))
         critic = credit.pop("critic", None)
         s3 = top.pop("s3", {})
@@ -294,7 +351,7 @@ class RunConfig:
                 maps=tuple(held.get("maps", ())),
                 seeds=tuple(held.get("seeds", ())),
             ),
-            panels=tuple(PanelConfig(**{**p, "specs": Path(p["specs"])}) for p in panels),
+            panels=tuple(PanelConfig(**p) for p in panels),
             s3_uri=s3_uri,
             credit=credit,
             critic=dict(critic) if critic is not None else None,
@@ -315,14 +372,14 @@ def check_run(cfg: RunConfig) -> list[str]:
     training game can be made from the mix (so a bad civ, size or interface fails now, not at the first game). Returns
     the names of the environment variables the frontier seats of the panels need."""
     from agentenv_zeroad.spend import LOCAL_PREFIX
+    from agentenv_zeroad.train.calibration import panel_specs
     from agentenv_zeroad.train.mix import GameFactory
-    from agentenv_zeroad.train.spec import load_specs
 
     keys: set[str] = set()
     for panel in cfg.panels:
-        if not panel.specs.is_file():
+        if panel.specs is not None and not panel.specs.is_file():
             raise ValueError(f"panel {panel.name}: no spec file at {panel.specs}")
-        for spec in load_specs(panel.specs):
+        for spec in panel_specs(cfg, panel):
             spec.match_config()
             keys |= {
                 s.api_key_env

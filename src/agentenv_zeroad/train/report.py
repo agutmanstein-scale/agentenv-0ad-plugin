@@ -18,6 +18,14 @@ small file. Sections:
   launches are not in results.json), kills at home and away (from the engine's combat
   counters when a game has them), villagers at minute 15, conquest share (games that ended by conquest) and conquest
   wins, hold share, the tool mix and the rejected share. These move before Elo does.
+- `teacher_calibration`: when `--panels` holds the calibration panel (`--calibration NAME`, default
+  `teacher-calibration`), each frontier teacher's win rate against Petra-3 and Petra-4 with its Wilson interval, and the
+  teacher distillation will pick (`stats.pick_teacher`: best against Petra-3, ties Petra-4). The panel's games are the
+  teachers' seats, not a policy's, so they are read apart from the board.
+- `sft_selection`: when `--sft-epochs DIR` (the SFT learner's ROOT/epochs) is given, which SFT epoch checkpoint to keep
+  (`stats.select_sft_checkpoint`): the best held-out win rate among those whose token entropy stayed above
+  `--min-entropy-ratio` (0.7) of the base model's; each epoch's panel is `PREFIX{N}` (`--sft-panel-prefix`, default
+  `sft-epoch`) under `--panels`. Never the SFT loss.
 - `health`: health.jsonl as a series, with the trips and alarms each update recorded.
 - `throughput` and `spend`: games and trained decisions per hour; opponent spend from the games' own estimates and, if
   given, the budget ledger.
@@ -46,11 +54,14 @@ from agentenv_zeroad.train import results as rs
 from agentenv_zeroad.train import stats
 
 RESULT = {"won": 1.0, "drawn": 0.5, "lost": 0.0}
+CALIBRATION_PANEL = "teacher-calibration"
+SFT_PANEL_PREFIX = "sft-epoch"
 ARMY_MINUTES = (5, 10, 15)
 HEALTH_KEYS = (
     "update", "version", "trained", "grad_norm", "kl_after_mb", "kl_to_base", "entropy", "clipped_share",
     "tis_truncation_share", "hold_share", "tokens_p50", "calls_per_decision", "exact_share", "distinct_fraction",
     "rejected_share", "invented_tool_share", "adv_mean", "adv_sd", "lr", "seconds", "stale_dropped",
+    "kl_to_anchor", "anchor_beta", "aux_alpha", "aux_rows", "aux_ce",
 )  # fmt: skip
 
 
@@ -85,6 +96,10 @@ def build(
     ledger: Path | None = None,
     bootstrap: int = 200,
     now: float | None = None,
+    calibration: str = CALIBRATION_PANEL,
+    sft_epochs: Path | None = None,
+    sft_panel_prefix: str = SFT_PANEL_PREFIX,
+    min_entropy_ratio: float = stats.MIN_ENTROPY_RATIO,
 ) -> dict[str, Any]:
     """The report for a run's folders, as of `now` (default: the clock)."""
     now = time.time() if now is None else now
@@ -117,6 +132,12 @@ def build(
         },
         "milestones": stats.milestones(rows, milestones, now_hours=horizon),
         "panel": _panel(panels, panel, learners, hours_of),
+        "teacher_calibration": teacher_calibration(panels / calibration) if panels else None,
+        "sft_selection": (
+            select_sft(sft_epochs, panels, learners, sft_panel_prefix, min_entropy_ratio)
+            if sft_epochs and panels
+            else None
+        ),
         "behaviour": _behaviour(played, hours_of),
         "health": _health(health, start),
         "throughput": _throughput(played, health, start, horizon),
@@ -313,6 +334,51 @@ def _panel(
     }
 
 
+def read_teacher_games(folder: Path) -> list[stats.TeacherGame]:
+    """Every finished game of a calibration panel from its teacher's side: the seat that is not a Petra controller."""
+    games = []
+    for path in sorted(folder.glob("*/results.json")):
+        results = json.loads(path.read_text())
+        if results.get("status") != "finished" or results.get("ended_by") not in ("conquest", *rs.CAP_ENDS):
+            continue
+        slots = list(results["seats"])
+        petras = [s for s in slots if rs.opponent_kind(results, s) == "petra"]
+        teachers = [s for s in slots if s not in petras]
+        outcome = results["seats"][teachers[0]].get("outcome") if len(teachers) == 1 and len(petras) == 1 else None
+        if outcome not in RESULT:
+            continue
+        games.append(
+            stats.TeacherGame(
+                rs.player_id(results, teachers[0]), rs.player_id(results, petras[0]), RESULT[outcome],
+                rs.seat_model(results, teachers[0]),
+            )
+        )  # fmt: skip
+    return games
+
+
+def teacher_calibration(folder: Path) -> dict[str, Any] | None:
+    """The calibration panel's summary (`stats.teacher_calibration`), or None when its folder has no games."""
+    games = read_teacher_games(folder) if folder.is_dir() else []
+    return stats.teacher_calibration(games) if games else None
+
+
+def select_sft(
+    epochs: Path, panels: Path, learners: Sequence[str] | None, prefix: str, min_entropy_ratio: float
+) -> dict[str, Any]:
+    """`stats.select_sft_checkpoint` over the epoch checkpoints in `epochs` (the SFT learner's ROOT/epochs), each one's
+    win rate read from the panel folder `PREFIX{epoch}` and its entropy ratio from the epoch's manifest."""
+    candidates = []
+    manifests = sorted(epochs.glob("epoch*/manifest.json"), key=lambda p: int(p.parent.name.removeprefix("epoch")))
+    for path in manifests:
+        manifest = json.loads(path.read_text())
+        played, _ = read_games(panels / f"{prefix}{manifest['epoch']}", learners)
+        rate = statistics.fmean(p.result for p in played) if played else None
+        candidates.append(stats.SftCandidate(path.parent.name, rate, len(played), manifest.get("entropy_ratio")))
+    out = stats.select_sft_checkpoint(candidates, min_entropy_ratio=min_entropy_ratio)
+    out["versions"] = {p.parent.name: json.loads(p.read_text())["version"] for p in manifests}
+    return out
+
+
 def _health(health: Sequence[Mapping[str, Any]], start: float) -> dict[str, Any]:
     series = []
     for r in health:
@@ -365,6 +431,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--panel", help="BASE:OTHER, two panel folder names under --panels")
     p.add_argument("--learner-slot", help="comma-separated learner slots, when the specs do not mark them")
     p.add_argument("--bootstrap", type=int, default=200)
+    p.add_argument("--calibration", default=CALIBRATION_PANEL, help="the teacher calibration panel's folder name")
+    p.add_argument("--sft-epochs", type=Path, help="the SFT learner's ROOT/epochs: pick the epoch checkpoint to keep")
+    p.add_argument("--sft-panel-prefix", default=SFT_PANEL_PREFIX)
+    p.add_argument("--min-entropy-ratio", type=float, default=stats.MIN_ENTROPY_RATIO)
     a = p.parse_args(argv)
     panel = None
     if a.panel:
@@ -374,8 +444,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         panel = (base, other)
     learners = [s for s in a.learner_slot.split(",") if s] if a.learner_slot else None
     report = build(
-        a.games, a.learner, learners=learners, panels=a.panels, panel=panel, ledger=a.ledger, bootstrap=a.bootstrap
-    )
+        a.games, a.learner, learners=learners, panels=a.panels, panel=panel, ledger=a.ledger, bootstrap=a.bootstrap,
+        calibration=a.calibration, sft_epochs=a.sft_epochs, sft_panel_prefix=a.sft_panel_prefix,
+        min_entropy_ratio=a.min_entropy_ratio,
+    )  # fmt: skip
     write(a.out, report)
 
 

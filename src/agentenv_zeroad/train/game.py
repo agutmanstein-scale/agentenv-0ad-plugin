@@ -35,7 +35,7 @@ from agentenv_zeroad.grading import BRAIN_TIMEOUT_S
 from agentenv_zeroad.llm import StrategistModel, ToolSpec
 from agentenv_zeroad.match import EngineHandle, LiveMatch, MatchConfig
 from agentenv_zeroad.pilot.games import PROMPT, PROMPT_V2
-from agentenv_zeroad.spend import SpendGuard
+from agentenv_zeroad.spend import LOCAL_PREFIX, SpendGuard
 from agentenv_zeroad.train.spec import GameSpec, SeatSpec
 from agentenv_zeroad.view import ExecutorView
 
@@ -124,14 +124,18 @@ def build_model(
 ) -> StrategistModel:
     """The strategist model of an LLM seat: its key from the named variable, its sampling in the request body, and
     `return_token_ids` and `logprobs` so each turn keeps the token ids the sampler saw and chose and their
-    log-probabilities. `cap_usd` caps what this seat's model may spend in the game (the guard stops it before a call
-    that could pass the cap); a `local/` model costs nothing, so it never binds."""
+    log-probabilities (a `local/` model only: a frontier model's API has neither and may refuse the request).
+    `cap_usd` caps what this seat's model may spend in the game (the guard stops it before a call that could pass
+    the cap); a `local/` model costs nothing, so it never binds."""
     environ = os.environ if environ is None else environ
     assert seat.model and seat.base_url and seat.api_key_env
     key = environ.get(seat.api_key_env)
     if not key:
         raise ValueError(f"seat {slot}: the environment variable {seat.api_key_env} is not set")
-    body = {"return_token_ids": True, "logprobs": True, "top_logprobs": 0, **seat.sampling, **seat.extra_body}
+    sampler = (
+        {"return_token_ids": True, "logprobs": True, "top_logprobs": 0} if seat.model.startswith(LOCAL_PREFIX) else {}
+    )
+    body = {**sampler, **seat.sampling, **seat.extra_body}
     guard = SpendGuard(f"seat {slot} {seat.model}", cap_usd=cap_usd)
     return StrategistModel(
         seat.model,

@@ -271,3 +271,123 @@ def milestones(
         out.append({"name": m.name, "opponent": m.opponent, "threshold": m.threshold, "passed_at": passed_at,
                     "checks": checks})  # fmt: skip
     return out
+
+
+# ---- teacher calibration ----------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TeacherGame:
+    teacher: str  # the seat's name (the config's teacher name, else its model)
+    opponent: str  # petra-3, petra-4
+    result: float  # the teacher's score: 1 won, 0.5 drawn, 0 lost
+    model: str | None = None
+
+
+CALIBRATION_RUNG = "petra-3"  # the teacher the distillation uses is the one that beats this rung most often
+CALIBRATION_TIEBREAK = "petra-4"
+
+
+def wilson_interval(wins: float, n: float, z: float = NORMAL.inv_cdf(0.975)) -> tuple[float, float]:
+    """The two-sided Wilson interval of a win rate (fractional wins allowed); (0, 1) for no games."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = wins / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def teacher_calibration(games: Sequence[TeacherGame]) -> dict[str, Any]:
+    """Per teacher and Petra rung: games, win rate and its 95% Wilson interval, then the teacher to distil from.
+
+    `best` follows `pick_teacher`: the best win rate against Petra-3, ties broken by Petra-4, then by name. A draw
+    counts half, as everywhere on the board. With ~10 games in all, the intervals are wide on purpose: the report
+    shows how little a difference means."""
+    cells: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    models: dict[str, str | None] = {}
+    for g in games:
+        cells[g.teacher][g.opponent].append(g.result)
+        models.setdefault(g.teacher, g.model)
+    teachers: dict[str, Any] = {}
+    for name in sorted(cells):
+        rungs = {}
+        for opponent, results in sorted(cells[name].items()):
+            wins, n = sum(results), len(results)
+            lo, hi = wilson_interval(wins, n)
+            rungs[opponent] = {"games": n, "wins": wins, "win_rate": wins / n, "lo": lo, "hi": hi}
+        teachers[name] = {"model": models[name], "rungs": rungs}
+    summary: dict[str, Any] = {"games": len(games), "teachers": teachers}
+    best = pick_teacher(summary)
+    rule = f"best win rate vs {CALIBRATION_RUNG}, ties {CALIBRATION_TIEBREAK}"
+    summary["best"] = {"name": best, "model": teachers[best]["model"], "rule": rule} if best else None
+    return summary
+
+
+def rank_teachers(summary: dict[str, Any]) -> list[str]:
+    """The teachers that played Petra-3, best first: by win rate against it, ties by the win rate against Petra-4 (no
+    games there counts as 0), then by name."""
+    scored = []
+    for name, teacher in summary["teachers"].items():
+        rungs = teacher["rungs"]
+        if CALIBRATION_RUNG in rungs:
+            tie = rungs.get(CALIBRATION_TIEBREAK, {}).get("win_rate", 0.0)
+            scored.append((-rungs[CALIBRATION_RUNG]["win_rate"], -tie, name))
+    return [name for *_, name in sorted(scored)]
+
+
+def pick_teacher(summary: dict[str, Any]) -> str | None:
+    """The teacher with the best win rate against Petra-3 (it has to have played it), ties broken by the win rate
+    against Petra-4, then by name. None when nobody played Petra-3."""
+    ranked = rank_teachers(summary)
+    return ranked[0] if ranked else None
+
+
+# ---- choosing the SFT checkpoint --------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SftCandidate:
+    name: str  # epoch1, epoch2 ...: candidates are listed in training order
+    win_rate: float | None  # on the held-out panel (None: it was not played)
+    games: int
+    entropy_ratio: float | None  # mean token entropy over the base model's, from the epoch's manifest
+
+
+MIN_ENTROPY_RATIO = 0.7
+
+
+def select_sft_checkpoint(
+    candidates: Sequence[SftCandidate], *, min_entropy_ratio: float = MIN_ENTROPY_RATIO
+) -> dict[str, Any]:
+    """Which SFT checkpoint RL should start from: by held-out win rate, never by the SFT loss.
+
+    SFT loss falls with every epoch whether or not the policy plays better, and a checkpoint trained too long has
+    collapsed its entropy, which RL then cannot explore from. So a candidate is rejected when its mean token entropy
+    is under `min_entropy_ratio` (default 0.7) of the base model's, or when it has no panel games; of the rest the
+    highest panel win rate wins, and a tie goes to the earlier (less trained) checkpoint. `chosen` is None when none
+    passes: start RL from the base model."""
+    rows, chosen = [], None
+    for c in candidates:
+        reason = None
+        if c.win_rate is None:
+            reason = "not played on the panel"
+        elif c.entropy_ratio is None:
+            reason = "no entropy measured"
+        elif c.entropy_ratio < min_entropy_ratio:
+            reason = f"entropy {c.entropy_ratio:.2f} of base is under {min_entropy_ratio:g}"
+        rows.append(
+            {
+                "name": c.name,
+                "win_rate": c.win_rate,
+                "games": c.games,
+                "entropy_ratio": c.entropy_ratio,
+                "rejected": reason,
+            }
+        )
+        if reason is None and (chosen is None or (c.win_rate or 0) > (chosen.win_rate or 0)):
+            chosen = c
+    return {
+        "chosen": chosen.name if chosen else None,
+        "min_entropy_ratio": min_entropy_ratio,
+        "candidates": rows,
+        "rule": "highest panel win rate among checkpoints whose token entropy is at least the floor times the base's; "
+        "ties to the earlier epoch; never the SFT loss",
+    }

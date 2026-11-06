@@ -43,7 +43,10 @@ What it does, each on its own interval:
   champion is `ROOT/champion.json`'s `version`.
 - Panels. At each panel's `at_hours` it plays the pre-registered configs (a JSONL of game specs whose `trainable` seats
   are pinned to the panel's version, or the current one) ahead of the training games, into ROOT/panels/NAME. A panel's
-  games are never credited, never reach the inbox and are never part of the training board.
+  games are never credited, never reach the inbox and are never part of the training board. A `teacher_calibration`
+  panel has no spec file: `calibration.py` makes its games (frontier teachers against Petra-3 and Petra-4 at the
+  policy's lockstep latency, recorded in ROOT/panels/NAME/specs.jsonl); no adapter is involved, so it runs on the base
+  model's instance slot and under the frontier spend caps like any frontier seat.
 - Restarts. Everything that must not start over is saved in ROOT/orchestrator after the step that changes it: the
   tripwatch (`tripwatch.json`), credit (`credit.json`), the game stream's random state (`factory.json`), and the
   panels, queues, games in flight and counts (`state.json`, with `keep.json`'s hourly adapters). A restarted process
@@ -84,6 +87,7 @@ import httpx
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, StrategistModel
 from agentenv_zeroad.spend import SpendCapReached, append_ledger, results_spend
 from agentenv_zeroad.train import budget
+from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, panel_specs
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
 from agentenv_zeroad.train.game import ModelFactory, build_model
@@ -91,7 +95,7 @@ from agentenv_zeroad.train.loopstats import LoopMonitor
 from agentenv_zeroad.train.mix import GameFactory, repin
 from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
-from agentenv_zeroad.train.spec import GameSpec, load_specs
+from agentenv_zeroad.train.spec import GameSpec
 from agentenv_zeroad.train.sync import Syncer
 
 log = logging.getLogger(__name__)
@@ -847,13 +851,16 @@ class Orchestrator:
         for panel in self.cfg.panels:
             if panel.name in self.panels or hours < panel.at_hours:
                 continue
-            version = panel.version if panel.version is not None else self.current
+            calibration = panel.kind == "teacher_calibration"
+            version = 0 if calibration else panel.version if panel.version is not None else self.current
             if version and version not in self.adapters.on_disk():
                 log.error("panel %s: adapter v%d is not on disk; skipping it", panel.name, version)
                 self.panels[panel.name] = PanelRun(panel, version, 0, 0)
                 self.save_state()
                 continue
-            specs = load_specs(panel.specs)
+            specs = panel_specs(self.cfg, panel)
+            if calibration:
+                self._write_panel_specs(panel, specs)
             self.adapters.pin(version)
             self.panels[panel.name] = PanelRun(panel, version, len(specs), len(specs))
             for spec in specs:
@@ -861,6 +868,12 @@ class Orchestrator:
                 self.panel_queue.append(Pending(spec, "panel", base_id, panel.name, version))
             self.save_state()
             log.info("panel %s: %d games on v%d", panel.name, len(specs), version)
+
+    def _write_panel_specs(self, panel: PanelConfig, specs: Sequence[GameSpec]) -> None:
+        """A generated panel's specs, kept beside its games: what was played stays on record."""
+        folder = self.root / "panels" / panel.name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "specs.jsonl").write_text("".join(json.dumps(s.to_json()) + "\n" for s in specs))
 
     def _panel_done(self, game: Game, *, finished: bool) -> None:
         run = self.panels.get(game.panel or "")
@@ -1066,6 +1079,10 @@ async def serve(args: argparse.Namespace) -> str:
     except ValueError as e:
         raise SystemExit(f"the run config does not make a runnable run: {e}") from e
     missing = [k for k in [cfg.servers.api_key_env, *frontier_keys] if not os.environ.get(k)]
+    if any(p.kind == "teacher_calibration" and not p.base_url for p in cfg.panels) and not os.environ.get(
+        LITELLM_URL_ENV
+    ):
+        missing.append(LITELLM_URL_ENV)
     if missing:
         raise SystemExit(f"not set: {', '.join(missing)}")
     credit = PlayOnly() if args.play_only else load_credit(cfg)
