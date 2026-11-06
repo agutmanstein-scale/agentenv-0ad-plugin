@@ -56,6 +56,8 @@ case $CMD in
       TRAIN_DURATION_HOURS=0.5 TRAIN_BOX_USD_PER_HOUR=${ZEROAD_BOX_USD_PER_HOUR:-0}
       say "(dry run: no config at $CONFIG yet; planning half an hour)"
     fi
+    # shellcheck disable=SC2086 # TRAIN_ENGINE_PATCHES is a space-separated list of patch names
+    [ -z "${TRAIN_ENGINE_IMAGE:-}" ] || require_engine_image "$TRAIN_ENGINE_IMAGE" ${TRAIN_ENGINE_PATCHES:-}
     [ -n "${ZEROAD_BOX_USD_PER_HOUR:-}" ] || die "ZEROAD_BOX_USD_PER_HOUR is not set in $CONF: the box has no rate"
     awk -v a="$TRAIN_BOX_USD_PER_HOUR" -v b="$ZEROAD_BOX_USD_PER_HOUR" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.005) }' \
       || die "the run config's box_usd_per_hour ($TRAIN_BOX_USD_PER_HOUR) is not this box's rate ($ZEROAD_BOX_USD_PER_HOUR in $CONF): a run on another instance type must be priced at its own"

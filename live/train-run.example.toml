@@ -12,9 +12,12 @@ shutdown = false             # true: `shutdown -h now` after the final upload (t
 engines = 24                 # engine containers; each game takes one for its 6-8 minutes. 0 (or leave it out) is the box's
                              # physical cores (24 on the g6e.12xlarge, 48 vCPUs): more engines than cores slow every game
 concurrency = 24             # games in flight, at most `engines`; 0 (or leave it out) is all of them
-# engine_image = "zeroad-engine:0.28-rt"  # the default: built by `scripts/build-engine.sh rt`, which applies
-                             # patches/rl-idle-wait.patch so an engine waiting for its next /step sleeps instead of
-                             # spinning a core; only the unpatched PPA image ("zeroad-engine:0.28") spins
+# engine_image = "zeroad-engine:0.28-rt"  # the default: built by `scripts/build-engine.sh rt` (pilot-bootstrap.sh
+                             # --train does it), which applies patches/rl-idle-wait.patch so an engine waiting for its
+                             # next /step sleeps instead of spinning a core and /step?state=0 skips the state JSON;
+                             # only the unpatched PPA image ("zeroad-engine:0.28") spins
+# engine_patches = ["rl-realtime", "rl-idle-wait"]  # the image's zeroad.patches label must name these, or the run
+                             # refuses to start; [] (with the PPA image) is for a deliberate comparison run
 seed = 1
 
 [servers]

@@ -592,6 +592,21 @@ STUB_SYSTEMCTL = textwrap.dedent(
 )
 
 
+STUB_DOCKER = textwrap.dedent(
+    """\
+    #!/bin/sh
+    # `docker image inspect` answers the engine image's zeroad.patches label from STUB_ENGINE_LABEL (the patched build
+    # by default) or fails when STUB_ENGINE_MISSING is set; every other call prints STUB_DOCKER_PS.
+    if [ "$1 $2" = "image inspect" ]; then
+      [ -z "$STUB_ENGINE_MISSING" ] || exit 1
+      echo "${STUB_ENGINE_LABEL-rl-realtime rl-idle-wait}"
+      exit 0
+    fi
+    [ -z "$STUB_DOCKER_PS" ] || echo "$STUB_DOCKER_PS"
+    """
+)
+
+
 @pytest.fixture
 def box_stubs(stubs):
     """systemctl, systemd-run, docker and xhost stubs on PATH; systemctl answers is-active from STUB_UNITS and logs
@@ -599,7 +614,7 @@ def box_stubs(stubs):
     write_exe(stubs["bin"] / "systemctl", STUB_SYSTEMCTL.format(python=sys.executable))
     calls = stubs["tmp"] / "systemctl.log"
     write_exe(stubs["bin"] / "systemd-run", f'#!/bin/sh\necho "systemd-run $*" >> "{calls}"\n')
-    write_exe(stubs["bin"] / "docker", '#!/bin/sh\n[ -z "$STUB_DOCKER_PS" ] || echo "$STUB_DOCKER_PS"\n')
+    write_exe(stubs["bin"] / "docker", STUB_DOCKER)
     write_exe(stubs["bin"] / "xhost", "#!/bin/sh\nexit 0\n")
     (stubs["tmp"] / "state").mkdir()
     stubs["env"].update(STUB_SYSTEMCTL_LOG=str(calls), ZEROAD_DISPLAY_WAIT_S="0", ZEROAD_MIN_FREE_GB="0")
@@ -1012,6 +1027,7 @@ def test_the_training_bootstrap_serves_two_bf16_vllm_instances_on_gpu_0_and_1_an
     assert "PILOT_TRAIN_GPUS=%s" in text and "2,3 0" in text.replace("\\,", ",")
     assert "train.smoke" in text and "pilot.smoke" not in text
     assert "zeroad-trainer" in text
+    assert text.index("scripts/build-engine.sh rt") < text.index("zeroad-boxtime")  # the engine is built before the run
     assert (
         "--max-model-len 8192 " in "".join(runs) and "12288" not in text
     )  # the learner's max_len: play nothing longer
@@ -1026,6 +1042,7 @@ def test_the_training_bootstrap_serves_two_bf16_vllm_instances_on_gpu_0_and_1_an
 def test_the_pilot_bootstrap_still_serves_one_tp2_instance_and_does_not_mount_the_train_folder(stubs):
     out = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
     assert out.returncode == 0, out.stderr
+    assert "build-engine.sh" not in out.stdout  # only the training box plays on the patched engine
     text = out.stdout.replace("\\", "")
     runs = [line for line in text.splitlines() if line.startswith("+ docker run -d")]
     assert len(runs) == 1 and "--name zeroad-vllm " in runs[0] and "--max-loras 4 --max-cpu-loras 16" in runs[0]
@@ -1100,6 +1117,22 @@ def test_the_run_starts_in_its_own_unit_and_a_second_is_refused(box_stubs):
     assert call.split("train-run.sh ")[1].endswith("config.toml --play-only")
     out = start_train(box_stubs, units={"zeroad-train": "active"})
     assert out.returncode != 0 and "a run is going" in out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_a_run_refuses_an_engine_image_that_is_missing_or_lacks_the_patches_it_expects(box_stubs):
+    out = start_train(box_stubs, "--play-only", STUB_ENGINE_MISSING="1")
+    assert out.returncode != 0 and "zeroad-engine:0.28-rt is not built on this box" in out.stderr
+    assert "scripts/build-engine.sh rt" in out.stderr
+    out = start_train(
+        box_stubs, "--play-only", STUB_ENGINE_LABEL="rl-realtime"
+    )  # an rt image built before the idle patch
+    assert out.returncode != 0 and "lacks the patch rl-idle-wait" in out.stderr and "REBUILD=1" in out.stderr
+    out = start_train(box_stubs, "--play-only", STUB_ENGINE_LABEL="")  # the PPA image retagged, no label at all
+    assert out.returncode != 0 and "lacks the patch rl-realtime" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    out = start_train(box_stubs, "--play-only")
+    assert out.returncode == 0, out.stderr
     assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
 
 

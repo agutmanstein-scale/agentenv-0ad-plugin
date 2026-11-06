@@ -135,6 +135,15 @@ done
 step "the trainer image (trainer/ on $VLLM_IMAGE, with PEFT)"
 run docker build -q -t zeroad-trainer --build-arg "VLLM_IMAGE=$VLLM_IMAGE" "$BOX_HOME/repo/trainer"
 
+if [ "$TRAIN" = 1 ]; then
+  step "the training engine (zeroad-engine:0.28-rt, labelled zeroad.patches; the PPA source build takes ~15 min, none when already built)"
+  run "$BOX_HOME/repo/scripts/build-engine.sh" rt
+  if [ "$DRY_RUN" = 0 ]; then
+    [ "$(docker image inspect -f '{{index .Config.Labels "zeroad.patches"}}' zeroad-engine:0.28-rt)" = "rl-realtime rl-idle-wait" ] \
+      || { echo "zeroad-engine:0.28-rt is not labelled zeroad.patches=\"rl-realtime rl-idle-wait\"" >&2; exit 1; }
+  fi
+fi
+
 step "the box-time timer (the budget guard's box hours)"
 run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
 run systemctl daemon-reload
