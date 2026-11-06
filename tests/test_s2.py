@@ -915,3 +915,20 @@ def test_the_tripwire_and_update_counters_read_the_learners_health_log(tmp_path)
         {"event": "rollback", "restored": 1, "version": 3}, {"version": 4}]) + "\nnot json\n")  # fmt: skip
     assert S.trips_in(health) == 1 and S.updates_in(health) == 3
     assert S.trips_in(tmp_path / "missing") == 0
+
+
+def test_the_final_report_links_the_panels_of_every_step_and_writes_s2_report_json(tmp_path):
+    ctx, _ = make_ctx(tmp_path, FakeRunner())
+    init_world(ctx, chosen_margin=600.0)
+    run1 = ctx.cfg("run1").root
+    write_panel(run1 / "panels" / "end-heldout", "end-heldout", 5, [("petra-2", 300.0)] * 6)
+    write_panel(run1 / "games", "s2-run1-g000001", 5, [("petra-2", 100.0)] * 2)
+    assert S.final_report(ctx) is None
+    report = json.loads((ctx.s2 / "s2-report.json").read_text())
+    assert report["panel"]["base_name"] == "v0-heldout" and report["panel"]["other_name"] == "run1-heldout"
+    assert report["sft_selection"]["chosen"] == "epoch2" and report["schema"] == "v2"
+    links = {p.name for p in (ctx.s2 / "report-panels").iterdir()}
+    assert {"v0-heldout", "run1-heldout", "sft-epoch1", "sft-epoch2"} <= links
+    broken, _ = make_ctx(tmp_path / "broken", FakeRunner())
+    broken.cfg = lambda step, **kw: (_ for _ in ()).throw(RuntimeError("no config"))  # type: ignore[method-assign]
+    assert "RuntimeError: no config" in S.final_report(broken)  # a report that cannot be built does not raise

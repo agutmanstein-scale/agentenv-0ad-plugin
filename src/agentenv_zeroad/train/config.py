@@ -29,6 +29,13 @@
     at_hours = 0
     teachers = [{ name = "astra", model = "openai/gpt-6-astra" }, { name = "opus", model = "..." }]
 
+Panels need no spec file when they are generated (`train/panels.py`): `kind = "heldout"` (`games`, `opponents`, `interface`,
+`positions`, `time_cap_minutes`) is the policy seat against an opponent mix on held-out positions, `kind = "frontier"` has
+each teacher in `teachers` play the policy seat for its own `games`. `[held_out] seed_ranges = [[low, high]]` holds out a
+block of seeds for panels of hundreds of games. A baseline or panel-only run sets `panels_only` (no training games),
+`stop_when_done` (end with reason "complete" once every panel is played) and `brief_target` (and until the games hold the
+briefs for that many distillation labels, `brief_per_game` at most from one game).
+
 `python -m agentenv_zeroad.train.config CONFIG` checks a config (`check_run`: the panel spec files load, and one
 training game can be made from the mix) and prints `TRAIN_RUN_ID=`, `TRAIN_ROOT=`, `TRAIN_DURATION_HOURS=`,
 `TRAIN_BOX_USD_PER_HOUR=` and `TRAIN_FRONTIER=` (1 when a panel has a seat on a frontier model) for the box's shell
