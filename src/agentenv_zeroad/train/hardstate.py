@@ -49,7 +49,7 @@ class HardStates:
         ledger: Path,
         policies: Mapping[str, distill.Policy],
         make_teacher: TeacherFactory,
-        tokenizer: Callable[[], distill.Tokenizer],
+        tokenizer: distill.Tokenizer,
         seed: int = 0,
     ):
         self.cfg, self.root, self.ledger = cfg, root, ledger
@@ -107,12 +107,23 @@ class HardStates:
         best = stats.pick_teacher(summary) if summary else None
         return (summary["teachers"][best]["model"] or best) if summary and best else None
 
-    async def label(self, hour: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    async def label(self, hour: int, alpha: float | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """One labelling pass for run hour `hour`: up to `batch` of the waiting decisions, within the hour's remaining
-        count and dollars. Returns the learner rows (flagged sft) and what happened."""
+        count and dollars. Returns the learner rows (flagged sft) and what happened.
+
+        `alpha` is the learner's latest auxiliary weight (its health record's `aux_alpha`): below `alpha_floor` the
+        learner would barely train on a label, so none is bought. Only decisions from games against an opponent that
+        is hard now are asked; those against one the policy has since learned to beat leave the pool.
+
+        The pass's dollars, count and asked briefs are booked whatever happens in the labelling, an unexpected error
+        included; the labels are tokenized with the tokenizer loaded at the start, which cannot fail for lack of an
+        install."""
         info: dict[str, Any] = {"hour": hour, "asked": 0, "labelled": 0, "usd": 0.0, "skipped": None}
+        self.pool = [b for b in self.pool if self.is_hard(b.opponent)]
         n, left = min(self.cfg.batch, self.quota(hour)), self.usd_left(hour)
-        if not self.pool:
+        if alpha is not None and alpha < self.cfg.alpha_floor:
+            info["skipped"] = f"the learner's aux alpha {alpha:.4f} is under the {self.cfg.alpha_floor:g} floor"
+        elif not self.pool:
             info["skipped"] = "no hard states waiting"
         elif n <= 0:
             info["skipped"] = f"{self.cfg.per_hour} decisions already sampled this hour"
@@ -126,20 +137,23 @@ class HardStates:
         chosen = distill.select(self.pool, n, per_game=self.cfg.per_game, seed=self.seed + self.passes)
         guard = SpendGuard(f"hard-state labels {model}", cap_usd=left)
         asked: set[str] = set()
-        labels, stats_ = await distill.label(
-            chosen, self.make_teacher(model, guard), self.policies, concurrency=self.cfg.concurrency,
-            on_asked=lambda b: asked.add(b.key),
-        )  # fmt: skip
-        # a brief the teacher was sent is not asked again, even if it failed; one the cap left unasked waits
-        self.pool = [b for b in self.pool if b.key not in asked]
-        self.asked[hour] += stats_["asked"]
-        self.usd[hour] += guard.spent_usd
-        if guard.spent_usd:
-            spend.append_ledger(self.ledger, f"hard-state labels h{hour}", guard.spent_usd)
-        rows = distill.sft_rows(labels, self.tokenizer(), model)
+        counts: dict[str, Any] = {"asked": 0}
+        try:
+            labels, counts = await distill.label(
+                chosen, self.make_teacher(model, guard), self.policies, concurrency=self.cfg.concurrency,
+                on_asked=lambda b: asked.add(b.key),
+            )  # fmt: skip
+            rows = distill.sft_rows(labels, self.tokenizer, model)
+        finally:
+            # a brief the teacher was sent is not asked again, even if it failed; one the cap left unasked waits
+            self.pool = [b for b in self.pool if b.key not in asked]
+            self.asked[hour] += len(asked)
+            self.usd[hour] += guard.spent_usd
+            if guard.spent_usd:
+                spend.append_ledger(self.ledger, f"hard-state labels h{hour}", guard.spent_usd)
         info |= {
-            "asked": stats_["asked"], "labelled": len(rows), "usd": guard.spent_usd, "stopped": stats_["stopped"],
-            "teacher": model, "failed": stats_["failed"], "no_calls": stats_["no_calls"],
+            "asked": counts["asked"], "labelled": len(rows), "usd": guard.spent_usd, "stopped": counts["stopped"],
+            "teacher": model, "failed": counts["failed"], "no_calls": counts["no_calls"],
         }  # fmt: skip
         return rows, info
 

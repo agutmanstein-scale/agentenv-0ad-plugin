@@ -656,7 +656,9 @@ class Orchestrator:
     async def _credit_game(self, game: Game, results: dict[str, Any]) -> tuple[int, str | None]:
         try:
             async with self._credit_lock:
-                return await asyncio.to_thread(self._credit, game.spec.game_id, results), None
+                rows = await asyncio.to_thread(self._credit, game.spec.game_id, results)
+            self._observe_hard(game.spec.game_id, results)
+            return rows, None
         except Exception as e:  # noqa: BLE001 - credit.rows raises its own errors; none of them may end the run
             self.counts["credit_failed"] += 1
             log.exception("credit failed for %s", game.spec.game_id)
@@ -667,11 +669,20 @@ class Orchestrator:
         write_rows(self.root / "inbox", game_id, rows)
         self.counts["rows"] += len(rows)
         self.save_credit()
-        if self.hard is not None:
+        return len(rows)
+
+    def _observe_hard(self, game_id: str, results: dict[str, Any]) -> None:
+        """Count a credited game toward its opponent's window, on the event loop: the labelling pass mutates the same
+        pool and counters between its awaits, so this must not run in a worker thread beside it."""
+        if self.hard is None:
+            return
+        try:
             if self.hard.observe(results, game_id):
                 self.counts["hard_games"] += 1
             self._write("hard.json", self.hard.state_dict())
-        return len(rows)
+        except Exception:  # noqa: BLE001 - the labels are an extra: the credited game stands
+            self.counts["hard_errors"] += 1
+            log.exception("hard-state bookkeeping failed for %s", game_id)
 
     def _record_spend(self, game: Game, results: dict[str, Any] | None, *, void: bool) -> None:
         """The game's frontier spend into the box ledger, whatever became of the game: a void or failed game was paid
@@ -958,7 +969,7 @@ class Orchestrator:
     async def _hard_labels(self, hour: int) -> None:
         assert self.hard is not None
         try:
-            rows, info = await self.hard.label(hour)
+            rows, info = await self.hard.label(hour, latest_aux_alpha(self.root / "health.jsonl"))
             if rows:
                 write_rows(self.root / "inbox", f"hard-{hour:03d}-{self.hard.passes:05d}", rows)
                 self.counts["hard_rows"] += len(rows)
@@ -1117,16 +1128,47 @@ def load_credit(cfg: RunConfig | None = None) -> Credit:
     return RealCredit(config, critic=critic)
 
 
+def teacher_settings(cfg: RunConfig, model: str) -> tuple[str | None, int]:
+    """The (effort, max_tokens) the calibration panel played `model` with: a label is asked the way the games that
+    picked the teacher were. A model the panels do not list gets the distillation CLI's (low, 1024)."""
+    for panel in cfg.panels:
+        for teacher in panel.teachers:
+            if model in (teacher.model, teacher.name):
+                return teacher.effort, teacher.max_tokens
+    return "low", 1024
+
+
+def latest_aux_alpha(health: Path) -> float | None:
+    """The learner's newest `aux_alpha` from the tail of its health log (None: no update has logged one yet)."""
+    try:
+        with health.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("aux_alpha") is not None:
+            return float(record["aux_alpha"])
+    return None
+
+
 def load_hard_states(cfg: RunConfig, tools: Sequence[Any], http: httpx.AsyncClient) -> HardStates | None:
     """The hard-state labeller of a run whose config enables it: the policy's prompt and order tools, a teacher client
-    on the LiteLLM endpoint (its key from the environment, never printed) and the policy's tokenizer, loaded when the
-    first labels are written."""
+    on the LiteLLM endpoint (its key from the environment, never printed; its effort and max_tokens those the
+    calibration panel played the model with) and the policy's tokenizer, loaded here once so that a missing or
+    unreachable tokenizer stops the run at its start, before any label is paid for. Blocking (the tokenizer download):
+    call it in a thread from async code."""
     hard = cfg.hard_states
     if not hard.enabled:
         return None
     from agentenv_zeroad import brains
     from agentenv_zeroad.spend import SpendGuard
-    from agentenv_zeroad.train.distill import Policy
+    from agentenv_zeroad.train.distill import HubTokenizer, Policy
     from agentenv_zeroad.train.hardstate import HardStates
 
     iface = cfg.games.interface
@@ -1134,16 +1176,12 @@ def load_hard_states(cfg: RunConfig, tools: Sequence[Any], http: httpx.AsyncClie
     url, key = hard.base_url or os.environ[LITELLM_URL_ENV], os.environ[hard.api_key_env]
 
     def make_teacher(model: str, guard: SpendGuard) -> StrategistModel:
-        return StrategistModel(model, url, key, guard, effort="low", max_tokens=1024, http=http)
-
-    def tokenizer() -> Any:
-        from transformers import AutoTokenizer  # the trainer image's, not the base install's
-
-        return AutoTokenizer.from_pretrained(hard.tokenizer)
+        effort, max_tokens = teacher_settings(cfg, model)
+        return StrategistModel(model, url, key, guard, effort=effort, max_tokens=max_tokens, http=http)
 
     return HardStates(
         hard, root=cfg.root, ledger=cfg.ledger_path, policies=policies, make_teacher=make_teacher,
-        tokenizer=tokenizer, seed=cfg.seed,
+        tokenizer=HubTokenizer(hard.tokenizer), seed=cfg.seed,
     )  # fmt: skip
 
 
@@ -1190,7 +1228,7 @@ async def serve(args: argparse.Namespace) -> str:
             syncer=Syncer(cfg.root, cfg.s3_uri),
             http=http,
             learner=not args.play_only,
-            hard_states=None if args.play_only else load_hard_states(cfg, tools, http),
+            hard_states=None if args.play_only else await asyncio.to_thread(load_hard_states, cfg, tools, http),
         )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):

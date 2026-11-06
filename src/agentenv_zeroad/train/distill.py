@@ -11,13 +11,14 @@ student's own states, DAgger-style (the teacher labels what the student reached,
 reached: the literature finds that beats SFT on the teacher's games), weighted to where a good answer is worth most:
   losing    the policy was behind on net worth at decision time in a game it went on to lose to Petra-2 or Petra-3
             (`losing_opponents`): 60% by default
-  late      turns from minute 20 on: 20%
   rejected  turns where one of its orders was rejected: 20%
+  late      turns from minute 20 on: 20%
 at most `per_game` from any game; a stratum that cannot fill its share hands the rest on, and what is left over is
-`other`. A turn goes in the first of the strata above that it fits. `--weights losing=0.5,late=0.25,rejected=0.25`
-changes the shares, and the default is 3,000 labels. A turn is one brief: the user message the policy saw, with the
-exact prompt token ids it was sampled from, so the label sits on the same prompt the policy will meet. The same
-labelling path labels the orchestrator's hard-state turns during RL (`hardstate.py`).
+`other`. A turn goes in the first of the strata above, in this order (losing, rejected, late), that it fits.
+`--weights losing=0.5,late=0.25,rejected=0.25` changes the shares, and the default is 3,000 labels. A turn is one
+brief: the user message the policy saw, with the exact prompt token ids it was sampled from, so the label sits on
+the same prompt the policy will meet. The same labelling path labels the orchestrator's hard-state turns during RL
+(`hardstate.py`).
 
 The teacher gets the policy's system prompt and tools for the brief's interface (`default_policy`: `brains.
 strategist_system(interface)` and `server.tool_specs()` as `brains.offered_tools` offers it to that interface; the
@@ -95,6 +96,22 @@ class Teacher(Protocol):
 
 class Tokenizer(Protocol):
     def encode(self, text: str, add_special_tokens: bool = ...) -> list[int]: ...
+
+
+class HubTokenizer:
+    """A model's tokenizer from the `tokenizers` library (`Tokenizer.from_pretrained`), which the base install has,
+    unlike transformers (`name` is a hub id, or a local tokenizer.json). It reads the same tokenizer.json
+    `AutoTokenizer` does, so the ids are the same; special tokens written in the text (`<|im_end|>`) are matched as
+    added tokens whether or not `add_special_tokens` is set."""
+
+    def __init__(self, name: str):
+        from tokenizers import Tokenizer as _Tokenizer
+
+        path = Path(name)
+        self._inner = _Tokenizer.from_file(str(path)) if path.is_file() else _Tokenizer.from_pretrained(name)
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return list(self._inner.encode(text, add_special_tokens=add_special_tokens).ids)
 
 
 @dataclass(frozen=True)
@@ -335,7 +352,7 @@ async def label(
             except SpendCapReached as e:
                 stats["stopped"] = str(e)
                 return
-            except (httpx.HTTPError, ValueError, KeyError) as e:
+            except Exception as e:  # noqa: BLE001 - a call that may have been sent counts as asked and failed
                 stats["asked"] += 1
                 if on_asked:
                     on_asked(brief)
@@ -495,8 +512,6 @@ async def _policy(args: argparse.Namespace) -> Policy:
 
 
 async def _run(args: argparse.Namespace) -> dict[str, Any]:
-    from transformers import AutoTokenizer  # the trainer image's, not the base install's
-
     losing = tuple(args.losing_opponents.split(","))
     pool = candidates(args.games, args.learner_slot.split(",") if args.learner_slot else None, losing)
     weights = parse_weights(args.weights) if args.weights else DEFAULT_WEIGHTS
@@ -520,7 +535,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             teacher,
             second,
             policies,
-            AutoTokenizer.from_pretrained(args.tokenizer),
+            HubTokenizer(args.tokenizer),
             check=args.check,
             seed=args.seed,
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,7 @@ def states(tmp_path: Path, fake: FakeLiteLLM | None = None, **over) -> tuple[Har
 
     hard = HardStates(
         cfg(**{"teacher": OPUS, **over}), root=tmp_path / "root", ledger=tmp_path / "spend.jsonl", policies=POLICIES,
-        make_teacher=make_teacher, tokenizer=CharTokenizer, seed=1,
+        make_teacher=make_teacher, tokenizer=CharTokenizer(), seed=1,
     )  # fmt: skip
     return hard, fake
 
@@ -246,13 +247,16 @@ class FakeHard:
     """What the orchestrator needs of HardStates: observe, label, status and state, with the labels scripted."""
 
     def __init__(self, rows_per_pass: int = 2):
-        self.rows_per_pass, self.passes, self.seen, self.hours = rows_per_pass, 0, [], []
+        self.rows_per_pass, self.passes, self.seen, self.hours, self.alphas = rows_per_pass, 0, [], [], []
+        self.observed_in = []
 
     def observe(self, results, name):
+        self.observed_in.append(threading.get_ident())
         self.seen.append(name)
         return len(self.seen) % 2 == 0
 
-    async def label(self, hour):
+    async def label(self, hour, alpha=None):
+        self.alphas.append(alpha)
         self.passes += 1
         self.hours.append(hour)
         rows = [{"game_id": f"h{self.passes}-{i}", "version": 0, "sft": True, "prompt_token_ids": [1],
@@ -287,12 +291,13 @@ async def test_the_orchestrator_counts_training_games_and_writes_labels_to_the_i
     status = json.loads((t.root / "orchestrator" / "status.json").read_text())
     assert status["hard_states"]["hard"] == ["petra-3"]
     assert t.orch.counts["hard_asked"] == t.orch.counts["hard_rows"]
+    assert hard.observed_in and set(hard.observed_in) == {threading.get_ident()}  # on the event loop, not in a thread
 
 
 async def test_a_failing_labelling_pass_is_counted_and_the_run_goes_on(tmp_path, monkeypatch):
     hard = FakeHard()
 
-    async def boom(hour):
+    async def boom(hour, alpha=None):
         raise RuntimeError("teacher down")
 
     hard.label = boom
@@ -336,6 +341,188 @@ def test_the_example_config_documents_both_sections_and_they_load_once_uncomment
     assert [t.model for t in panel.teachers] == [
         "openai/gpt-6-astra",
         "anthropic/claude-opus-5-5",
-    ] and panel.games == 10
+    ] and panel.games == 16
     assert cfg.hard_states.enabled and (cfg.hard_states.per_hour, cfg.hard_states.cap_usd_per_hour) == (200, 10.0)
     assert check_run(cfg) == ["LITELLM_API_KEY"]
+
+
+# ---- review fixes -----------------------------------------------------------------------------------------------
+async def test_a_failing_tokenizer_still_books_the_spend_and_the_asked_briefs(tmp_path):
+    class Broken:
+        def encode(self, text, add_special_tokens=True):
+            raise RuntimeError("tokenizer exploded")
+
+    hard, fake = states(tmp_path, batch=4)
+    hard.tokenizer = Broken()
+    feed(hard, "LLLLL")
+    waiting = len(hard.pool)
+    with pytest.raises(RuntimeError, match="exploded"):
+        await hard.label(0)
+    ledger = [json.loads(line) for line in (tmp_path / "spend.jsonl").read_text().splitlines()]
+    assert len(fake.bodies("/v1/chat/completions")) == 4 and hard.usd[0] > 0
+    assert ledger and ledger[0]["usd_est"] == pytest.approx(hard.usd[0]) and hard.asked[0] == 4
+    assert len(hard.pool) == waiting - 4  # paid for and asked: neither paid for again nor kept waiting
+
+
+async def test_an_unexpected_error_in_one_teacher_call_is_a_failed_brief_and_the_pass_is_still_booked(tmp_path):
+    hard, fake = states(tmp_path, batch=4)
+    real = hard.make_teacher
+    calls = {"n": 0}
+
+    def flaky(model, guard):
+        teacher = real(model, guard)
+        original = teacher.call
+
+        async def call(system, user, tools):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("an error nobody planned for")
+            return await original(system, user, tools)
+
+        teacher.call = call
+        return teacher
+
+    hard.make_teacher = flaky
+    feed(hard, "LLLLL")
+    rows, info = await hard.label(0)
+    assert info["asked"] == 4 and info["failed"] == 1 and len(rows) == 3
+    assert hard.usd[0] == pytest.approx(info["usd"]) and hard.usd[0] > 0
+    assert (tmp_path / "spend.jsonl").exists() and hard.asked[0] == 4
+
+
+async def test_only_briefs_of_opponents_that_are_still_hard_are_asked(tmp_path):
+    hard, fake = states(tmp_path, window=10, min_games=5, threshold=0.2, batch=20)
+    feed(hard, "LLLLL")  # petra-3 hard: 6 briefs a game
+    feed(hard, "LLLLL", difficulty=2)  # petra-2 hard too
+    assert {b.opponent for b in hard.pool} == {"petra-2", "petra-3"}
+    feed(hard, "WWWWWWWWWW", difficulty=3, start=5)  # the policy has since learned to beat petra-3
+    assert not hard.is_hard("petra-3") and hard.is_hard("petra-2")
+    rows, info = await hard.label(0)
+    assert rows and {r["opponent"] for r in rows} == {"petra-2"} and info["asked"] == len(rows)
+    assert all(b.opponent == "petra-2" for b in hard.pool)  # the petra-3 ones left the pool unasked
+    assert all("g3-" not in json.dumps(body) for body in fake.bodies("/v1/chat/completions"))
+
+
+async def test_no_labels_are_bought_once_the_learners_aux_alpha_is_under_the_floor(tmp_path):
+    hard, fake = states(tmp_path, alpha_floor=0.01)
+    feed(hard, "LLLLL")
+    rows, info = await hard.label(0, alpha=0.004)
+    assert rows == [] and "under the 0.01 floor" in info["skipped"] and not fake.requests and hard.usd[0] == 0
+    assert (await hard.label(0, alpha=0.2))[1]["asked"] > 0
+    assert (await states(tmp_path / "n")[0].label(0, alpha=None))[1][
+        "skipped"
+    ] == "no hard states waiting"  # no alpha yet
+
+
+def test_the_alpha_floor_is_a_config_field_with_a_default_and_a_sanity_check(tmp_path):
+    assert HardStateConfig().alpha_floor == 0.01
+    with pytest.raises(ValueError, match="alpha_floor"):
+        HardStateConfig(alpha_floor=-1)
+
+
+def test_the_orchestrator_reads_the_learners_latest_aux_alpha_from_the_health_tail(tmp_path):
+    from agentenv_zeroad.train.orchestrate import latest_aux_alpha
+
+    health = tmp_path / "health.jsonl"
+    assert latest_aux_alpha(health) is None
+    health.write_text(
+        "\n".join(
+            json.dumps(r) for r in [{"update": 1, "aux_alpha": 0.2}, {"update": 2, "aux_alpha": 0.19}, {"update": 3}]
+        )
+        + "\n{bad json\n"
+    )
+    assert latest_aux_alpha(health) == 0.19
+
+
+def test_a_label_is_asked_with_the_effort_and_max_tokens_the_calibration_played_that_model_with(tmp_path):
+    from agentenv_zeroad.train.orchestrate import teacher_settings
+
+    panel = {
+        "name": "teacher-calibration", "kind": "teacher_calibration", "at_hours": 0, "games": 16,
+        "teachers": [
+            {"name": "opus", "model": OPUS, "effort": "high", "max_tokens": 8000},
+            {"name": "astra", "model": ASTRA, "effort": None, "max_tokens": 2048},
+        ],
+    }  # fmt: skip
+    cfg = run_config(tmp_path / "run", panels=[panel], hard_states={"enabled": True})
+    assert teacher_settings(cfg, OPUS) == ("high", 8000) and teacher_settings(cfg, "astra") == (None, 2048)
+    assert teacher_settings(cfg, "some/other-model") == ("low", 1024)
+
+
+# ---- the tokenizer ----------------------------------------------------------------------------------------------
+def tiny_tokenizer_file(path: Path) -> Path:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    vocab = {"[UNK]": 0, "<|im_end|>": 1, "<tool_call>": 2, "</tool_call>": 3, "army": 4}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.add_special_tokens(["<|im_end|>", "<tool_call>", "</tool_call>"])
+    tok.save(str(path))
+    return path
+
+
+def test_the_hub_tokenizer_ends_a_completion_with_the_im_end_id_and_adds_nothing_else(tmp_path):
+    tok = distill.HubTokenizer(str(tiny_tokenizer_file(tmp_path / "tokenizer.json")))
+    ids = tok.encode(distill.completion_text([("army", {})]), add_special_tokens=False)
+    assert ids[0] == 2 and ids[-1] == 1 and 3 in ids and ids.count(1) == 1  # <tool_call> ... </tool_call><|im_end|>
+
+
+def test_the_hub_tokenizer_gives_the_same_ids_as_transformers_for_a_teacher_completion():
+    pytest.importorskip("transformers")
+    from transformers import AutoTokenizer
+
+    try:
+        ours = distill.HubTokenizer("Qwen/Qwen3-4B")
+        theirs = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+    except Exception as e:  # noqa: BLE001 - no network and no cached tokenizer here
+        pytest.skip(f"the Qwen tokenizer is not available: {e}")
+    text = distill.completion_text([("army", {"action": "attack", "note": "café"}), ("hold", {})])
+    assert ours.encode(text, add_special_tokens=False) == theirs.encode(text, add_special_tokens=False)
+    assert ours.encode(text, add_special_tokens=False)[-1] == theirs.convert_tokens_to_ids("<|im_end|>")
+
+
+def test_load_hard_states_loads_the_tokenizer_once_and_a_missing_one_stops_the_run_at_its_start(tmp_path, monkeypatch):
+    from agentenv_zeroad.train.orchestrate import load_hard_states
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "https://p")
+    monkeypatch.setenv("LITELLM_API_KEY", KEY)
+    loaded = []
+    monkeypatch.setattr(distill, "HubTokenizer", lambda name: loaded.append(name) or CharTokenizer())
+    cfg = run_config(tmp_path / "run", hard_states={"enabled": True, "teacher": OPUS, "batch": 4, "min_games": 5})
+    hard = load_hard_states(cfg, TOOLS, None)
+    assert loaded == ["Qwen/Qwen3-8B"] and hard is not None and isinstance(hard.tokenizer, CharTokenizer)
+
+    def missing(name):
+        raise OSError(f"no tokenizer {name}")
+
+    monkeypatch.setattr(distill, "HubTokenizer", missing)
+    with pytest.raises(OSError, match="no tokenizer"):
+        load_hard_states(cfg, TOOLS, None)
+
+
+async def test_labelling_passes_reuse_the_one_tokenizer(tmp_path):
+    loads = []
+
+    class Counting(CharTokenizer):
+        def __init__(self):
+            loads.append(1)
+
+    hard, _ = states(tmp_path, batch=2)
+    hard.tokenizer = Counting()
+    feed(hard, "LLLLL")
+    await hard.label(0)
+    await hard.label(0)
+    assert loads == [1]
+
+
+async def test_the_orchestrator_hands_the_learners_latest_aux_alpha_to_the_labelling_pass(tmp_path, monkeypatch):
+    hard = FakeHard()
+    t = make(tmp_path, monkeypatch, concurrency=1, hard_states={"enabled": True, "interval_s": 0.001})
+    t.orch.hard = hard
+    t.root.mkdir(parents=True, exist_ok=True)
+    (t.root / "health.jsonl").write_text(
+        json.dumps({"update": 1, "aux_alpha": 0.2}) + "\n" + json.dumps({"update": 2, "aux_alpha": 0.003}) + "\n"
+    )
+    t.orch._start_hard_labels(0)
+    await t.orch.join_hard()
+    assert hard.alphas == [0.003]

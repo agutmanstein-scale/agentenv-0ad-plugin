@@ -2,8 +2,6 @@
 
 import asyncio
 import json
-import sys
-import types
 
 import pytest
 
@@ -401,11 +399,7 @@ def test_the_command_line_writes_rows_a_report_and_the_ledger(tmp_path, monkeypa
     fake = FakeLiteLLM(tool_calls=[("army", {"action": "attack"})])
     client = fake.http()
     monkeypatch.setattr(D.httpx, "AsyncClient", lambda **kw: client)
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda name: CharTokenizer())),
-    )
+    monkeypatch.setattr(D, "HubTokenizer", lambda name: CharTokenizer())
     monkeypatch.setenv("TEACHER_KEY", KEY)
     out, ledger = tmp_path / "out", tmp_path / "spend.jsonl"
     args = [
@@ -430,11 +424,7 @@ def test_the_command_line_refuses_to_run_without_the_teachers_key(tmp_path, monk
     (tmp_path / "tools.json").write_text("[]")
     (tmp_path / "system.txt").write_text(SYSTEM)
     monkeypatch.delenv("TEACHER_KEY", raising=False)
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda name: CharTokenizer())),
-    )
+    monkeypatch.setattr(D, "HubTokenizer", lambda name: CharTokenizer())
     args = [
         "--games", str(tmp_path / "games"), "--out", str(tmp_path / "o"), "--tools", str(tmp_path / "tools.json"),
         "--system", str(tmp_path / "system.txt"), "--tokenizer", "t", "--teacher", "m", "--base-url", "u",
@@ -452,11 +442,7 @@ def run_cli(tmp_path, monkeypatch, *extra):
     fake = FakeLiteLLM(tool_calls=[("army", {"action": "attack"})])
     client = fake.http()
     monkeypatch.setattr(D.httpx, "AsyncClient", lambda **kw: client)
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        types.SimpleNamespace(AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda name: CharTokenizer())),
-    )
+    monkeypatch.setattr(D, "HubTokenizer", lambda name: CharTokenizer())
     monkeypatch.setenv("TEACHER_KEY", KEY)
     args = [
         "--games", str(tmp_path / "games"), "--out", str(tmp_path / "out"), "--tools", str(tmp_path / "tools.json"),
