@@ -94,6 +94,10 @@ class Store(Protocol):
         """Every key under `prefix` (a folder name, no trailing slash needed), sorted."""
         ...
 
+    def tags(self, prefix: str) -> dict[str, str]:
+        """Every key under `prefix` with a tag that changes when the object is rewritten (S3's ETag)."""
+        ...
+
     def exists(self, key: str) -> bool: ...
     def delete(self, key: str) -> None: ...
 
@@ -133,6 +137,13 @@ class LocalStore:
         found = (p for p in base.rglob("*") if p.is_file() and not p.name.startswith(".")) if base.is_dir() else ()
         return sorted(p.relative_to(self.root).as_posix() for p in found)
 
+    def tags(self, prefix: str) -> dict[str, str]:
+        out = {}
+        for key in self.list(prefix):
+            stat = self._path(key).stat()
+            out[key] = f"{stat.st_size}-{stat.st_mtime_ns}"
+        return out
+
     def exists(self, key: str) -> bool:
         return self._path(key).is_file()
 
@@ -152,10 +163,6 @@ def run_aws(cmd: list[str]) -> tuple[int, str]:
     except subprocess.TimeoutExpired:
         return 124, "aws timed out"
     return done.returncode, done.stdout if done.returncode == 0 else done.stderr + done.stdout
-
-
-def _missing(output: str) -> bool:
-    return any(s in output for s in ("404", "Not Found", "does not exist", "NoSuchKey"))
 
 
 class S3Store:
@@ -184,27 +191,28 @@ class S3Store:
         code, out = self._run(["aws", "s3", "cp", self._url(key), str(dst), "--only-show-errors"])
         if code == 0:
             return
-        if _missing(out):
+        # The role may list only its own prefix, so S3 answers 403 rather than 404 for a key that is not there: only a
+        # listing says whether the object exists, and a failure on one that does is an error.
+        if not self.exists(key):
             raise FileNotFoundError(key)
         raise StoreError(f"get {key} failed ({code}): {out.strip()[-300:]}")
 
-    def list(self, prefix: str) -> list[str]:
-        full = self._full(prefix.strip("/")) + "/"
+    def _pairs(self, prefix: str) -> list[tuple[str, str]]:
         out = self._ok(
-            ["aws", "s3api", "list-objects-v2", "--bucket", self.bucket, "--prefix", full, "--query", "Contents[].Key",
-             "--output", "json"]
+            ["aws", "s3api", "list-objects-v2", "--bucket", self.bucket, "--prefix", prefix, "--query",
+             "Contents[].[Key,ETag]", "--output", "json"]
         )  # fmt: skip
-        keys = json.loads(out or "null") or []
         strip = len(self.prefix) + 1 if self.prefix else 0
-        return sorted(k[strip:] for k in keys)
+        return sorted((k[strip:], str(tag)) for k, tag in json.loads(out or "null") or [])
+
+    def list(self, prefix: str) -> list[str]:
+        return [k for k, _ in self._pairs(self._full(prefix.strip("/")) + "/")]
+
+    def tags(self, prefix: str) -> dict[str, str]:
+        return dict(self._pairs(self._full(prefix.strip("/")) + "/"))
 
     def exists(self, key: str) -> bool:
-        code, out = self._run(["aws", "s3api", "head-object", "--bucket", self.bucket, "--key", self._full(key)])
-        if code == 0:
-            return True
-        if _missing(out):
-            return False
-        raise StoreError(f"head {key} failed ({code}): {out.strip()[-300:]}")
+        return any(k == key for k, _ in self._pairs(self._full(key)))
 
     def delete(self, key: str) -> None:
         self._ok(["aws", "s3", "rm", self._url(key), "--only-show-errors"])

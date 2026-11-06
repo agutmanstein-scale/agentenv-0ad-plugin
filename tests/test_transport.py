@@ -79,10 +79,12 @@ def test_actors_draw_different_games_from_each_other_and_from_the_learner(tmp_pa
 
 # ---- the stores ---------------------------------------------------------------------------------------------------
 class FakeAws:
-    """`aws s3 cp|rm` and `s3api list-objects-v2|head-object` over a directory, the way S3 answers them."""
+    """`aws s3 cp|rm` and `s3api list-objects-v2` over a directory, answering as the zeroad-train-box role does: it may
+    list only under the run prefix, so a get of a key that is not there is a 403, as S3 answers without s3:ListBucket on
+    the key (`missing_status` 404 is the open-bucket answer)."""
 
-    def __init__(self, root: Path, bucket: str = "bkt"):
-        self.root, self.bucket, self.calls = root, bucket, []
+    def __init__(self, root: Path, bucket: str = "bkt", missing_status: int = 403):
+        self.root, self.bucket, self.calls, self.missing_status = root, bucket, [], missing_status
         self.fail: str | None = None
 
     def _path(self, url: str) -> Path:
@@ -92,17 +94,15 @@ class FakeAws:
     def __call__(self, cmd: list[str]) -> tuple[int, str]:
         self.calls.append(cmd)
         if self.fail and self.fail in " ".join(cmd):
-            return 1, "Could not connect to the endpoint URL"
+            return 1, "Could not connect to the endpoint URL: port 8404"
+        assert "head-object" not in cmd, "the role cannot HeadObject a key that is not there"
         match cmd[1:3]:
             case ["s3", "cp"]:
                 src, dst = cmd[3], cmd[4]
                 if src.startswith("s3://"):
                     path = self._path(src)
                     if not path.is_file():
-                        return (
-                            1,
-                            f'fatal error: An error occurred (404) when calling HeadObject: Key "{src}" does not exist',
-                        )
+                        return 1, f"An error occurred ({self.missing_status}) when calling the HeadObject operation"
                     shutil.copyfile(path, dst)
                 else:
                     path = self._path(dst)
@@ -112,15 +112,13 @@ class FakeAws:
             case ["s3", "rm"]:
                 self._path(cmd[3]).unlink(missing_ok=True)
                 return 0, ""
-            case ["s3api", "head-object"]:
-                key = cmd[cmd.index("--key") + 1]
-                if (self.root / key).is_file():
-                    return 0, "{}"
-                return 254, "An error occurred (404) when calling the HeadObject operation: Not Found"
             case ["s3api", "list-objects-v2"]:
                 prefix = cmd[cmd.index("--prefix") + 1]
-                keys = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*") if p.is_file())
-                found = [k for k in keys if k.startswith(prefix)]
+                found = [
+                    [p.relative_to(self.root).as_posix(), f'"{p.stat().st_size}-{p.stat().st_mtime_ns}"']
+                    for p in sorted(self.root.rglob("*"))
+                    if p.is_file() and p.relative_to(self.root).as_posix().startswith(prefix)
+                ]
                 return 0, json.dumps(found or None)
         raise AssertionError(cmd)
 
@@ -158,14 +156,36 @@ def test_a_store_puts_gets_lists_checks_and_deletes(store, tmp_path):
 def test_an_s3_failure_that_is_not_a_missing_object_raises_a_store_error(tmp_path):
     aws = FakeAws(tmp_path / "bucket")
     store = S3Store("s3://bkt", run=aws)
+    put_json(store, "a.json", {})
     aws.fail = "s3 cp"
     with pytest.raises(StoreError):
         store.put("a.json", tmp_path)
     with pytest.raises(StoreError):
-        store.get("a.json", tmp_path / "x")
-    aws.fail = "head-object"
+        store.get("a.json", tmp_path / "x")  # a failure on an object that a listing shows is not "missing"
+    with pytest.raises(FileNotFoundError):
+        store.get("b.json", tmp_path / "x")  # not listed: missing, whatever the text of the failure said
+    aws.fail = "list-objects-v2"
     with pytest.raises(StoreError):
         store.exists("a.json")
+    with pytest.raises(StoreError):
+        store.get("b.json", tmp_path / "x")
+
+
+@pytest.mark.parametrize("missing_status", [403, 404])
+def test_a_missing_key_reads_as_missing_under_a_role_that_cannot_head_it(tmp_path, missing_status):
+    aws = FakeAws(tmp_path / "bucket", missing_status=missing_status)
+    store = S3Store("s3://bkt/runs/r1", run=aws)
+    assert (
+        not store.exists("stop.json")
+        and get_json(store, "stop.json") is None
+        and get_json(store, "current.json") is None
+    )
+    store.delete("stop.json")
+    put_json(store, "current.json.bak", {})
+    assert not store.exists("current.json")  # a longer key under the same prefix is not it
+    put_json(store, "current.json", {"version": 1})
+    assert store.exists("current.json") and get_json(store, "current.json") == {"version": 1}
+    assert not any("head-object" in c for c in aws.calls)
 
 
 def test_the_s3_store_names_objects_under_its_prefix_and_uses_the_cli(tmp_path):
