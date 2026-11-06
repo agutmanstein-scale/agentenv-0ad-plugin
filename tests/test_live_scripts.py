@@ -524,11 +524,33 @@ def test_teardown_refuses_a_box_whose_name_or_purpose_tag_is_not_ours(stubs, tag
 
 
 def test_teardown_terminates_a_box_with_both_tags(stubs):
-    rules = [["describe-instances", "running zeroad-live-onair zeroad-live\n", 0], ["terminate", "shutting-down\n", 0]]
+    rules = [
+        ["describe-instances&&SpotInstanceRequestId", "None\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["terminate", "shutting-down\n", 0],
+    ]
     out = run(stubs, "teardown.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
     assert out.returncode == 0, out.stderr
-    assert [c["argv"][1] for c in aws_calls(stubs)] == ["describe-instances", "terminate-instances", "wait"]
+    assert [c["argv"][1] for c in aws_calls(stubs)] == [
+        "describe-instances", "describe-instances", "terminate-instances", "wait"
+    ]
     assert "aws ssm delete-parameters" in out.stderr
+
+
+def test_teardown_cancels_a_spot_boxs_persistent_request_before_terminating_it(stubs):
+    rules = [
+        ["describe-instances&&SpotInstanceRequestId", "sir-0abc\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["cancel-spot-instance-requests", "cancelled\n", 0],
+        ["terminate", "shutting-down\n", 0],
+    ]
+    out = run(stubs, "teardown.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
+    assert out.returncode == 0, out.stderr
+    calls = [c["argv"] for c in aws_calls(stubs)]
+    assert [c[1] for c in calls] == [
+        "describe-instances", "describe-instances", "cancel-spot-instance-requests", "terminate-instances", "wait"
+    ]
+    assert "sir-0abc" in calls[2]
 
 
 @pytest.mark.parametrize("tags", WRONG_TAGS, ids=["wrong-purpose", "wrong-name"])
@@ -1839,6 +1861,19 @@ def test_the_s2_launch_plan_prices_a_g6e_box_for_the_whole_sequence_and_stops_it
     assert out.returncode == 0, plan
     assert "--instance-type g6e.12xlarge" in plan and "--instance-initiated-shutdown-behavior stop" in plan
     assert "Key=purpose,Value=zeroad-s2" in plan and "powers off (stop) after 21 h" in plan
+
+
+def test_a_spot_launch_asks_for_a_persistent_request_that_stops_when_reclaimed_and_tags_it(stubs):
+    out = run(s2_stubs(stubs, "LIVE_SPOT=1\n"), "launch.sh", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}" in plan
+    assert "ResourceType=spot-instances-request,Tags=[{Key=Name,Value=zeroad-s2}" in plan
+
+
+def test_a_spot_launch_refuses_a_box_that_would_terminate_on_shutdown(stubs):
+    out = run(s2_stubs(stubs, "LIVE_SPOT=1\nLIVE_SHUTDOWN_BEHAVIOR=terminate\n"), "launch.sh", forbid_aws=True)
+    assert out.returncode != 0 and "LIVE_SPOT=1 needs LIVE_SHUTDOWN_BEHAVIOR=stop" in out.stderr
 
 
 def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket_filled_in_then_starts_the_sequence(
