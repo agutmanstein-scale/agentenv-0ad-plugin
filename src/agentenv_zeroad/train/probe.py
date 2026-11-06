@@ -208,8 +208,7 @@ def write_outputs(out: Path, results: Sequence[ServerLevel], rows: Sequence[dict
     return summary
 
 
-async def main_async(args: argparse.Namespace) -> int:
-    items = prompts_from(args.prompts)
+async def main_async(args: argparse.Namespace, items: Sequence[PromptItem]) -> int:
     results, rows = await run_probe(
         args.url, os.environ["VLLM_API_KEY"], items, levels=args.levels, window_s=args.window_s, keep=args.rows
     )
@@ -225,7 +224,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--window-s", type=float, default=WINDOW_S)
     p.add_argument("--rows", type=int, default=DEFAULT_ROWS, help="sampled decisions kept for the learner's probe")
     p.add_argument("--prompts", type=Path, help="JSON lines of {system, user, tools}, instead of the recorded ones")
-    return asyncio.run(main_async(p.parse_args(argv)))
+    args = p.parse_args(argv)
+    items = prompts_from(args.prompts)  # before the loop: the recorded prompts are built with their own asyncio.run
+    return asyncio.run(main_async(args, items))
 
 
 if __name__ == "__main__":

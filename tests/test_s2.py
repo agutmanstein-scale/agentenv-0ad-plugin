@@ -1124,3 +1124,16 @@ def test_the_final_report_links_the_panels_of_every_step_and_writes_s2_report_js
     broken, _ = make_ctx(tmp_path / "broken", FakeRunner())
     broken.cfg = lambda step, **kw: (_ for _ in ()).throw(RuntimeError("no config"))  # type: ignore[method-assign]
     assert "RuntimeError: no config" in S.final_report(broken)  # a report that cannot be built does not raise
+
+
+def test_the_probe_cli_builds_the_recorded_prompts_outside_its_event_loop(tmp_path, monkeypatch):
+    seen: list[int] = []
+
+    async def fake_probe(urls, key, items, **_):
+        seen.append(len(items))
+        return [], []
+
+    monkeypatch.setattr(P, "run_probe", fake_probe)
+    monkeypatch.setenv("VLLM_API_KEY", "k")
+    assert P.main(["--url", "http://x:8000", "--out", str(tmp_path / "out")]) == 0
+    assert seen and seen[0] > 0 and (tmp_path / "out" / "throughput.json").exists()
