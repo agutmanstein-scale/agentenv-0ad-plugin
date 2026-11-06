@@ -88,6 +88,7 @@ from agentenv_zeroad.engine import DEFAULT_IMAGE, EngineOptions, free_port, star
 from agentenv_zeroad.grading import ScoreRule
 from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
 from agentenv_zeroad.live import Broadcast, BroadcastSettings, overlay_html, overlay_state
+from agentenv_zeroad.llm import ToolSpec
 from agentenv_zeroad.match import TICK_S, EngineHandle, LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.orders import (
     DEFAULT_MIN_SIZE,
@@ -102,7 +103,6 @@ from agentenv_zeroad.orders import (
     ArmyAction,
     Build,
     Hold,
-    OrderResult,
     Research,
     Role,
     Say,
@@ -270,8 +270,16 @@ def overlay_url(token: str) -> str:
     return f"http://127.0.0.1:{os.environ.get('MCP_PORT', '18765')}/live?stream&token={token}"
 
 
-def _result(result: OrderResult, footer: str) -> str:
-    return json.dumps({**result.to_json(), "footer": footer})
+async def tool_specs() -> list[ToolSpec]:
+    """Every tool as an MCP client lists it: the names, descriptions and schemas FastMCP builds from `ZeroADEnv`'s tool
+    functions. An in-process seat link shows its model these, so the prompt matches the MCP seat's byte for byte."""
+    with tempfile.TemporaryDirectory(prefix="zeroad-tools-") as out:
+        env = ZeroADEnv(out_root=Path(out))
+        env.create_app()
+        listed = await env.mcp.list_tools()
+    return [
+        ToolSpec(t.name, t.description or "", t.inputSchema or {"type": "object", "properties": {}}) for t in listed
+    ]
 
 
 @environment_card(name="zeroad")
@@ -567,19 +575,7 @@ class ZeroADEnv(AgentEnvGameEnv):
         if refusal is not None:
             return refusal
         assert slot is not None and self.live is not None
-        live = self.live
-        if live.over or self.playing_out:
-            result = rejected("match_over", f"The match is over: {live.detail() or 'it is being played out'}.")
-        else:
-            try:
-                order = build()
-                result = live.submit(slot, order)
-            except ValidationError as e:
-                result = rejected(
-                    "bad_arguments", "; ".join(err["msg"] for err in e.errors()), suggest="get_brief() for the state"
-                )
-        live.record_tool_call(slot, tool_name, time.perf_counter() - started, result.status)
-        return _result(result, live.footer(slot))
+        return self.live.run_order(slot, tool_name, build, closed=self.playing_out, started=started)
 
     @tool()
     async def get_brief(
@@ -595,9 +591,7 @@ class ZeroADEnv(AgentEnvGameEnv):
         if refusal is not None:
             return refusal
         assert slot is not None and self.live is not None
-        text = self.live.compact_brief(slot) if compact else self.live.brief(slot)
-        self.live.record_tool_call(slot, "get_brief", time.perf_counter() - started, "accepted")
-        return text
+        return self.live.read_brief(slot, compact=compact, started=started)
 
     @tool()
     async def set_economy(

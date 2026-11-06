@@ -27,6 +27,12 @@ Setup A). They are wrapped as A2A agents in `agents/zeroad-commander` and `agent
   "not yet" all match; a "not yet" past the plan's deadline is reported as a hold (`POST .../held`), and the env's
   autopilot carries out the default, logged as the autopilot's.
 
+Lockstep training games (`train/`) run the strategist as a library instead: `CommanderSeat` gives the lockstep clock
+(`clock.LockstepClock`) one decision at a time (the brief frozen at game time T, the model call in flight while the game
+steps, the orders applied at T + L), and `InProcessSeatLink` plays the seat straight against its `LiveMatch` with the
+same tool schemas, brief and results as the MCP link, so the model sees byte-identical prompts. The due-time rule is
+the same `decision_due` the live loop uses, counted in game seconds.
+
 Each stops before its spend cap (`SpendGuard`) and keeps polling until the match is over, so the seat plays on with
 its executor; it stops at once when the match is over or the env goes away. A defeated seat's strategist stops calling
 its model and polls until the match is over. A failed model call, order call or brief costs one turn (a failed order
@@ -40,21 +46,26 @@ import copy
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from agentenv_zeroad import grading
 from agentenv_zeroad.autopilot import HELD_ATTACK_MIN, HELD_DEADLINES
 from agentenv_zeroad.brief_v2 import notices_in
 from agentenv_zeroad.decisions import DecisionsClient, Question, choice, score
 from agentenv_zeroad.interface import DEFAULT_INTERFACE, Interface
-from agentenv_zeroad.llm import StrategistModel, ToolSpec
+from agentenv_zeroad.llm import Reply, StrategistModel, ToolSpec
+from agentenv_zeroad.orders import parse_order
 from agentenv_zeroad.spend import SpendCapReached
+
+if TYPE_CHECKING:
+    from agentenv_zeroad.match import LiveMatch
 
 log = logging.getLogger(__name__)
 
@@ -117,26 +128,12 @@ class SeatLink:
         self.interface = interface
 
     async def tools(self) -> list[ToolSpec]:
-        """The seat's order tools as its interface offers them: v1 is the env's tools without v2's `hold` and
-        parameters, exactly as they were before v2."""
+        """The seat's order tools as its interface offers them (`offered_tools`)."""
         listed = (await self.session.list_tools()).tools
-        offered = ORDER_TOOLS_V2 if self.interface == "v2" else ORDER_TOOLS
-        return [
-            ToolSpec(t.name, t.description or "", self._schema(t.name, t.inputSchema))
-            for t in listed
-            if t.name in offered
-        ]
-
-    def _schema(self, name: str, schema: dict[str, Any] | None) -> dict[str, Any]:
-        schema = schema or {"type": "object", "properties": {}}
-        if self.interface == "v2":
-            return compact_schema(schema)
-        if name not in V2_ONLY_PARAMS:
-            return schema
-        schema = copy.deepcopy(schema)
-        for param in V2_ONLY_PARAMS[name]:
-            schema.get("properties", {}).pop(param, None)
-        return schema
+        specs = (
+            ToolSpec(t.name, t.description or "", t.inputSchema or {"type": "object", "properties": {}}) for t in listed
+        )
+        return offered_tools(specs, self.interface)
 
     async def reference(self) -> str:
         """The seat's static cost tables (interface v2), for the system prompt's prefix."""
@@ -191,6 +188,53 @@ async def seat_link(server: dict[str, Any], interface: Interface = DEFAULT_INTER
         yield SeatLink(session, server["url"], http, interface)
 
 
+class InProcessSeatLink:
+    """A seat played straight against its `LiveMatch` in this process, with `SeatLink`'s interface and no MCP session
+    or HTTP route between them.
+
+    `tool_specs` are the schemas FastMCP builds from the env's tool functions (`server.tool_specs`), offered as the
+    seat plan's interface offers them (`offered_tools`), so the model is shown exactly what an MCP link lists.
+    `get_brief` and the order tools run through the same `LiveMatch.read_brief` and `LiveMatch.run_order` the env's
+    tool functions call, so briefs and results (including the footer) are the same text; `reference` is the same
+    `LiveMatch.reference` the env's route serves. The one difference is an order whose arguments break the tool's
+    schema: the MCP server turns that into an MCP error before the tool runs, this link into a rejected
+    `bad_arguments` result.
+    """
+
+    def __init__(self, match: LiveMatch, slot: str, tool_specs: Sequence[ToolSpec]):
+        self.match = match
+        self.slot = slot
+        self.interface = match.seats[slot].plan.interface
+        self._tools = offered_tools(tool_specs, self.interface)
+
+    async def tools(self) -> list[ToolSpec]:
+        return list(self._tools)
+
+    async def reference(self) -> str:
+        return self.match.reference(self.slot)
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        if name == "get_brief":
+            return await self.brief(compact=bool(arguments.get("compact")))
+        return self.match.run_order(self.slot, name, lambda: parse_order({**arguments, "kind": name}))
+
+    async def brief(self, *, compact: bool = False) -> str:
+        return self.match.read_brief(self.slot, compact=compact)
+
+    async def status(self) -> dict[str, Any]:
+        return {**self.match.status(self.slot), "playing_out": False}
+
+    async def report_call(self, seconds: float, error: str | None, **extra: Any) -> None:
+        call = grading.BrainCall(seconds=seconds, error=error, game_ms=self.match.time_ms)
+        tokens = (extra["input_tokens"], extra["output_tokens"]) if extra.get("input_tokens") is not None else None
+        self.match.record_brain_call(
+            self.slot, call, usd=extra.get("usd"), tokens=tokens, model=extra.get("model"), turn=extra.get("turn")
+        )
+
+    async def waiting(self, state: str) -> None:
+        self.match.record_waiting(self.slot, state)
+
+
 @dataclass
 class BrainRecord:
     """What a brain did, for its A2A result."""
@@ -230,6 +274,28 @@ def _message_of(text: str) -> str:
         return str(json.loads(text).get("message", ""))[:300]
     except (json.JSONDecodeError, AttributeError):
         return text[:300]
+
+
+def offered_tools(specs: Iterable[ToolSpec], interface: Interface) -> list[ToolSpec]:
+    """The order tools an interface offers, from the env's tool schemas: v1 is the env's tools without v2's `hold` and
+    parameters, exactly as they were before v2; v2 adds `hold`, every schema compacted (`compact_schema`)."""
+    offered = ORDER_TOOLS_V2 if interface == "v2" else ORDER_TOOLS
+    return [
+        ToolSpec(t.name, t.description, _offered_schema(t.name, t.parameters, interface))
+        for t in specs
+        if t.name in offered
+    ]
+
+
+def _offered_schema(name: str, schema: dict[str, Any], interface: Interface) -> dict[str, Any]:
+    if interface == "v2":
+        return compact_schema(schema)
+    if name not in V2_ONLY_PARAMS:
+        return schema
+    schema = copy.deepcopy(schema)
+    for param in V2_ONLY_PARAMS[name]:
+        schema.get("properties", {}).pop(param, None)
+    return schema
 
 
 def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -280,6 +346,15 @@ async def _wait_over(link: SeatLink, poll_s: float, sleep: Callable[[float], Awa
 
 
 # ---- the strategist --------------------------------------------------------------------------------------------------
+def decision_due(
+    now: float, last: float | None, urgent: int, *, interval_s: float, min_gap_s: float, started: bool = True
+) -> bool:
+    """Whether a strategist call falls due: the match has started and either none was made yet, `interval_s` passed
+    since the last, or an urgent event is pending and `min_gap_s` passed. `now` and `last` share one clock (wall
+    seconds, or game seconds when the interval counts game time)."""
+    return started and (last is None or now - last >= interval_s or (urgent > 0 and now - last >= min_gap_s))
+
+
 @dataclass
 class CommanderSettings:
     interval_s: float = 25.0
@@ -299,6 +374,16 @@ class CommanderSettings:
 
 def strategist_system(interface: Interface) -> str:
     return STRATEGIST_SYSTEM_V2 if interface == "v2" else STRATEGIST_SYSTEM
+
+
+@dataclass
+class Asked:
+    """One model call's outcome: the reply or the error, when it began (`perf_counter`) and how long it took."""
+
+    reply: Reply | None
+    error: Exception | None
+    started: float
+    seconds: float
 
 
 class Commander:
@@ -323,11 +408,17 @@ class Commander:
         """The system prompt: the settings' text, then (interface v2) the seat's per-civ cost tables."""
         return f"{self.settings.system_prompt}\n\n{self._reference}" if self._reference else self.settings.system_prompt
 
+    async def offered(self, link: SeatLink | InProcessSeatLink) -> list[ToolSpec]:
+        """The seat's tools for this brain's model and, on interface v2, the seat's cost tables for its system prompt
+        (read once, before the first brief)."""
+        tools = await link.tools()
+        if self.settings.interface == "v2":
+            self._reference = await link.reference()
+        return tools
+
     async def play(self, link: SeatLink, *, reflex_key: tuple[str, str] | None = None) -> BrainRecord:
         s = self.settings
-        tools = await link.tools()
-        if s.interface == "v2":
-            self._reference = await link.reference()
+        tools = await self.offered(link)
         await link.brief()  # the first call marks the seat ready; the match starts when every agent is
         if reflex_key is not None:
             await link.offer_reflex(*reflex_key)
@@ -345,8 +436,13 @@ class Commander:
                 self.record.end_reason = f"defeated ({await _wait_over(link, s.poll_s, self._sleep)})"
                 return self.record
             now = st.get("game_ms", 0) / 1000 if s.game_clock else self._clock()
-            due = st.get("started", True) and (
-                last is None or now - last >= s.interval_s or (st.get("urgent", 0) > 0 and now - last >= s.min_gap_s)
+            due = decision_due(
+                now,
+                last,
+                st.get("urgent", 0),
+                interval_s=s.interval_s,
+                min_gap_s=s.min_gap_s,
+                started=st.get("started", True),
             )
             if not due:
                 await self._sleep(s.poll_s)
@@ -361,6 +457,18 @@ class Commander:
                 self.record.end_reason = f"spend_cap ({self.record.end_reason})"
                 return self.record
 
+    async def prepare(self, link: SeatLink, urgent: bool) -> str | None:
+        """Freeze a turn: read the brief now and build the user message from it. None when there is no brief. A v2
+        brief's executor notices are kept for this turn's memory entry."""
+        try:
+            brief = await link.brief()
+        except Exception as e:  # noqa: BLE001 - no brief, no turn; the next trigger tries again
+            self.record.last_error = f"brief failed: {type(e).__name__}: {str(e)[:200]}"
+            return None
+        if self.settings.interface == "v2":
+            self._notices = notices_in(brief)
+        return self._user(brief, urgent)
+
     async def turn(
         self,
         link: SeatLink,
@@ -373,39 +481,49 @@ class Commander:
         """One brief -> model -> orders turn. False when the spend cap stops the brain. `waiting`: the seat had a
         decision open when the turn began, so it waits on this call until its orders are applied. `game_ms`: the
         game time the turn began at, for its logged turn."""
-        try:
-            brief = await link.brief()
-        except Exception as e:  # noqa: BLE001 - no brief, no turn; the next trigger tries again
-            self.record.last_error = f"brief failed: {type(e).__name__}: {str(e)[:200]}"
+        user = await self.prepare(link, urgent)
+        if user is None:
             return True
-        user = self._user(brief, urgent)
-        if self.settings.interface == "v2":
-            self._notices = notices_in(brief)
         if waiting:
             await link.waiting("begin")
         try:
-            return await self._call_and_apply(link, user, tools, game_ms=game_ms, urgent=urgent)
+            asked = await self.ask(user, tools)
+            return await self.settle(link, user, asked, game_ms=game_ms, urgent=urgent)
         finally:
             if waiting:
                 await link.waiting("end")
 
-    async def _call_and_apply(
-        self, link: SeatLink, user: str, tools: list[ToolSpec], *, game_ms: int | None = None, urgent: bool = False
-    ) -> bool:
+    async def ask(self, user: str, tools: list[ToolSpec]) -> Asked:
+        """The model call of a turn. Its failure is returned, not raised; `settle` decides what it costs."""
         started = time.perf_counter()
         try:
             reply = await self.model.call(self.system, user, tools)
-        except SpendCapReached as e:
-            self.record.last_error = str(e)
-            return False
         except Exception as e:  # noqa: BLE001 - a failed call is reported (missed) and the next trigger tries again
-            seconds = time.perf_counter() - started
-            self.record.calls += 1
-            self.record.errors += 1
-            self.record.last_error = f"{type(e).__name__}: {str(e)[:300]}"
-            usd = round(self.model.guard.last_usd, 6)
-            await link.report_call(seconds, self.record.last_error, usd=usd, model=self.model.model)
+            return Asked(None, e, started, time.perf_counter() - started)
+        return Asked(reply, None, started, time.perf_counter() - started)
+
+    async def fail_call(self, link: SeatLink, error: str, seconds: float, *, usd: float | None = None) -> None:
+        """Count a model call that gave no usable answer, and report it as missed."""
+        self.record.calls += 1
+        self.record.errors += 1
+        self.record.last_error = error
+        await link.report_call(seconds, error, usd=usd, model=self.model.model)
+
+    async def settle(
+        self, link: SeatLink, user: str, asked: Asked, *, game_ms: int | None = None, urgent: bool = False
+    ) -> bool:
+        """Apply what `ask` got: its orders go to the seat and the call is reported. False when the spend cap stops
+        the brain."""
+        if isinstance(asked.error, SpendCapReached):
+            self.record.last_error = str(asked.error)
+            return False
+        if asked.error is not None:
+            error = f"{type(asked.error).__name__}: {str(asked.error)[:300]}"
+            await self.fail_call(link, error, asked.seconds, usd=round(self.model.guard.last_usd, 6))
             return True
+        reply = asked.reply
+        assert reply is not None
+        applying = time.perf_counter()
         v2 = self.settings.interface == "v2"
         offered = ORDER_TOOLS_V2 if v2 else ORDER_TOOLS
         orders, applied, said = [], [], False
@@ -425,7 +543,7 @@ class Commander:
             line = f"{c.name}({json.dumps(c.arguments, separators=(',', ':'))}) -> {status}"
             orders.append(f"{line}: {_answer_of(result)}" if v2 else line)
             applied.append({"tool": c.name, "arguments": c.arguments, "status": status})
-        seconds = time.perf_counter() - started
+        seconds = asked.seconds + time.perf_counter() - applying
         self.record.calls += 1
         self.record.latencies_s.append(reply.seconds)
         turn = None
@@ -438,6 +556,7 @@ class Commander:
                 "orders": applied,
                 "prompt_token_ids": reply.prompt_token_ids,
                 "token_ids": reply.token_ids,
+                "logprobs": reply.logprobs,
             }
         await link.report_call(
             reply.seconds,
@@ -475,6 +594,95 @@ class Commander:
             + "Decide your orders now and call the tools."
         )
         return "\n\n".join(parts)
+
+
+class CommanderSeat:
+    """A `Commander` driven by the lockstep clock instead of its own polling loop (spec: the clock calls the seat's
+    strategist when a decision is due and awaits it).
+
+    `begin` is the clock's question at each boundary: if `decision_due` says a call falls due at this game time, the
+    brief is frozen now and a decision is handed back. Its `answer` is the model call, run while the game steps; its
+    `apply` runs the orders against the seat at the decision's deadline; its `miss` reports a call that never answered.
+    Intervals count game seconds whatever `settings.game_clock` says. The seat ends like `Commander.play` does: the
+    match is over, the seat is defeated, `max_calls` reached or the spend cap hit, after which `begin` returns None.
+    """
+
+    def __init__(self, commander: Commander, link: SeatLink | InProcessSeatLink, slot: str, tools: list[ToolSpec]):
+        self.commander = commander
+        self.link = link
+        self.slot = slot
+        self.tools = tools
+        self._last: float | None = None
+        self._stopped = False
+
+    async def begin(self, game_ms: int) -> _SeatDecision | None:
+        if self._stopped:
+            return None
+        s, record = self.commander.settings, self.commander.record
+        st = await self.link.status()
+        if st.get("over") or st.get("playing_out"):
+            return self._stop("match_over")
+        if st.get("defeated"):
+            return self._stop("defeated (match_over)")
+        now = game_ms / 1000
+        urgent = st.get("urgent", 0)
+        if not decision_due(
+            now, self._last, urgent, interval_s=s.interval_s, min_gap_s=s.min_gap_s, started=st.get("started", True)
+        ):
+            return None
+        if s.max_calls is not None and record.calls >= s.max_calls:
+            return self._stop("match_over")
+        self._last = now
+        user = await self.commander.prepare(self.link, urgent > 0)
+        if user is None:
+            return None
+        waiting = bool(st.get("open"))
+        if waiting:
+            await self.link.waiting("begin")
+        return _SeatDecision(self, user, game_ms, urgent > 0, waiting)
+
+    def finish(self) -> None:
+        """The match ended under this seat: say so in its record unless it ended earlier."""
+        if self.commander.record.end_reason is None:
+            self.commander.record.end_reason = "match_over"
+
+    def _stop(self, reason: str) -> None:
+        self._stopped = True
+        self.commander.record.end_reason = reason
+        return None
+
+
+class _SeatDecision:
+    """One `CommanderSeat` decision in flight (the clock's `Decision`)."""
+
+    def __init__(self, seat: CommanderSeat, user: str, game_ms: int, urgent: bool, waiting: bool):
+        self.seat, self.user, self.game_ms, self.urgent, self.waiting = seat, user, game_ms, urgent, waiting
+        self.asked: Asked | None = None
+        self._began = time.perf_counter()
+
+    async def answer(self) -> None:
+        self.asked = await self.seat.commander.ask(self.user, self.seat.tools)
+
+    async def apply(self) -> None:
+        seat, asked = self.seat, self.asked
+        assert asked is not None
+        try:
+            more = await seat.commander.settle(seat.link, self.user, asked, game_ms=self.game_ms, urgent=self.urgent)
+        finally:
+            await self._end_wait()
+        if not more:
+            seat._stop("spend_cap (match_over)")
+
+    async def miss(self, reason: str) -> None:
+        seat = self.seat
+        try:
+            await seat.commander.fail_call(seat.link, reason, time.perf_counter() - self._began)
+        finally:
+            await self._end_wait()
+
+    async def _end_wait(self) -> None:
+        if self.waiting:
+            await self.seat.link.waiting("end")
 
 
 # ---- the Luna player -------------------------------------------------------------------------------------------------

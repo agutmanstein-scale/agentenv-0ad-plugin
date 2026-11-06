@@ -11,13 +11,18 @@ back as `(name, arguments)` with arguments parsed, or an error for arguments tha
 
 `extra_body` goes into every chat request as is: a vLLM server takes sampling settings, `chat_template_kwargs` (e.g.
 Qwen's `enable_thinking: false`) and `return_token_ids`, whose prompt and completion token ids the reply keeps, so a
-trainer sees exactly what the model saw and sampled.
+trainer sees exactly what the model saw and sampled. With `logprobs: true` in `extra_body` the reply also keeps the
+sampler's log-probability of each sampled token (`logprobs`, one per entry of `token_ids`), which the learner's
+importance weights need. A reply whose log-probs don't line up with its token ids (or that has none although they
+were asked for) keeps its turn but gets `logprobs=None`, because the learner rejects a misaligned row; the model
+counts those replies (`sampler_stats()`), so a run can tell a server that never aligns from one that did once.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,6 +59,7 @@ class Reply:
     raw_usage: dict[str, Any] = field(default_factory=dict)
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    logprobs: list[float] | None = None
 
 
 def route(model: str) -> str:
@@ -73,6 +79,21 @@ def _parse_args(raw: Any) -> tuple[dict[str, Any], str | None]:
     except (TypeError, json.JSONDecodeError) as e:
         return {}, f"arguments are not valid JSON: {e}"
     return (value, None) if isinstance(value, dict) else ({}, "arguments must be a JSON object")
+
+
+def _sampled_logprobs(choice: dict[str, Any]) -> tuple[list[float] | None, str]:
+    """(the log-probability of each sampled token, how it lines up with the choice's `token_ids`).
+
+    The status is `aligned` (one log-prob per token id; the list is returned), `mismatched` (the counts differ, or
+    there are no token ids to line up with; the list is dropped) or `missing` (the reply has no log-probs).
+    """
+    content = (choice.get("logprobs") or {}).get("content")
+    if not content:
+        return None, "missing"
+    token_ids = choice.get("token_ids")
+    if token_ids is None or len(token_ids) != len(content):
+        return None, "mismatched"
+    return [float(t["logprob"]) for t in content], "aligned"
 
 
 class StrategistModel:
@@ -101,6 +122,7 @@ class StrategistModel:
         self._http = http
         self.extra_body = dict(extra_body or {})
         self.route = route(model)
+        self.stats: Counter[str] = Counter()
 
     def request(self, system: str, user: str, tools: list[ToolSpec]) -> tuple[str, dict[str, Any]]:
         """(path, body) for this model's route."""
@@ -154,10 +176,15 @@ class StrategistModel:
                 self._parse_responses(data) if self.route == "responses" else self._parse_chat(data)
             )
         except Exception:
+            self.stats["failed_calls"] += 1
             self.guard.record(self.model, None, None, most_usd=most)
             raise
         usd = self.guard.record(self.model, tokens_in, tokens_out, most_usd=most)
         choice = (data.get("choices") or [{}])[0]
+        logprobs, alignment = _sampled_logprobs(choice)
+        self.stats["calls"] += 1
+        if self.extra_body.get("logprobs"):
+            self.stats[f"logprobs_{alignment}"] += 1
         return Reply(
             text,
             calls,
@@ -168,7 +195,14 @@ class StrategistModel:
             data.get("usage") or {},
             prompt_token_ids=data.get("prompt_token_ids") or choice.get("prompt_token_ids"),
             token_ids=choice.get("token_ids"),
+            logprobs=logprobs,
         )
+
+    def sampler_stats(self) -> dict[str, int]:
+        """Calls made, calls that failed, and (when log-probs were asked for) how many replies had them aligned with
+        their token ids, misaligned or missing."""
+        keys = ("calls", "failed_calls", "logprobs_aligned", "logprobs_mismatched", "logprobs_missing")
+        return {k: self.stats[k] for k in keys}
 
     @staticmethod
     def _parse_chat(data: dict[str, Any]) -> tuple[str, list[ToolCall], int | None, int | None]:

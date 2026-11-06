@@ -36,6 +36,11 @@ load_settings() {
   export AWS_REGION="${LIVE_AWS_REGION:-us-west-2}" AWS_DEFAULT_REGION="${LIVE_AWS_REGION:-us-west-2}" AWS_PAGER=""
   PURPOSE="${LIVE_TAG_PURPOSE:-zeroad-live}"
   BOX_NAME="${LIVE_BOX_NAME:-zeroad-live-onair}"
+  # The stream box's rate is the default; a settings file that sets LIVE_REQUIRE_RATE=1 (a training box, whose type
+  # costs several times that) must give its own, because a guard that quietly prices a box at another's rate is wrong.
+  if [ "${LIVE_REQUIRE_RATE:-0}" = 1 ]; then
+    [ -n "${LIVE_BOX_USD_PER_HOUR:-}" ] || die "set LIVE_BOX_USD_PER_HOUR in $LIVE_ENV: this box type has no default rate"
+  fi
   RATE="${LIVE_BOX_USD_PER_HOUR:-1.32}"
   SSM_PREFIX="${LIVE_SSM_PREFIX:-/zeroad-live}"
   PREFIX="${LIVE_S3_PREFIX:-zeroad-live}"
@@ -100,13 +105,14 @@ box_conf() {
   cat <<EOF
 # /etc/zeroad-live.conf: written by live/bootstrap.sh from live/live.env. No secrets: keys stay in SSM.
 AWS_DEFAULT_REGION=$AWS_REGION
-ZEROAD_SSM_LITELLM_KEY=$SSM_PREFIX/litellm-key
-ZEROAD_SSM_RTMP_SERVER=$SSM_PREFIX/rtmp-server
-ZEROAD_SSM_RTMP_KEY=$SSM_PREFIX/rtmp-key
+ZEROAD_SSM_LITELLM_KEY=${SSM_PREFIX:-/zeroad-live}/litellm-key
+ZEROAD_SSM_RTMP_SERVER=${SSM_PREFIX:-/zeroad-live}/rtmp-server
+ZEROAD_SSM_RTMP_KEY=${SSM_PREFIX:-/zeroad-live}/rtmp-key
 LITELLM_BASE_URL=${LIVE_LITELLM_BASE_URL:-}
 LITELLM_ALT_BASE_URL=${LIVE_LITELLM_ALT_BASE_URL:-}
 ZEROAD_BOX_USD_PER_HOUR=$RATE
 ZEROAD_MIN_FREE_GB=${LIVE_MIN_FREE_GB:-8}
+ZEROAD_MATCH_CAP_USD=${LIVE_MATCH_CAP_USD:-9}
 EOF
 }
 

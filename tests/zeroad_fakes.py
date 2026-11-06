@@ -67,3 +67,36 @@ class Handle:
 
 def placer() -> FakePlacer:
     return FakePlacer()
+
+
+class FakeRunning:
+    """A started engine for the pool, around a ScriptedEngine: records closes and replay clears, writes a replay."""
+
+    def __init__(self, options, home: Path | None, engine: ScriptedEngine | None = None):
+        self.options = options
+        self.home = home
+        self.engine = engine or ScriptedEngine()
+        self.closed = 0
+        self.cleared = 0
+
+    async def close(self) -> None:
+        self.closed += 1
+
+    async def clear_replays(self) -> None:
+        self.cleared += 1
+
+    async def copy_replay(self, dest: Path) -> Path | None:
+        dest.write_text('{"settings": {}}\nend\n')
+        return dest
+
+
+class FakeStarter:
+    """`EnginePool`'s `start_one` without engines: every start is a `FakeRunning`, kept in `started`."""
+
+    def __init__(self) -> None:
+        self.started: list[FakeRunning] = []
+
+    async def __call__(self, options, home: Path | None) -> FakeRunning:
+        running = FakeRunning(options, home)
+        self.started.append(running)
+        return running

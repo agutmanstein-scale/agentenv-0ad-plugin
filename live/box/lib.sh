@@ -28,3 +28,20 @@ run() {
 # The RTMP URL carries the stream key: every log line that could hold it goes through redact.
 redact() { sed -E 's#rtmps?://[^[:space:]"'"'"']+#<rtmp url>#g'; }
 active() { [ "$DRY_RUN" = 1 ] && { echo inactive; return; }; systemctl is-active "$1" 2>/dev/null || true; }
+# require_engine_image IMAGE [PATCH...]: die unless docker has IMAGE and its zeroad.patches label names every PATCH. The
+# rt engine is built by scripts/build-engine.sh rt (pilot-bootstrap.sh --train runs it); an older rt image built without
+# a patch keeps its tag but not the label, and a run that expects the patch must not start on it.
+require_engine_image() {
+  local image=$1 have patch
+  shift
+  if [ "$DRY_RUN" = 1 ]; then say "+ docker image inspect $image (its zeroad.patches label must name: ${*:-nothing})"; return 0; fi
+  have=$(docker image inspect -f '{{index .Config.Labels "zeroad.patches"}}' "$image" 2>/dev/null) \
+    || die "engine image $image is not built on this box: $REPO/scripts/build-engine.sh rt (pilot-bootstrap.sh --train does it)"
+  [ "$have" = "<no value>" ] && have=
+  for patch in "$@"; do
+    case " $have " in
+      *" $patch "*) ;;
+      *) die "engine image $image lacks the patch $patch (its zeroad.patches label is \"$have\"): REBUILD=1 $REPO/scripts/build-engine.sh rt" ;;
+    esac
+  done
+}

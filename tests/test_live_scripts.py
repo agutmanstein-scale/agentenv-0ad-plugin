@@ -151,6 +151,13 @@ CHANGE_SCRIPTS = [
     ("pilot.sh", ID, "start", "--baseline", "--no-frontier", "--speed", "4"),
     ("pilot.sh", ID, "stop"),
     ("pilot.sh", ID, "stop", "--now"),
+    ("launch.sh", "--shutdown-behavior", "stop"),
+    ("bootstrap.sh", ID, "--train"),
+    ("train-iam.sh", "create", ID),
+    ("train-iam.sh", "delete", ID),
+    ("train.sh", ID, "start", str(LIVE / "train-run.example.toml")),
+    ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "--play-only"),
+    ("train.sh", ID, "stop"),
 ]
 
 
@@ -166,7 +173,12 @@ def test_every_script_that_changes_anything_is_a_dry_run_without_yes_and_calls_n
 
 @pytest.mark.parametrize(
     "cmd",
-    [("status.sh", ID, "--dry-run"), ("health.sh", ID, "--dry-run"), ("pilot.sh", ID, "status", "--dry-run")],
+    [
+        ("status.sh", ID, "--dry-run"),
+        ("health.sh", ID, "--dry-run"),
+        ("pilot.sh", ID, "status", "--dry-run"),
+        ("train.sh", ID, "status", "--dry-run"),
+    ],
 )
 def test_the_read_only_scripts_plan_with_dry_run_and_call_no_aws(stubs, cmd):
     out = run(stubs, *cmd, forbid_aws=True)
@@ -191,7 +203,9 @@ def test_the_launch_plan_is_one_l4_box_on_the_nvidia_dlami_that_powers_itself_of
     assert "--instance-initiated-shutdown-behavior terminate" in plan and "HttpTokens=required" in plan
     assert "Key=purpose,Value=zeroad-live" in plan and "Key=Name,Value=zeroad-live-onair" in plan
     user_data = re.search(r"--user-data (\S+)", plan).group(1)
-    assert 'shutdown -h +180 "zeroad-live: MAX_HOURS reached"' in base64.b64decode(user_data).decode()
+    script = base64.b64decode(user_data).decode()
+    assert script.startswith("#cloud-boothook\n") and "zeroad-poweroff.service" in script
+    assert "shutdown -h" not in script.split("<<'ARM'")[0]  # nothing is scheduled from the boothook itself
     assert "at most about $3.96" in plan
     assert out.stdout.strip() == ID  # the id is the only stdout, for ID=$(live/launch.sh --yes)
 
@@ -227,6 +241,11 @@ def test_launch_tries_the_next_subnet_when_one_has_no_capacity(stubs):
         ("teardown.sh", ID, "extra"),
         ("put-secret.sh", "x-key"),
         ("status.sh", ID, "many"),
+        ("launch.sh", "--shutdown-behavior", "reboot"),
+        ("train-iam.sh", "create"),
+        ("train.sh", ID, "start", "/no/such/config.toml"),
+        ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "bad arg"),
+        ("train.sh", ID, "stop", "--now"),
     ],
     ids=" ".join,
 )
@@ -517,7 +536,7 @@ def test_health_flags_a_match_whose_stream_does_not_reach_the_relay(stubs):
     write_exe(stubs["bin"] / "docker", "#!/bin/sh\necho 'localhost:5000/mcp-server-zeroad-live:v3 Up 3 minutes'\n")
     write_exe(stubs["bin"] / "curl", '#!/bin/sh\necho \'{"ready": false, "bytesReceived": 0}\'\n')
     write_exe(stubs["bin"] / "nvidia-smi", "#!/bin/sh\necho '41, 12, 3100, 55'\n")
-    write_exe(stubs["bin"] / "busctl", "#!/bin/sh\necho 't 0'\n")
+    write_exe(stubs["bin"] / "busctl", "#!/bin/sh\necho '(st) \"poweroff\" 1800003600000000'\n")
     state = stubs["tmp"] / "state"
     state.mkdir()
     (state / "push.wanted").touch()
@@ -573,6 +592,21 @@ STUB_SYSTEMCTL = textwrap.dedent(
 )
 
 
+STUB_DOCKER = textwrap.dedent(
+    """\
+    #!/bin/sh
+    # `docker image inspect` answers the engine image's zeroad.patches label from STUB_ENGINE_LABEL (the patched build
+    # by default) or fails when STUB_ENGINE_MISSING is set; every other call prints STUB_DOCKER_PS.
+    if [ "$1 $2" = "image inspect" ]; then
+      [ -z "$STUB_ENGINE_MISSING" ] || exit 1
+      echo "${STUB_ENGINE_LABEL-rl-realtime rl-idle-wait}"
+      exit 0
+    fi
+    [ -z "$STUB_DOCKER_PS" ] || echo "$STUB_DOCKER_PS"
+    """
+)
+
+
 @pytest.fixture
 def box_stubs(stubs):
     """systemctl, systemd-run, docker and xhost stubs on PATH; systemctl answers is-active from STUB_UNITS and logs
@@ -580,7 +614,7 @@ def box_stubs(stubs):
     write_exe(stubs["bin"] / "systemctl", STUB_SYSTEMCTL.format(python=sys.executable))
     calls = stubs["tmp"] / "systemctl.log"
     write_exe(stubs["bin"] / "systemd-run", f'#!/bin/sh\necho "systemd-run $*" >> "{calls}"\n')
-    write_exe(stubs["bin"] / "docker", '#!/bin/sh\n[ -z "$STUB_DOCKER_PS" ] || echo "$STUB_DOCKER_PS"\n')
+    write_exe(stubs["bin"] / "docker", STUB_DOCKER)
     write_exe(stubs["bin"] / "xhost", "#!/bin/sh\nexit 0\n")
     (stubs["tmp"] / "state").mkdir()
     stubs["env"].update(STUB_SYSTEMCTL_LOG=str(calls), ZEROAD_DISPLAY_WAIT_S="0", ZEROAD_MIN_FREE_GB="0")
@@ -884,3 +918,454 @@ def test_the_pilot_bootstrap_binds_vllm_to_the_docker_bridge_behind_a_key_and_sp
     assert "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True" in text
     assert "zeroad setup --source" in text and "--live" not in text and "zeroad-trainer" in text
     assert "zeroad-boxtime.timer" in text and "zeroad-x" not in text
+
+
+# ---- the training box --------------------------------------------------------------------------------------------
+TRAIN_ENV = LIVE / "train.env.example"
+TRAIN_CONFIG = LIVE / "train-run.example.toml"
+
+
+def train_stubs(stubs):
+    env_file = stubs["tmp"] / "train.env"
+    env_file.write_text(
+        TRAIN_ENV.read_text()
+        + "LIVE_INSTANCE_PROFILE=zeroad-box\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+        + "LIVE_SUBNETS='subnet-a subnet-b'\nLIVE_SECURITY_GROUP=sg-1\n"
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    return stubs
+
+
+def test_the_training_env_example_is_a_g6e_box_with_its_own_rate_and_a_stop_not_terminate_shutdown(stubs):
+    out = run(train_stubs(stubs), "launch.sh", "--max-hours", "12", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "one of [g6e.12xlarge g6e.24xlarge], about $10.49/h" in plan and "powers off (stop) after 12 h" in plan
+    assert "--instance-type g6e.12xlarge" in plan and "--instance-initiated-shutdown-behavior stop" in plan
+    assert "at most about $125.88" in plan
+    assert "Key=purpose,Value=zeroad-train" in plan and "Key=Name,Value=zeroad-train" in plan
+
+
+def test_the_training_env_example_matches_the_run_example_and_leaves_two_hours_after_the_run():
+    env = dict(line.split("=", 1) for line in TRAIN_ENV.read_text().splitlines() if re.match(r"^[A-Z_]+=", line))
+    from agentenv_zeroad.train.config import check_run, load_config
+
+    cfg = load_config(TRAIN_CONFIG)
+    assert (cfg.games.interface, cfg.games.score_rule) == ("v2", "net_worth") and check_run(cfg) == []
+    assert float(env["LIVE_BOX_USD_PER_HOUR"]) == cfg.box_usd_per_hour
+    assert int(env["LIVE_MAX_HOURS"]) == cfg.duration_hours + 2
+    assert env["LIVE_REQUIRE_RATE"] == "1" and env["LIVE_SHUTDOWN_BEHAVIOR"] == "stop"
+
+
+def test_launch_keeps_terminate_as_the_default_and_the_stop_option_overrides_the_env(stubs):
+    assert "--instance-initiated-shutdown-behavior terminate" in run(stubs, "launch.sh", forbid_aws=True).stderr
+    env = {"LIVE_SHUTDOWN_BEHAVIOR": "stop"}
+    assert "behavior stop" in run(stubs, "launch.sh", extra=env, forbid_aws=True).stderr
+    out = run(stubs, "launch.sh", "--shutdown-behavior", "terminate", extra=env, forbid_aws=True)
+    assert "behavior terminate" in out.stderr
+
+
+def test_a_training_env_without_its_rate_is_refused_instead_of_priced_at_the_stream_boxs(stubs):
+    text = "".join(
+        line + "\n" for line in TRAIN_ENV.read_text().splitlines() if not line.startswith("LIVE_BOX_USD_PER_HOUR")
+    )
+    (stubs["tmp"] / "train.env").write_text(text)
+    out = run(stubs, "launch.sh", extra={"LIVE_ENV": str(stubs["tmp"] / "train.env")}, forbid_aws=True)
+    assert out.returncode != 0 and "set LIVE_BOX_USD_PER_HOUR" in out.stderr and "no default rate" in out.stderr
+    out = run(stubs, "launch.sh", forbid_aws=True)  # the stream box's env is still fine without one
+    assert out.returncode == 0
+
+
+def test_the_box_budget_guard_has_no_default_rate(stubs):
+    out = run_box(
+        stubs, "budget.sh", "show", ZEROAD_LIVE_CONF=str(stubs["tmp"] / "none.conf"), ZEROAD_BOX_USD_PER_HOUR=""
+    )
+    assert out.returncode != 0 and "ZEROAD_BOX_USD_PER_HOUR is not set" in out.stderr and "no default" in out.stderr
+
+
+def test_the_train_iam_role_reads_and_writes_the_run_prefix_and_not_the_pools(stubs):
+    out = run(train_stubs(stubs), "train-iam.sh", "create", ID, forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "zeroad-train-box" in plan and "/run/*" in plan and "/pool/" not in plan
+    assert "--policy-name zeroad-pilot-run" in plan and "iam add-role-to-instance-profile" in plan
+    assert "delete-role" not in plan
+    assert "live/pilot-iam.sh delete" in plan and "--train --yes" in plan
+    pilot = run(stubs, "pilot-iam.sh", "create", ID, forbid_aws=True).stderr
+    assert "zeroad-pilot-box" in pilot and "zeroad-pilot-pool" in pilot and "/run/" not in pilot
+    out = run(train_stubs(stubs), "train-iam.sh", "delete", ID, forbid_aws=True)
+    assert "delete-role --role-name zeroad-train-box" in out.stderr
+
+
+def test_the_training_bootstrap_serves_two_bf16_vllm_instances_on_gpu_0_and_1_and_leaves_2_and_3(stubs):
+    out = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    runs = [line for line in text.splitlines() if line.startswith("+ docker run -d --name zeroad-vllm")]
+    assert [re.search(r"--name (\S+)", r).group(1) for r in runs] == ["zeroad-vllm-0", "zeroad-vllm-1"]
+    for n, line in enumerate(runs):
+        assert (
+            f'--gpus "device={n}"' in line and "--tensor-parallel-size 1" in line and "--restart unless-stopped" in line
+        )
+        assert f"-p 172.17.0.1:800{n}:8000 -p 127.0.0.1:800{n}:8000" in line
+        flags = (
+            "--dtype bfloat16",
+            "--generation-config vllm",
+            "--enable-lora",
+            "--max-lora-rank 32",
+            "--max-loras 8",
+            "--max-cpu-loras 32",
+            "--tool-call-parser hermes",
+            "--enable-prefix-caching",
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING=True",
+            ":/train:ro",
+        )
+        for flag in flags:
+            assert flag in line, flag
+        assert "--quantization" not in line and "/adapters" not in line
+    assert "800 8001" not in text and "vllm.urls 8000 8001" in text
+    assert "PILOT_TRAIN_GPUS=%s" in text and "2,3 0" in text.replace("\\,", ",")
+    assert "train.smoke" in text and "pilot.smoke" not in text
+    assert "zeroad-trainer" in text
+    assert text.index("scripts/build-engine.sh rt") < text.index("zeroad-boxtime")  # the engine is built before the run
+    assert (
+        "--max-model-len 8192 " in "".join(runs) and "12288" not in text
+    )  # the learner's max_len: play nothing longer
+    lines = text.splitlines()
+    first_run = next(i for i, line in enumerate(lines) if line.startswith("+ docker run -d --name zeroad-vllm-0"))
+    assert any(
+        line.startswith("+ docker rm -f zeroad-vllm ") or line == "+ docker rm -f zeroad-vllm"
+        for line in lines[:first_run]
+    )
+
+
+def test_the_pilot_bootstrap_still_serves_one_tp2_instance_and_does_not_mount_the_train_folder(stubs):
+    out = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert "build-engine.sh" not in out.stdout  # only the training box plays on the patched engine
+    text = out.stdout.replace("\\", "")
+    runs = [line for line in text.splitlines() if line.startswith("+ docker run -d")]
+    assert len(runs) == 1 and "--name zeroad-vllm " in runs[0] and "--max-loras 4 --max-cpu-loras 16" in runs[0]
+    assert "/adapters:ro" in runs[0] and ":/train" not in runs[0] and "--generation-config" not in runs[0]
+    assert "then pilot.smoke" in text and "train.smoke" not in text
+    assert "--max-model-len 12288 " in runs[0] and "docker rm -f zeroad-vllm " not in text
+    out = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--bogus", DRY_RUN="1")
+    assert out.returncode == 2
+
+
+def test_the_laptop_start_sends_the_config_then_starts_the_run_with_the_budget(stubs):
+    env_file = stubs["tmp"] / "train.env"
+    env_file.write_text(
+        TRAIN_ENV.read_text()
+        + "LIVE_INSTANCE_PROFILE=zeroad-box\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    out = run(stubs, "train.sh", ID, "start", str(TRAIN_CONFIG), "--play-only", forbid_aws=True)
+    plan = out.stderr + out.stdout
+    assert out.returncode == 0, plan
+    assert plan.count("aws ssm send-command") == 2
+    assert "train.sh put-config" in plan and "train.sh start --play-only --budget 150" in plan
+    sent = [base64.b64decode(b).decode() for b in re.findall(r"[A-Za-z0-9+/=]{200,}", plan)]
+    assert any('run_id = "run1"' in text for text in sent)
+
+
+def test_the_box_train_run_starts_the_learner_on_the_training_gpus_and_then_the_orchestrator(stubs):
+    state = stubs["tmp"] / "state"
+    out = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--init", f"{state}/train/start", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    [learner] = [line for line in text.splitlines() if "docker run -d --name zeroad-learner" in line]
+    assert '--gpus "device=2,3"' in learner and "torchrun --nproc_per_node 2 /app/learner.py" in learner
+    assert (
+        f"--root {state}/train/RUN_ID" in learner
+        and "--known-tools" in learner
+        and f"--init {state}/train/start" in learner
+    )
+    assert "agentenv_zeroad.train.orchestrate run --config" in text and "--play-only" not in text
+    out = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--play-only", DRY_RUN="1")
+    assert (
+        "zeroad-learner" not in out.stdout and "orchestrate run --config" in out.stdout and "--play-only" in out.stdout
+    )
+
+
+def start_train(stubs, *args, units=None, rate=1.32, hours=1, **extra):
+    write_exe(stubs["bin"] / "curl", "#!/bin/sh\nexit 0\n")  # vLLM's health
+    etc = stubs["tmp"] / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.urls").write_text("http://172.17.0.1:8000\nhttp://172.17.0.1:8001\n")
+    (stubs["tmp"] / "state" / "train").mkdir(parents=True, exist_ok=True)
+    state = stubs["tmp"] / "state"
+    (state / "train" / "config.toml").write_text(
+        f'run_id = "run1"\nroot = "{state}/train/run1"\nbudget_usd = 100\nbox_usd_per_hour = {rate}\n'
+        f"duration_hours = {hours}\n"
+        'servers = { urls = ["http://172.17.0.1:8000"], adapter_dir = "/train/run1/adapters" }\n'
+    )
+    clock = {"ZEROAD_NOW_EPOCH": "1800000000", "ZEROAD_BOOT_EPOCH": "1800000000"}
+    return run_box(
+        stubs, "train.sh", "start", *args, "--budget", "150", DRY_RUN="0", STUB_UNITS=json.dumps(units or {}),
+        ZEROAD_PILOT_ETC=str(etc), **clock, **extra,
+    )  # fmt: skip
+
+
+def test_the_run_starts_in_its_own_unit_and_a_second_is_refused(box_stubs):
+    out = start_train(box_stubs, "--play-only")
+    assert out.returncode == 0, out.stderr
+    [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert "--unit zeroad-train" in call and "KillMode=control-group" in call
+    assert "TimeoutStopSec=2400" in call  # 3 final uploads of 10 minutes (sync.SYNC_TIMEOUT_S) and the learner's grace
+    assert "After=network-online.target docker.service" in call and "Wants=network-online.target docker.service" in call
+    assert call.split("train-run.sh ")[1].endswith("config.toml --play-only")
+    out = start_train(box_stubs, units={"zeroad-train": "active"})
+    assert out.returncode != 0 and "a run is going" in out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_a_run_refuses_an_engine_image_that_is_missing_or_lacks_the_patches_it_expects(box_stubs):
+    out = start_train(box_stubs, "--play-only", STUB_ENGINE_MISSING="1")
+    assert out.returncode != 0 and "zeroad-engine:0.28-rt is not built on this box" in out.stderr
+    assert "scripts/build-engine.sh rt" in out.stderr
+    out = start_train(
+        box_stubs, "--play-only", STUB_ENGINE_LABEL="rl-realtime"
+    )  # an rt image built before the idle patch
+    assert out.returncode != 0 and "lacks the patch rl-idle-wait" in out.stderr and "REBUILD=1" in out.stderr
+    out = start_train(box_stubs, "--play-only", STUB_ENGINE_LABEL="")  # the PPA image retagged, no label at all
+    assert out.returncode != 0 and "lacks the patch rl-realtime" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    out = start_train(box_stubs, "--play-only")
+    assert out.returncode == 0, out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_a_run_that_would_pass_the_budget_or_names_a_path_outside_the_train_folder_is_refused(box_stubs):
+    ledger = box_stubs["tmp"] / "state" / "spend.jsonl"
+    ledger.write_text(json.dumps({"what": "panel", "usd_est": 149.9}) + "\n")
+    out = start_train(box_stubs)
+    assert out.returncode != 0 and "REFUSED" in out.stdout
+    ledger.unlink()
+    out = start_train(box_stubs, "--init", "/etc/passwd")
+    assert out.returncode != 0 and "needs a path under" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_the_box_config_upload_refuses_what_is_not_base64(stubs):
+    out = run_box(stubs, "train.sh", "put-config", "not base64!", DRY_RUN="1")
+    assert out.returncode != 0 and "needs base64" in out.stderr
+
+
+# ---- review fixes: rates per type, the power-off on every boot, the run's start checks -------------------------------
+def launch_rules(*extra) -> str:
+    return json.dumps(
+        [
+            ["sts&&get-caller-identity", "123456789012\n", 0],
+            ["describe-instances", "None\n", 0],
+            ["ssm&&get-parameter", "ami-1\n", 0],
+            *extra,
+            ["describe-instance-information", "Online\n", 0],
+        ]
+    )
+
+
+def test_a_launch_that_falls_back_to_the_bigger_type_is_tagged_with_that_types_rate(stubs):
+    rules = launch_rules(
+        ["run-instances&&g6e.12xlarge", "", 254], ["run-instances&&g6e.24xlarge", "i-00000000000000002\n", 0]
+    )
+    out = run(train_stubs(stubs), "launch.sh", "--yes", extra={"STUB_AWS_RULES": rules})
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "i-00000000000000002"
+    runs = [c["argv"] for c in aws_calls(stubs) if "run-instances" in c["argv"]]
+    assert [a[a.index("--instance-type") + 1] for a in runs][-1] == "g6e.24xlarge"
+    tags = runs[-1][runs[-1].index("--tag-specifications") + 1]
+    assert "Key=zeroad-box-usd-per-hour,Value=15.07" in tags and "Key=zeroad-instance-type,Value=g6e.24xlarge" in tags
+    assert "Key=zeroad-box-usd-per-hour,Value=10.49" in runs[0][runs[0].index("--tag-specifications") + 1]
+    assert "g6e.24xlarge costs $15.07/h, not the $10.49/h" in out.stderr and "must be 15.07" in out.stderr
+
+
+def test_a_fallback_type_with_no_rate_is_refused_before_anything_is_launched(stubs):
+    train_stubs(stubs)
+    env_file = Path(stubs["env"]["LIVE_ENV"])
+    env_file.write_text(
+        re.sub(r"^LIVE_GPU_RATES=.*\n", 'LIVE_GPU_RATES="g6e.12xlarge=10.49"\n', env_file.read_text(), flags=re.M)
+    )
+    for args in ((), ("--yes",)):
+        out = run(stubs, "launch.sh", *args, extra={"STUB_AWS_RULES": launch_rules()}, forbid_aws=not args)
+        assert out.returncode != 0 and "no rate for the fallback type g6e.24xlarge" in out.stderr
+    assert not any("run-instances" in c["argv"] for c in aws_calls(stubs))
+
+
+def test_a_stream_box_without_rates_still_falls_back_at_its_default_rate_and_warns(stubs):
+    env = {"LIVE_GPU_TYPES": "g6.4xlarge gr6.4xlarge"}  # the stream settings: no LIVE_GPU_RATES, no LIVE_REQUIRE_RATE
+    rules = launch_rules(
+        ["run-instances&&g6.4xlarge", "", 254], ["run-instances&&gr6.4xlarge", "i-00000000000000003\n", 0]
+    )
+    out = run(stubs, "launch.sh", "--yes", extra={"STUB_AWS_RULES": rules, **env})
+    assert out.returncode == 0, out.stderr
+    runs = [c["argv"] for c in aws_calls(stubs) if "run-instances" in c["argv"]]
+    tags = runs[-1][runs[-1].index("--tag-specifications") + 1]
+    assert (
+        "Key=zeroad-box-usd-per-hour,Value=1.32" in tags and "no rate for gr6.4xlarge in LIVE_GPU_RATES" in out.stderr
+    )
+
+
+def boothook(stubs, root: Path, hours: int = 12) -> tuple[str, int]:
+    out = run(stubs, "launch.sh", "--max-hours", str(hours), forbid_aws=True)
+    script = base64.b64decode(re.search(r"--user-data (\S+)", out.stderr).group(1)).decode()
+    subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "ZEROAD_ROOT": str(root)}, check=True)
+    return script, int((root / "etc/zeroad-live/deadline").read_text())
+
+
+def test_the_boothook_only_records_the_deadline_and_installs_a_unit_that_arms_after_logind(stubs, tmp_path):
+    script, deadline = boothook(stubs, tmp_path / "root", 12)
+    assert script.startswith("#cloud-boothook\n")  # cloud-init runs a boothook at every boot, user-data scripts once
+    assert abs(deadline - (time.time() + 12 * 3600)) < 120
+    unit = (tmp_path / "root/etc/systemd/system/zeroad-poweroff.service").read_text()
+    assert "After=systemd-logind.service" in unit and "Type=oneshot" in unit
+    assert "WantedBy=multi-user.target" in unit and "ExecStart=/usr/local/sbin/zeroad-poweroff-arm" in unit
+    assert "enable zeroad-poweroff.service" in script and "--now" not in script  # the unit never blocks boot
+    assert "systemctl start --no-block zeroad-poweroff.service" in script  # queued for the boot under way too
+    arm = (tmp_path / "root/usr/local/sbin/zeroad-poweroff-arm").read_text()
+    assert 'shutdown -h +"$mins" "zeroad-live: MAX_HOURS reached"' in arm and '[ "$mins" -ge 30 ]' in arm
+
+
+def test_the_deadline_survives_a_second_boot_so_a_restart_keeps_the_absolute_deadline(stubs, tmp_path):
+    root = tmp_path / "root"
+    _, first = boothook(stubs, root, 12)
+    (root / "etc/zeroad-live/deadline").write_text("1234\n")
+    script, _ = boothook(stubs, root, 12)  # the same user-data runs again on a later boot
+    assert (root / "etc/zeroad-live/deadline").read_text() == "1234\n" != f"{first}\n"
+    assert script
+
+
+def test_the_arm_script_schedules_the_minutes_left_and_at_least_thirty(stubs, tmp_path):
+    root = tmp_path / "root"
+    _, deadline = boothook(stubs, root, 12)
+    arm = root / "usr/local/sbin/zeroad-poweroff-arm"
+
+    def minutes_scheduled(boot_epoch: int) -> int:
+        bin_dir = tmp_path / f"bin{boot_epoch}"
+        bin_dir.mkdir()
+        write_exe(bin_dir / "date", f"#!/bin/sh\necho {boot_epoch}\n")
+        write_exe(bin_dir / "shutdown", '#!/bin/sh\necho "$@" > "$STUB_SHUTDOWN"\n')
+        log = tmp_path / f"shutdown{boot_epoch}"
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin", "STUB_SHUTDOWN": str(log),
+            "ZEROAD_DEADLINE_FILE": str(root / "etc/zeroad-live/deadline"),
+        }  # fmt: skip
+        subprocess.run(["sh", str(arm)], env=env, check=True)
+        return int(log.read_text().split()[1].lstrip("+"))
+
+    assert minutes_scheduled(deadline - 12 * 3600) == 720  # first boot
+    assert minutes_scheduled(deadline - 5 * 3600) == 300  # started again after a stop: the remaining hours, not 12
+    assert minutes_scheduled(deadline + 3600) == 30  # started after the deadline: a half hour to fetch the results
+
+
+def busctl_stub(stubs, answer: str, after_arm: str | None = None):
+    """busctl answers `answer`; once the arm stub has run, `after_arm` (default: the same)."""
+    flag = stubs["tmp"] / "armed.flag"
+    write_exe(
+        stubs["bin"] / "busctl",
+        f"#!/bin/sh\nif [ -f '{flag}' ]; then echo '{after_arm or answer}'; else echo '{answer}'; fi\n",
+    )
+    arm = write_exe(stubs["bin"] / "arm", f"#!/bin/sh\ntouch '{flag}'\n")
+    return arm
+
+
+NOT_ARMED = '(st) "" 18446744073709551615'
+ARMED = '(st) "poweroff" 1800003600000000'
+
+
+def test_a_bootstrap_re_arms_a_missing_power_off_and_fails_loudly_if_it_stays_unset(stubs):
+    arm = busctl_stub(stubs, NOT_ARMED, after_arm=ARMED)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 0 and "power-off armed" in out.stdout and "arming it" in out.stderr
+    arm = busctl_stub(stubs, NOT_ARMED)  # re-arming does not take
+    (stubs["tmp"] / "armed.flag").unlink(missing_ok=True)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 1 and "NOT ARMED" in out.stdout and "NOT ARMED" in out.stderr
+
+
+def test_a_bootstrap_does_not_rearm_a_power_off_that_is_already_scheduled(stubs):
+    arm = busctl_stub(stubs, ARMED)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 0 and not (stubs["tmp"] / "armed.flag").exists()
+
+
+@pytest.mark.parametrize("script", ["bootstrap.sh", "pilot-bootstrap.sh"])
+def test_every_bootstrap_ends_with_the_power_off_check(stubs, script):
+    args = ["https://payload", "https://repo"]
+    out = run_box(stubs, script, *args, DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert "poweroff.sh check" in out.stdout
+    if script == "pilot-bootstrap.sh":
+        assert "poweroff.sh check" in run_box(stubs, script, *args, "--train", DRY_RUN="1").stdout
+
+
+def test_status_prints_a_clear_warning_instead_of_the_raw_busctl_tuple(stubs):
+    busctl_stub(stubs, NOT_ARMED)
+    out = run_box(stubs, "poweroff.sh", "status")
+    assert (
+        out.returncode == 0
+        and out.stdout.startswith("power-off NOT ARMED")
+        and "18446744073709551615" not in out.stdout
+    )
+    busctl_stub(stubs, ARMED)
+    out = run_box(stubs, "poweroff.sh", "status")
+    assert out.stdout.startswith("power-off armed") and "NOT ARMED" not in out.stdout
+
+
+def test_health_reports_an_unarmed_power_off_as_a_problem(box_stubs):
+    write_exe(box_stubs["bin"] / "busctl", f"#!/bin/sh\necho '{NOT_ARMED}'\n")
+    write_exe(box_stubs["bin"] / "df", "#!/bin/sh\necho Avail; echo 100G\n")  # BSD df has no -BG
+    out = run_box(box_stubs, "health.sh")
+    health = json.loads(out.stdout)
+    assert "power-off NOT ARMED: no shutdown is scheduled" in health["problems"] and health["poweroff_utc"] is None
+
+
+def test_the_box_config_carries_the_rate_the_cap_and_the_free_disk_floor(stubs):
+    out = subprocess.run(
+        ["bash", "-c", f'source "{LIVE}/lib/common.sh"; RATE=15.07; LIVE_MATCH_CAP_USD=5; AWS_REGION=x; box_conf'],
+        capture_output=True, text=True, check=True, env={**os.environ, "LIVE_ENV": str(stubs["live_env"])},
+    )  # fmt: skip
+    assert "ZEROAD_BOX_USD_PER_HOUR=15.07" in out.stdout and "ZEROAD_MATCH_CAP_USD=5" in out.stdout
+
+
+def test_a_run_whose_config_rate_is_not_the_boxs_is_refused(box_stubs):
+    out = start_train(box_stubs, rate=10.49)  # the box's config says 1.32
+    assert out.returncode != 0 and "is not this box's rate" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_a_run_whose_whole_duration_would_pass_the_budget_is_refused_at_the_start(box_stubs):
+    out = start_train(box_stubs, hours=200)  # 200 h at $1.32 is $264 against a $150 budget; nothing is spent yet
+    assert out.returncode != 0 and "REFUSED" in out.stdout and "$264" in out.stdout
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert start_train(box_stubs, hours=10).returncode == 0
+
+
+def test_the_box_train_run_reads_the_frontier_key_from_ssm_only_when_a_panel_needs_it(stubs):
+    state = stubs["tmp"] / "state"
+    panel = stubs["tmp"] / "panel.jsonl"
+    seat = {
+        "kind": "llm",
+        "civ": "pers",
+        "model": "anthropic/claude-opus-5-5",
+        "base_url": "http://l",
+        "api_key_env": "LITELLM_API_KEY",
+    }
+    panel.write_text(json.dumps({"game_id": "p0", "seats": [{"kind": "bot", "civ": "rome"}, seat]}))
+    config = stubs["tmp"] / "run.toml"
+    base = f'run_id = "r"\nroot = "{state}/train/r"\nbudget_usd = 100\nbox_usd_per_hour = 10\nduration_hours = 1\n'
+    base += 'servers = { urls = ["http://x:8000"], adapter_dir = "/train/r/adapters" }\n'
+    config.write_text(base + f'[[panels]]\nname = "end"\nat_hours = 1\nspecs = "{panel}"\n')
+    out = run_box(stubs, "train-run.sh", str(config), "--play-only", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert "aws ssm get-parameter --name /zeroad-live/litellm-key" in out.stdout and "never printed" in out.stdout
+    assert "orchestrate run --config" in out.stdout
+    config.write_text(base)
+    out = run_box(stubs, "train-run.sh", str(config), "--play-only", DRY_RUN="1")
+    assert "litellm-key" not in out.stdout and "with-model" not in out.stdout
+
+
+def test_the_train_run_stops_the_learner_container_when_it_is_stopped_too():
+    text = (BOX / "train-run.sh").read_text()
+    assert "trap ':' TERM" in text and "trap stop_learner EXIT" in text
+    assert text.count("docker stop -t 60 zeroad-learner") == 1  # in the trap's function, not after the orchestrator

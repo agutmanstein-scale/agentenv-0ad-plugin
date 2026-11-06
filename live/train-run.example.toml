@@ -1,0 +1,58 @@
+# A post-training run's config (src/agentenv_zeroad/train/config.py). Copy, edit, and start it with
+# live/train.sh ID start my-run.toml --yes. No secret goes here.
+
+run_id = "run1"
+# Under /var/lib/zeroad-live/train: the learner's --root, and what the vLLM containers mount at /train for adapters.
+root = "/var/lib/zeroad-live/train/run1"
+duration_hours = 10          # the box's LIVE_MAX_HOURS is this + 2
+budget_usd = 140             # box hours at box_usd_per_hour + frontier spend; at this the run uploads and stops
+box_usd_per_hour = 10.49     # required, no default: the instance type's on-demand price (g6e.12xlarge; 15.07 for a
+                             # g6e.24xlarge). train.sh start refuses it if the box's own rate differs.
+shutdown = false             # true: `shutdown -h now` after the final upload (the box then stops, it is not terminated)
+engines = 24                 # engine containers; each game takes one for its 6-8 minutes. 0 (or leave it out) is the box's
+                             # physical cores (24 on the g6e.12xlarge, 48 vCPUs): more engines than cores slow every game
+concurrency = 24             # games in flight, at most `engines`; 0 (or leave it out) is all of them
+# engine_image = "zeroad-engine:0.28-rt"  # the default: built by `scripts/build-engine.sh rt` (pilot-bootstrap.sh
+                             # --train does it), which applies patches/rl-idle-wait.patch so an engine waiting for its
+                             # next /step sleeps instead of spinning a core and /step?state=0 skips the state JSON;
+                             # only the unpatched PPA image ("zeroad-engine:0.28") spins
+# engine_patches = ["rl-realtime", "rl-idle-wait"]  # the image's zeroad.patches label must name these, or the run
+                             # refuses to start; [] (with the PPA image) is for a deliberate comparison run
+seed = 1
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+# adapter_dir is derived from root: the vLLM containers mount /var/lib/zeroad-live/train at /train, so this run's
+# adapters are at /train/run1/adapters there (written out, it must say the same).
+
+# Run 1's fixed mix; the frozen base model ("base") is v0.
+[mix]
+bot = 0.10
+petra-1 = 0.35
+petra-2 = 0.35
+petra-3 = 0.10
+base = 0.10
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.15          # these end by conquest or at the 45-minute safety cap
+interface = "v2"             # what the LLM seats play (the policy and the frozen base); v1 is allowed
+score_rule = "net_worth"     # decides a game at its cap; it must be the rule the interface's prompt names
+maps = ["mainland"]
+
+# None of these ever appears in a training game; the pre-registered panels use them.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = ["mainland_held_out"]
+seeds = [900001, 900002, 900003]
+
+# [credit]                   # train.credit.CreditConfig fields, e.g. positive_control = true, margin_scale, on_error
+# [credit.critic]            # train.critic.CriticConfig fields; leave it out for no critic
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/run1"
+
+# [[panels]]
+# name = "end"
+# at_hours = 9.5
+# specs = "/opt/zeroad-live/repo/live/panels/end.jsonl"   # GameSpec lines; `trainable` seats are pinned to the version

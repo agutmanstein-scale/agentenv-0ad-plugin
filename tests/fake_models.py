@@ -14,6 +14,9 @@ from typing import Any
 
 import httpx
 
+from agentenv_zeroad.llm import Reply, ToolCall
+from agentenv_zeroad.spend import SpendGuard
+
 KEY = "test-key-not-real"
 
 
@@ -61,6 +64,7 @@ class FakeLiteLLM:
             if self.token_ids:  # vLLM's return_token_ids
                 out["prompt_token_ids"] = [1, 2, 3]
                 out["choices"][0]["token_ids"] = [7, 8]
+                out["choices"][0]["logprobs"] = {"content": [{"token": "a", "logprob": -0.5}, {"logprob": -1.25}]}
             if self.usage:
                 out["usage"] = {"prompt_tokens": 3000, "completion_tokens": 400}
             return httpx.Response(200, json=out)
@@ -89,3 +93,43 @@ class FakeLiteLLM:
 
 def _split() -> dict[str, int]:
     return {"food": 50, "wood": 30, "stone": 10, "metal": 10}
+
+
+class FakeStrategist:
+    """A `StrategistModel` stand-in for tests of the lockstep seat: records each request, answers with scripted tool
+    calls, token ids and log-probs, and can wait on `gate`, `delay_s` or `fail` (an exception raised instead of an
+    answer)."""
+
+    def __init__(
+        self,
+        calls: list[tuple[str, dict[str, Any]]] | None = None,
+        *,
+        gate: asyncio.Event | None = None,
+        delay_s: float = 0.0,
+        fail: Exception | None = None,
+    ):
+        self.model = "local/fake"
+        self.guard = SpendGuard("fake strategist")
+        self.calls = calls if calls is not None else [("say", {"text": "Ave"})]
+        self.gate, self.delay_s, self.fail = gate, delay_s, fail
+        self.requests: list[tuple[str, str, list[Any]]] = []
+
+    async def call(self, system: str, user: str, tools: list[Any]) -> Reply:
+        self.requests.append((system, user, tools))
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if self.fail is not None:
+            raise self.fail
+        return Reply(
+            "Plan.",
+            [ToolCall(name, args) for name, args in self.calls],
+            0.01,
+            0.0,
+            3000,
+            400,
+            prompt_token_ids=[1, 2, 3],
+            token_ids=[7, 8],
+            logprobs=[-0.5, -1.25],
+        )

@@ -56,6 +56,8 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from pydantic import ValidationError
+
 from agentenv_zeroad import grading
 from agentenv_zeroad.army import ArmyReport
 from agentenv_zeroad.autopilot import held_default
@@ -293,6 +295,7 @@ class LiveMatch:
         decider_for: Callable[[SeatPlan, str, str, SpendGuard], Decider] | None = None,
         environ: Mapping[str, str] | None = None,
         broadcast: Broadcast | None = None,
+        clock: GameClock | None = None,
     ):
         self.handle = handle
         self.broadcast = broadcast
@@ -306,12 +309,13 @@ class LiveMatch:
         self._environ = os.environ if environ is None else environ
         self._reflex_tasks: list[asyncio.Task[None]] = []
         # A rendered match runs on the -rl-realtime engine, which advances the game from its own frame loop.
-        self.clock = GameClock(self.engine, speed=config.speed, realtime=broadcast is not None)
+        self.clock = clock or GameClock(self.engine, speed=config.speed, realtime=broadcast is not None)
         self.seats = {s.slot: SeatState(s) for s in config.seats}
         self.by_player = {s.player: s.slot for s in config.seats}
         self.metrics = MatchMetrics(sorted(self.by_player))
         self.trackers: dict[int, EventTracker] = {}
         self.snapshot: Snapshot | None = None
+        self._read_snap: Snapshot | None = None  # what `_observe` last read, until `_act` has run on it
         self.scores: dict[str, dict[str, Any]] = {}  # net_worth: None until read; net_worth_stale: reads since
         self.states: dict[str, str] = {}
         self.outcomes: dict[str, grading.Outcome] | None = None
@@ -466,20 +470,41 @@ class LiveMatch:
                 await self._tick()
                 self.failed_ticks = 0
             except Exception as e:  # noqa: BLE001 - a bad tick is retried next second; a dead engine fails the clock
-                self.tick_errors += 1
-                self.failed_ticks += 1
-                log.exception("match tick failed")
-                if self.failed_ticks >= MAX_FAILED_TICKS:
-                    self._fail(f"the match loop failed {self.failed_ticks} ticks in a row: {e!r}")
-                else:
-                    self._check_end(max(self.time_ms, self.clock.steps * TURN_MS))
+                self._tick_failed(e)
         if self.over:
             self._final_task = asyncio.get_running_loop().create_task(self.finalize())
 
+    def _tick_failed(self, error: Exception) -> None:
+        """Count a failed tick: the time cap is still checked on the last known scores, and too many in a row fail the
+        match, so it can't run unbounded. Call from inside the `except` that caught `error`."""
+        self.tick_errors += 1
+        self.failed_ticks += 1
+        log.exception("match tick failed")
+        if self.failed_ticks >= MAX_FAILED_TICKS:
+            self._fail(f"the match loop failed {self.failed_ticks} ticks in a row: {error!r}")
+        else:
+            self._check_end(max(self.time_ms, self.clock.steps * TURN_MS))
+
     async def _tick(self) -> None:
+        # Live play publishes the snapshot after the executors and trackers have run on it, as it always did: a brain
+        # reading its brief mid-tick sees the last finished tick, never a half-updated one.
+        view = await self._observe(publish=False)
+        await self._act(view)
+
+    async def _observe(self, *, publish: bool = True) -> ExecutorView | None:
+        """Read the executors' view and the fog-limited snapshot at this moment. Lockstep publishes it here, so the
+        briefs its brains decide on are this very state; `_act` publishes it too, after the trackers have updated."""
         assert self._snapshots is not None
         view: ExecutorView | None = await self._view() if self._view is not None else None
-        snap = await self._snapshots()
+        self._read_snap = await self._snapshots()
+        if publish:
+            self.snapshot = self._read_snap
+        return view
+
+    async def _act(self, view: ExecutorView | None) -> None:
+        """Tick every driven seat's executor and bot on what `_observe` read, then track the match and check its end."""
+        snap = self._read_snap
+        assert snap is not None
         for seat in self.seats.values():
             if seat.executor is None or view is None or seat.plan.player not in view.seats:
                 continue
@@ -623,6 +648,37 @@ class LiveMatch:
             return rejected("not_driven", f"seat {slot} is not driven by orders.")
         return self._submit_logged(seat, order, by="brain")
 
+    def read_brief(self, slot: str, *, compact: bool = False, started: float | None = None) -> str:
+        """The `get_brief` tool call: the seat's brief (or the compact JSON one), recorded as a tool call."""
+        started = time.perf_counter() if started is None else started
+        text = self.compact_brief(slot) if compact else self.brief(slot)
+        self.record_tool_call(slot, "get_brief", time.perf_counter() - started, "accepted")
+        return text
+
+    def run_order(
+        self,
+        slot: str,
+        tool: str,
+        build: Callable[[], _Order],
+        *,
+        closed: bool = False,
+        started: float | None = None,
+    ) -> str:
+        """One order tool call as a seat's brain gets its answer: the order `build` makes, submitted and recorded as a
+        tool call, as the JSON result ending in the brief footer. `closed`: the match is being played out."""
+        started = time.perf_counter() if started is None else started
+        if self.over or closed:
+            result = rejected("match_over", f"The match is over: {self.detail() or 'it is being played out'}.")
+        else:
+            try:
+                result = self.submit(slot, build())
+            except ValidationError as e:
+                result = rejected(
+                    "bad_arguments", "; ".join(err["msg"] for err in e.errors()), suggest="get_brief() for the state"
+                )
+        self.record_tool_call(slot, tool, time.perf_counter() - started, result.status)
+        return json.dumps({**result.to_json(), "footer": self.footer(slot)})
+
     def _submit_logged(
         self, seat: SeatState, order: _Order, *, by: Who, line: str | None = None, held_by: str | None = None
     ) -> OrderResult:
@@ -729,9 +785,10 @@ class LiveMatch:
         """One line every tool result ends with: clock, the seat's essentials, pending events, how the match ends."""
         player = self.seats[slot].plan.player
         # With no time cap the safety cap is internal: the seat is told there is no limit, never a countdown.
-        cap = f"/ cap {clock_text(self.cap_ms)}" if self.config.time_cap_s > 0 else "· no time limit"
+        limit = f"/ cap {clock_text(self.cap_ms)}" if self.config.time_cap_s > 0 else "· no time limit"
+        clock = f"{self.game_clock} {limit}"
         if self.snapshot is None or player not in self.snapshot.players:
-            return f"[{self.game_clock} {cap}]"
+            return f"[{clock}]"
         me = self.snapshot.players[player]
         tracker = self.trackers.get(player)
         pending = tracker.peek() if tracker else []
@@ -745,7 +802,7 @@ class LiveMatch:
             line = (last.line or last.what)[:60]
             luna = f" · {n} reflex/autopilot actions, last {clock_text(last.game_ms)} {seat.label(last)}: {line}"
         return (
-            f"[{self.game_clock} {cap} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
+            f"[{clock} · {status} · pop {me.pop}/{me.pop_cap} · {res} · {me.phase} · "
             f"army {me.army} · {len(pending)} new events ({urgent} urgent){luna}: get_brief()]"
         )
 

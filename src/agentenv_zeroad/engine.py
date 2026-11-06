@@ -14,7 +14,14 @@ Launch quirks measured in the spike (docs/spike-results.md) are encoded here, no
 
 Engine containers (the `docker` launcher, used on a dev machine and by the engine tests) are labelled with the pid,
 start time and host of the process that started them, and `reap_orphans` removes those whose owner is gone, before
-every docker start and at the start of each test session: a runner killed mid-test no longer leaves engines running.
+every docker start (unless the caller reaps once itself, as the engine pool does) and at the start of each test
+session: a runner killed mid-test no longer leaves engines running.
+
+`step_raw` is `step` without decoding the reply: a 200 ms turn answers with a 0.2-0.3 MB state JSON, and a lockstep
+training game that reads state through `/evaluate` queries never looks at it. On an engine built with
+patches/rl-idle-wait.patch (`no_state_step=True`, set by the pool from the image's `zeroad.patches` label) it posts
+`/step?state=0`, which skips building and serialising that state and answers `{}`; the PPA and stream images ignore
+the query, so they are never told to.
 
 `FakeEngine` has the same async interface for unit tests: deterministic state, no process, records every step. Like
 the real engine, whose startup autostart game is already running, it accepts `step` and `evaluate` before any reset.
@@ -43,6 +50,8 @@ log = logging.getLogger(__name__)
 
 TURN_MS = 200
 DEFAULT_IMAGE = "zeroad-engine:0.28"
+PATCHES_LABEL = "zeroad.patches"  # on an image built from patched sources: the patches, space-separated (Dockerfile.rt)
+IDLE_WAIT_PATCH = "rl-idle-wait"  # the patch that adds /step?state=0 (and the idle wait)
 DOCKER_PYROGENESIS = "/usr/games/pyrogenesis"
 SIM_TIME_JS = "Engine.QueryInterface(SYSTEM_ENTITY, IID_Timer).GetTime()"
 # `TemplateExists` looks the file up without loading it, so an absent name logs nothing; `/templates` (GetTemplate) logs
@@ -66,6 +75,10 @@ class GameEngine(Protocol):
     async def reset(self, scenario: Mapping[str, Any] | str, *, save_replay: bool = False) -> dict[str, Any]: ...
 
     async def step(self, commands: Commands = ()) -> dict[str, Any]: ...
+
+    async def step_raw(self, commands: Commands = ()) -> None:
+        """Advance one turn like `step`, without decoding the state the engine answers with."""
+        ...
 
     async def evaluate(self, code: str) -> Any: ...
 
@@ -94,9 +107,15 @@ class Engine:
     """Async client for one engine's RL interface."""
 
     def __init__(
-        self, url: str = "http://127.0.0.1:6000", *, timeout: float = 120.0, client: httpx.AsyncClient | None = None
+        self,
+        url: str = "http://127.0.0.1:6000",
+        *,
+        timeout: float = 120.0,
+        client: httpx.AsyncClient | None = None,
+        no_state_step: bool = False,
     ):
         self.url = url.rstrip("/")
+        self.no_state_step = no_state_step
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._owns_client = client is None
 
@@ -107,6 +126,9 @@ class Engine:
 
     async def step(self, commands: Commands = ()) -> dict[str, Any]:
         return json.loads(await self._post("step", format_commands(commands)))
+
+    async def step_raw(self, commands: Commands = ()) -> None:
+        await self._post("step?state=0" if self.no_state_step else "step", format_commands(commands))
 
     async def evaluate(self, code: str) -> Any:
         return json.loads(await self._post("evaluate", code))
@@ -213,6 +235,39 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+PORT_STOP = 32768  # where Linux's ephemeral ports begin
+
+
+def free_ports(count: int, *, start: int = 16000, stop: int = PORT_STOP) -> list[int]:
+    """`count` distinct loopback ports in [start, stop) that are free right now.
+
+    Unlike calling `free_port` once per engine, every candidate is held bound until all are chosen, so concurrent
+    callers in this process can't be handed the same port. The default range ends where Linux's ephemeral ports
+    begin (`PORT_STOP`), so the OS doesn't hand a port in it to another process's outgoing connection; a caller that
+    shares the range with other scanners gives each its own `start` and `stop`.
+    """
+    held: list[socket.socket] = []
+    ports: list[int] = []
+    try:
+        for port in range(start, stop):
+            if len(ports) == count:
+                break
+            sock = socket.socket()
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                sock.close()
+                continue
+            held.append(sock)
+            ports.append(port)
+    finally:
+        for sock in held:
+            sock.close()
+    if len(ports) < count:
+        raise EngineError(f"found only {len(ports)} free ports in {start}-{stop}, need {count}")
+    return ports
+
+
 class Launcher(Protocol):
     async def start(self) -> None: ...
 
@@ -222,14 +277,20 @@ class Launcher(Protocol):
 
     async def copy_replay(self, dest: Path) -> Path | None: ...
 
+    async def clear_replays(self) -> None:
+        """Delete the replays this engine has written, so the next `copy_replay` can only find a later game's."""
+        ...
+
 
 @dataclass
 class LocalLauncher:
-    """Runs pyrogenesis from PATH (inside the env container)."""
+    """Runs pyrogenesis from PATH (inside the env container). `home` gives this engine its own HOME (and so its own
+    replay folder); without it the process shares the caller's."""
 
     options: EngineOptions
     binary: str | None = None
     stop_timeout: float = 5.0
+    home: Path | None = None
     _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
 
     def command(self) -> list[str]:
@@ -240,6 +301,9 @@ class LocalLauncher:
         env = dict(os.environ)
         if self.options.display:
             env["DISPLAY"] = self.options.display
+        if self.home is not None:
+            self.home.mkdir(parents=True, exist_ok=True)
+            env["HOME"] = str(self.home)
         self._proc = await asyncio.create_subprocess_exec(
             *self.command(), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
@@ -258,14 +322,22 @@ class LocalLauncher:
             proc.kill()
             await proc.wait()
 
+    def _replays(self) -> Path:
+        home = self.home if self.home is not None else Path(os.environ.get("HOME", "~")).expanduser()
+        return home / ".local/share/0ad/replays"
+
     async def copy_replay(self, dest: Path) -> Path | None:
-        """Copy the newest replay's commands.txt from this user's 0 A.D. data directory."""
-        root = Path(os.environ.get("HOME", "~")).expanduser() / ".local/share/0ad/replays"
-        found = sorted(root.glob("**/commands.txt"), key=lambda p: p.stat().st_mtime)
+        """Copy the newest replay's commands.txt from this engine's 0 A.D. data directory."""
+        found = sorted(self._replays().glob("**/commands.txt"), key=lambda p: p.stat().st_mtime)
         if not found:
             return None
         shutil.copyfile(found[-1], dest)
         return dest
+
+    async def clear_replays(self) -> None:
+        if self.home is None:
+            raise EngineError("refusing to delete the replays of a shared HOME: give the engine its own `home`")
+        shutil.rmtree(self._replays(), ignore_errors=True)
 
 
 @dataclass
@@ -284,6 +356,8 @@ class DockerLauncher:
     display (the engine tests for the stream engine; the host needs no X server)."""
     mounts: tuple[tuple[str, str], ...] = ()
     """(host path, container path) pairs mounted read-only, e.g. a mod into /usr/share/games/0ad/mods/."""
+    reap: bool = True
+    """Remove other dead owners' engine containers before starting. A pool reaps once itself and sets this False."""
 
     def command(self) -> list[str]:
         cmd = ["docker", "run", "-d", "-t", "--init", "--name", self.name, "-u", "1000:1000"]
@@ -302,7 +376,8 @@ class DockerLauncher:
         return [*cmd, self.image, DOCKER_PYROGENESIS, *pyrogenesis_args(self.options)]
 
     async def start(self) -> None:
-        await reap_orphans()
+        if self.reap:
+            await reap_orphans()
         code, out = await _run(self.command())
         if code != 0:
             raise EngineError(f"docker run failed ({code}): {out.strip()}")
@@ -322,6 +397,9 @@ class DockerLauncher:
             return None
         code, out = await _run(["docker", "cp", f"{self.name}:{found[-1]}", str(dest)])
         return dest if code == 0 and dest.exists() else None
+
+    async def clear_replays(self) -> None:
+        await _run(["docker", "exec", self.name, "rm", "-rf", "/tmp/.local/share/0ad/replays"])
 
 
 XVFB_DISPLAY = ":99"
@@ -383,6 +461,18 @@ async def reap_orphans() -> list[str]:
     return reaped
 
 
+async def image_patches(image: str) -> tuple[str, ...] | None:
+    """The patches an engine image was built with (its `zeroad.patches` label; empty for the PPA's image), or None when
+    docker has no such image."""
+    code, out = await _run(
+        ["docker", "image", "inspect", "-f", f'{{{{index .Config.Labels "{PATCHES_LABEL}"}}}}', image]
+    )
+    if code != 0:
+        return None
+    label = out.strip()
+    return () if label in ("", "<no value>") else tuple(label.split())
+
+
 async def _run(cmd: list[str]) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out, _ = await proc.communicate()
@@ -405,6 +495,9 @@ class RunningEngine:
     async def copy_replay(self, dest: Path) -> Path | None:
         return await self.launcher.copy_replay(dest)
 
+    async def clear_replays(self) -> None:
+        await self.launcher.clear_replays()
+
 
 async def start_engine(
     options: EngineOptions | None = None,
@@ -413,19 +506,24 @@ async def start_engine(
     image: str = DEFAULT_IMAGE,
     ready_timeout: float = 120.0,
     docker: Mapping[str, Any] | None = None,
+    home: Path | None = None,
+    no_state_step: bool = False,
 ) -> RunningEngine:
-    """Start an engine and wait for its port; the caller must `close()` it.
+    """Start an engine and wait for its port; the caller must `close()` it. `home` is a local engine's own HOME;
+    `no_state_step` makes its `step_raw` ask for no state (only for an engine built with patches/rl-idle-wait.patch).
 
     The port must be free before the start, and our process must still be alive once the port answers; otherwise the
     `Engine` could be talking to some other server (a leftover engine on host networking) while ours has died.
     """
     options = options or EngineOptions()
-    engine = Engine(options.url)
+    engine = Engine(options.url, no_state_step=no_state_step)
     if await engine.answers():
         await engine.aclose()
         raise EngineError(f"{options.url} is already in use by another server; pick a free port")
     launcher: Launcher = (
-        LocalLauncher(options) if mode == "local" else DockerLauncher(options, image=image, **dict(docker or {}))
+        LocalLauncher(options, home=home)
+        if mode == "local"
+        else DockerLauncher(options, image=image, **dict(docker or {}))
     )
     running = RunningEngine(engine, launcher)
     try:
@@ -484,6 +582,7 @@ class FakeEngine:
         self.evaluated: list[str] = []
         self.template_requests: list[list[str]] = []
         self.resets = 0
+        self.raw_steps = 0
 
     async def reset(self, scenario: Mapping[str, Any] | str, *, save_replay: bool = False) -> dict[str, Any]:
         self.scenario = json.loads(scenario) if isinstance(scenario, str) else dict(scenario)
@@ -503,6 +602,10 @@ class FakeEngine:
         self.steps.append(batch)
         self.time_ms += TURN_MS
         return self.state()
+
+    async def step_raw(self, commands: Commands = ()) -> None:
+        await self.step(commands)
+        self.raw_steps += 1
 
     async def evaluate(self, code: str) -> Any:
         self.evaluated.append(code)

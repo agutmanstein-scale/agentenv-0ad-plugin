@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from importlib.resources import files
 from pathlib import Path
 
@@ -218,7 +219,27 @@ def test_the_zero_dollar_livestream_records_a_bot_against_petra_on_the_live_env(
     assert {"save_match_files", "save_zeroad_results"} <= {s["type"] for s in steps}
 
 
+@pytest.mark.parametrize(
+    "returncode, label, builds",
+    [
+        (1, "", True),  # no rt image
+        (0, "\n", True),  # an rt image from before the idle patch: same tag, no label
+        (0, "rl-realtime\n", True),
+        (0, "rl-realtime rl-idle-wait\n", False),
+    ],
+)
+def test_setup_live_rebuilds_an_rt_image_that_lacks_the_current_patches(monkeypatch, returncode, label, builds):
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, returncode, stdout=label, stderr=""),
+    )
+    cmds = cli.live_build_commands(ROOT, "mcp-server-zeroad-live")
+    assert ([str(ROOT / "scripts/build-engine.sh"), "rt"] in cmds) is builds
+
+
 def test_setup_live_builds_the_rt_engine_the_env_image_on_it_and_the_live_image(monkeypatch):
+    monkeypatch.setattr(cli, "rt_image_current", lambda: False)
     monkeypatch.setattr(cli, "image_exists", lambda image: False)
     rt, env, live = cli.live_build_commands(ROOT, "mcp-server-zeroad-live")
     assert rt == [str(ROOT / "scripts/build-engine.sh"), "rt"]  # builds zeroad-engine:0.28 first

@@ -16,4 +16,4 @@ echo "--- spend"; "$BOX_HOME/box/budget.sh" show || true
 echo "--- recordings"; find "$STATE/rec" -type f -name '*.mp4' -printf '%TY-%Tm-%Td %TH:%TM %s %p\n' 2>/dev/null | sort | tail -5 || true
 echo "--- gpu"; nvidia-smi --query-gpu=name,utilization.gpu,utilization.encoder,memory.used,temperature.gpu --format=csv,noheader || true
 echo "--- disk"; df -h "$STATE" | tail -1
-echo "--- power-off"; busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null || echo none
+echo "--- power-off"; "$BOX_HOME/box/poweroff.sh" status
