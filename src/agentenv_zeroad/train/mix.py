@@ -107,10 +107,17 @@ class GameFactory:
             "seed": self._seed(),
             "ai_seed": self._seed(),
             "uncapped": self._draw_uncapped(),
-            "group": f"{self.cfg.run_id}-s{self.index:06d}",
+            "group": f"{self.cfg.game_prefix}-s{self.index:06d}",
         }
         self._group = {"left": g.seed_group - 1, "start": start}
         return start
+
+    def reseed(self, nonce: int) -> None:
+        """A different stream from the same config: an actor that replaces another with its id must not replay the
+        specs the first one played."""
+        self.rng = random.Random(f"{self.cfg.stream_seed}:{nonce}")
+        self._opponents, self._uncapped = [], []
+        self._group = None
 
     def _draw_opponent(self) -> str:
         if not self._opponents:
