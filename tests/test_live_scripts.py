@@ -1353,7 +1353,7 @@ def test_a_bootstrap_does_not_rearm_a_power_off_that_is_already_scheduled(stubs)
     assert out.returncode == 0 and not (stubs["tmp"] / "armed.flag").exists()
 
 
-@pytest.mark.parametrize("script", ["bootstrap.sh", "pilot-bootstrap.sh"])
+@pytest.mark.parametrize("script", ["bootstrap.sh", "pilot-bootstrap.sh", "cpu-bootstrap.sh"])
 def test_every_bootstrap_ends_with_the_power_off_check(stubs, script):
     args = ["https://payload", "https://repo"]
     out = run_box(stubs, script, *args, DRY_RUN="1")

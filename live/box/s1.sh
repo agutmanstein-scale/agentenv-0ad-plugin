@@ -75,7 +75,7 @@ case $CMD in
     echo "--- cpu and memory"; echo "$(nproc) vCPU, load $(cut -d' ' -f1-3 /proc/loadavg)"; free -m | awk '/^Mem:/ {print $3 " of " $2 " MB used"}'
     echo "--- spend"; "$BOX_HOME/box/budget.sh" show || true
     echo "--- disk"; df -h "$STATE" | tail -1
-    echo "--- power-off"; busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null || echo none
+    echo "--- power-off"; "$BOX_HOME/box/poweroff.sh" status
     ;;
   stop)
     say "stopping zeroad-s1: the games in flight are lost, the games done stay in $OUT"

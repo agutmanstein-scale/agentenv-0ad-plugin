@@ -69,4 +69,5 @@ step "the box-time timer (the budget guard's box hours)"
 run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
 run systemctl daemon-reload
 run systemctl enable --now zeroad-boxtime.timer
+run "$BOX_HOME/box/poweroff.sh" check
 echo "cpu bootstrap done; nothing is played (live/s1.sh ID start)"
