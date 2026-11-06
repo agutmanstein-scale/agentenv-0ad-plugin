@@ -18,6 +18,9 @@ PAYLOAD_URL=${1:?usage: pilot-bootstrap.sh PAYLOAD_URL REPO_URL}
 REPO_URL=${2:?usage: pilot-bootstrap.sh PAYLOAD_URL REPO_URL [--train]}
 TRAIN=0
 case ${3:-} in --train) TRAIN=1 ;; "") ;; *) echo "unknown argument: $3" >&2; exit 2 ;; esac
+# A training box also installs the `train` extra (numpy, scikit-learn): the orchestrator's critic and board statistics
+# run in the venv; a pilot or play-only box keeps the base install.
+EXTRA=(); [ "$TRAIN" = 0 ] || EXTRA=(--extra train)
 BOX_HOME=${ZEROAD_LIVE_HOME:-/opt/zeroad-live}
 STATE=${ZEROAD_LIVE_STATE:-/var/lib/zeroad-live}
 LOGDIR=${ZEROAD_LIVE_LOG:-/var/log/zeroad-live}
@@ -68,13 +71,13 @@ run mkdir -p "$BOX_HOME/bin" "$STATE/pilot/adapters" "$STATE/train" "$STATE/agen
 run sh -c 'rm -rf "$1/box.new" && mkdir -p "$1/box.new" && curl -fsSL "$2" | tar xz -C "$1/box.new"' _ "$BOX_HOME" "$PAYLOAD_URL"
 run sh -c 'rm -rf "$1/box" && mv "$1/box.new/box" "$1/box" && install -m 644 "$1/box.new/zeroad-live.conf" /etc/zeroad-live.conf && rm -rf "$1/box.new"' _ "$BOX_HOME"
 run sh -c 'rm -rf "$1/repo.new" && mkdir -p "$1/repo.new" && curl -fsSL "$2" | tar xz -C "$1/repo.new" && rm -rf "$1/repo" && mv "$1/repo.new" "$1/repo"' _ "$BOX_HOME" "$REPO_URL"
-run uv sync --project "$BOX_HOME/repo" --frozen --no-dev
+run uv sync --project "$BOX_HOME/repo" --frozen --no-dev ${EXTRA[@]+"${EXTRA[@]}"}
 # agent-env passes the model endpoint to each agent from these variables; pilot-run.sh sets them.
 run sh -c 'printf "[model]\nbase_url = \"env:LITELLM_BASE_URL\"\napi_key = \"env:LITELLM_API_KEY\"\n" > "$1/agent-env.toml"' _ "$ETC"
 
 step "images: the headless env (engine from the PPA) and the agents"
 AE=(env XDG_STATE_HOME="$STATE/agentenv" AGENT_ENV_CONFIG="$ETC/agent-env.toml"
-    uv run --project "$BOX_HOME/repo" --frozen --no-dev agent-env)
+    uv run --project "$BOX_HOME/repo" --frozen --no-dev ${EXTRA[@]+"${EXTRA[@]}"} agent-env)
 run "${AE[@]}" zeroad setup --source "$BOX_HOME/repo"
 run "${AE[@]}" zeroad setup --agents-only --source "$BOX_HOME/repo"
 
@@ -132,7 +135,7 @@ for instance in "${INSTANCES[@]}"; do
   fi
 done
 
-step "the trainer image (trainer/ on $VLLM_IMAGE, with PEFT)"
+step "the trainer image (trainer/ on $VLLM_IMAGE, with PEFT; train-run.sh rebuilds it at every start)"
 run docker build -q -t zeroad-trainer --build-arg "VLLM_IMAGE=$VLLM_IMAGE" "$BOX_HOME/repo/trainer"
 
 if [ "$TRAIN" = 1 ]; then
@@ -163,7 +166,7 @@ else
   set -a; source "$ETC/vllm.env"; set +a
   for port in "${PORTS[@]}"; do
     smoke=agentenv_zeroad.pilot.smoke; [ "$TRAIN" = 1 ] && smoke=agentenv_zeroad.train.smoke
-    uv run --project "$BOX_HOME/repo" --frozen --no-dev python -m "$smoke" --url "http://$BRIDGE:$port"
+    uv run --project "$BOX_HOME/repo" --frozen --no-dev ${EXTRA[@]+"${EXTRA[@]}"} python -m "$smoke" --url "http://$BRIDGE:$port"
   done
   docker run --rm curlimages/curl:8.10.1 -fsS -o /dev/null -w 'a container reaches vLLM: %{http_code}\n' "http://$BRIDGE:${PORTS[0]}/health"
   echo "gpus: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | paste -sd' ')"

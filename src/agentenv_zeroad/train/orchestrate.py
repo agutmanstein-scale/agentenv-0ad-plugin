@@ -85,7 +85,7 @@ from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
@@ -96,13 +96,15 @@ from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, panel_specs
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
 from agentenv_zeroad.train.game import ModelFactory, build_model
-from agentenv_zeroad.train.hardstate import HardStates
 from agentenv_zeroad.train.loopstats import LoopMonitor
 from agentenv_zeroad.train.mix import GameFactory, repin
 from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
 from agentenv_zeroad.train.spec import GameSpec
 from agentenv_zeroad.train.sync import Syncer
+
+if TYPE_CHECKING:
+    from agentenv_zeroad.train.hardstate import HardStates
 
 log = logging.getLogger(__name__)
 
@@ -1125,6 +1127,7 @@ def load_hard_states(cfg: RunConfig, tools: Sequence[Any], http: httpx.AsyncClie
     from agentenv_zeroad import brains
     from agentenv_zeroad.spend import SpendGuard
     from agentenv_zeroad.train.distill import Policy
+    from agentenv_zeroad.train.hardstate import HardStates
 
     iface = cfg.games.interface
     policies = {iface: Policy(brains.strategist_system(iface), tuple(brains.offered_tools(tools, iface)))}

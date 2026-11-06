@@ -1157,6 +1157,40 @@ def test_a_run_that_would_pass_the_budget_or_names_a_path_outside_the_train_fold
     assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
 
 
+def test_an_anchor_of_base_is_accepted_by_the_box_start_and_reaches_the_learner(box_stubs, stubs):
+    out = start_train(box_stubs, "--init", f"{box_stubs['tmp']}/state/train/sft", "--anchor", "base")
+    assert out.returncode == 0, out.stderr
+    [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert "--anchor base" in call
+    out = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--init", "/x/train/sft", "--anchor", "base", DRY_RUN="1")
+    [learner] = [line for line in out.stdout.splitlines() if "docker run -d --name zeroad-learner" in line]
+    assert "--init /x/train/sft --anchor base" in learner.replace("\\", "")
+
+
+def test_the_training_box_installs_and_runs_with_the_train_extra_and_a_play_only_box_does_not(stubs):
+    train = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    plain = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    sync = [line for line in train.stdout.splitlines() if line.startswith("+ uv sync")]
+    assert len(sync) == 1 and "--frozen --no-dev --extra train" in sync[0]
+    assert "uv run --project" in train.stdout and train.stdout.count("--extra train") >= 3  # sync, agent-env, smoke
+    assert "--extra" not in plain.stdout  # the pilot's base install is unchanged
+    run_ = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--play-only", DRY_RUN="1")
+    assert "--frozen --no-dev --extra train" in run_.stdout
+    for script in ("train.sh", "train-run.sh"):
+        text = (BOX / script).read_text()
+        assert "--no-dev python" not in text, script  # every uv run of a training script names the extra
+
+
+def test_the_learner_image_is_rebuilt_at_every_training_start_but_not_for_a_play_only_run(stubs):
+    out = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--init", "/x/train/start", DRY_RUN="1")
+    lines = out.stdout.replace("\\", "").splitlines()
+    build = next(i for i, line in enumerate(lines) if line.startswith("+ docker build -q -t zeroad-trainer"))
+    launch = next(i for i, line in enumerate(lines) if "docker run -d --name zeroad-learner" in line)
+    assert build < launch
+    play = run_box(stubs, "train-run.sh", str(TRAIN_CONFIG), "--play-only", DRY_RUN="1")
+    assert "docker build" not in play.stdout
+
+
 def test_the_box_config_upload_refuses_what_is_not_base64(stubs):
     out = run_box(stubs, "train.sh", "put-config", "not base64!", DRY_RUN="1")
     assert out.returncode != 0 and "needs base64" in out.stderr

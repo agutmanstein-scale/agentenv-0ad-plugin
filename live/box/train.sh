@@ -6,7 +6,8 @@
 # `start` refuses while a run is going, while a vLLM instance is down, when the run config's box_usd_per_hour is not this
 # box's rate (ZEROAD_BOX_USD_PER_HOUR), or when budget.sh says --budget would be passed by the box hours and ledger so
 # far plus the config's whole duration_hours at the rate; --init is a PEFT adapter to start the learner from, --anchor the frozen
-# adapter its KL penalty holds the policy near (the distilled SFT adapter; none: the base model), --baseline the tripwire
+# adapter its KL penalty holds the policy near (default: the --init adapter, so a run started from the distilled SFT
+# adapter is held near it; `--anchor base` holds it near the base model instead), --baseline the tripwire
 # baseline (JSON from baseline_from), all under $STATE/train; --play-only starts no learner and credits nothing (a baseline or panel run). `status` prints the
 # unit, the orchestrator's status, the learner's latest health records, the containers, the GPUs, vLLM and the spend.
 # `stop` sends SIGTERM: the orchestrator stops the learner, uploads the run (each of its 3 tries is cut off after 10 min;
@@ -24,7 +25,7 @@ case $CMD in
     run mkdir -p "$TRAIN"
     if [ "$DRY_RUN" = 1 ]; then say "+ write the decoded config to $CONFIG and check it (train.config)"; exit 0; fi
     printf '%s' "$B64" | base64 -d > "$CONFIG.new"
-    uv run --project "$REPO" --frozen --no-dev python -m agentenv_zeroad.train.config "$CONFIG.new" || { rm -f "$CONFIG.new"; die "the config is not valid"; }
+    uv run --project "$REPO" --frozen --no-dev --extra train python -m agentenv_zeroad.train.config "$CONFIG.new" || { rm -f "$CONFIG.new"; die "the config is not valid"; }
     mv "$CONFIG.new" "$CONFIG"
     say "config in place: $CONFIG"
     ;;
@@ -33,7 +34,10 @@ case $CMD in
     while [ $# -gt 0 ]; do
       case $1 in
         --config) CONFIG=${2:?--config needs a path}; shift 2 ;;
-        --init|--anchor|--baseline)
+        --anchor)
+          [[ ${2:-} == base || ( ${2:-} == "$TRAIN"/* && ${2:-} =~ ^[A-Za-z0-9._/-]+$ ) ]] || die "--anchor needs a path under $TRAIN, or base"
+          ARGS+=("$1" "$2"); shift 2 ;;
+        --init|--baseline)
           [[ ${2:-} == "$TRAIN"/* && ${2:-} =~ ^[A-Za-z0-9._/-]+$ ]] || die "$1 needs a path under $TRAIN"
           ARGS+=("$1" "$2"); shift 2 ;;
         --play-only) ARGS+=(--play-only); shift ;;
@@ -51,7 +55,7 @@ case $CMD in
     fi
     # The run's own numbers: its duration and its rate (the config is checked here too, panel files and a sample game).
     if [ -f "$CONFIG" ]; then
-      cfg_vars=$(uv run --project "$REPO" --frozen --no-dev python -m agentenv_zeroad.train.config "$CONFIG") || die "the run config $CONFIG is not a runnable run"
+      cfg_vars=$(uv run --project "$REPO" --frozen --no-dev --extra train python -m agentenv_zeroad.train.config "$CONFIG") || die "the run config $CONFIG is not a runnable run"
       eval "$cfg_vars"
     else
       TRAIN_DURATION_HOURS=0.5 TRAIN_BOX_USD_PER_HOUR=${ZEROAD_BOX_USD_PER_HOUR:-0}
@@ -78,7 +82,7 @@ case $CMD in
       say "+ orchestrator/status.json; health.jsonl; journalctl -u zeroad-train -n $N; docker ps; nvidia-smi; vLLM health; budget.sh show; df"
       exit 0
     fi
-    eval "$(uv run --project "$REPO" --frozen --no-dev python -m agentenv_zeroad.train.config "$CONFIG" 2>/dev/null)" || TRAIN_ROOT=
+    eval "$(uv run --project "$REPO" --frozen --no-dev --extra train python -m agentenv_zeroad.train.config "$CONFIG" 2>/dev/null)" || TRAIN_ROOT=
     echo "--- orchestrator"; cat "$TRAIN_ROOT/orchestrator/status.json" 2>/dev/null || echo "(no status yet)"
     echo "--- learner (latest health records)"; tail -n 3 "$TRAIN_ROOT/health.jsonl" 2>/dev/null | cut -c1-400 || true
     echo "--- log"; journalctl -u zeroad-train -n "$N" --no-pager -o cat 2>/dev/null || true

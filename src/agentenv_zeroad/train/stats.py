@@ -19,6 +19,9 @@ to bootstrap; the fit here is the same model solved by Newton's method on arrays
   97.5% lower bound (Wilson) of the win rate against its opponent, pooled over the last two completed hourly bins,
   clears its threshold; 97.5% is Bonferroni-corrected across the milestones. Checking only on a schedule is what keeps
   the error rate: retrying after every game would promote a 55% policy most of the time.
+
+numpy is imported inside the functions that fit and test (the `train` extra); the Wilson, teacher-calibration and SFT
+selection functions need only the standard library, so the orchestrator imports this module on the box's base install.
 """
 
 from __future__ import annotations
@@ -28,11 +31,12 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from statistics import NormalDist
-from typing import Any
-
-import numpy as np
+from typing import TYPE_CHECKING, Any
 
 from agentenv_zeroad.pilot.ratings import ANCHOR, ELO, PRIOR
+
+if TYPE_CHECKING:
+    import numpy as np
 
 FIXED_PREFIXES = ("petra-", "bot")
 BASE = "v0"
@@ -64,6 +68,8 @@ def fit(
     a: np.ndarray, b: np.ndarray, score: np.ndarray, players: int, *, prior: float = PRIOR, iterations: int = 60
 ) -> np.ndarray:
     """Natural-unit Bradley-Terry ratings of `players` players from games `a[i]` vs `b[i]` scored `score[i]` for a."""
+    import numpy as np
+
     r = np.zeros(players)
     for _ in range(iterations):
         p = 1 / (1 + np.exp(r[b] - r[a]))
@@ -91,6 +97,8 @@ def elo_by_hour(
     """{"board": {player: {elo, lo, hi, games}}, "curve": [...]} over every game, with game-bootstrap intervals.
 
     The curve is the policy's hourly bins in order: label, hour, elo, lo, hi and the games in the bin."""
+    import numpy as np
+
     if not games:
         return {"board": {}, "curve": []}
     labels = sorted({g.player for g in games} | {g.opponent for g in games})
@@ -123,6 +131,8 @@ def trend_test(games: Sequence[Game]) -> dict[str, Any]:
 
     Returns the slope (log-odds per training hour), its sandwich SE and the one-sided p for a positive slope. With
     fewer than two distinct hours, or no games, the numbers are None: there is no trend to test."""
+    import numpy as np
+
     anchored = [g for g in games if g.fixed]
     opponents = sorted({g.opponent for g in anchored})
     out: dict[str, Any] = {"n": len(anchored), "opponents": opponents, "slope": None, "se": None, "z": None, "p": None}
@@ -145,6 +155,8 @@ def trend_test(games: Sequence[Game]) -> dict[str, Any]:
 
 def _logistic(x: np.ndarray, y: np.ndarray, *, ridge: float = 1e-6) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(beta, X'WX + ridge, y - mu) for a fractional-response logistic regression fit by Newton steps."""
+    import numpy as np
+
     beta = np.zeros(x.shape[1])
     for _ in range(100):
         mu = 1 / (1 + np.exp(-x @ beta))
@@ -166,6 +178,8 @@ def panel_test(base: Sequence[Game], other: Sequence[Game]) -> dict[str, Any]:
     OLS of margin on an `other` indicator plus a fixed effect per opponent that both played (the rest cannot be
     compared). The SE is sigma x sqrt((X'X)^-1[0, 0]) with sigma the pooled within-opponent SD of `base`'s margins; the
     p-value is one-sided on the normal, and `sd_other` reports the other arm's SD so a mismatch is visible."""
+    import numpy as np
+
     base = [g for g in base if g.margin is not None]
     other = [g for g in other if g.margin is not None]
     strata = sorted({g.opponent for g in base} & {g.opponent for g in other})
@@ -196,6 +210,8 @@ def panel_test(base: Sequence[Game], other: Sequence[Game]) -> dict[str, Any]:
 
 def _within_sd(games: Sequence[Game]) -> float | None:
     """Pooled within-opponent SD of the margins, or None when no opponent has two games."""
+    import numpy as np
+
     by: dict[str, list[float]] = defaultdict(list)
     for g in games:
         if g.margin is not None:
@@ -301,8 +317,9 @@ def teacher_calibration(games: Sequence[TeacherGame]) -> dict[str, Any]:
     """Per teacher and Petra rung: games, win rate and its 95% Wilson interval, then the teacher to distil from.
 
     `best` follows `pick_teacher`: the best win rate against Petra-3, ties broken by Petra-4, then by name. A draw
-    counts half, as everywhere on the board. With ~10 games in all, the intervals are wide on purpose: the report
-    shows how little a difference means."""
+    counts half, as everywhere on the board. With ~16 games in all, the intervals are wide on purpose: the report
+    shows how little a difference means, and `best.separated` says whether the best teacher's Petra-3 interval is
+    clear of the runner-up's (`overlaps_runner_up` is its negation; None with no runner-up that played Petra-3)."""
     cells: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     models: dict[str, str | None] = {}
     for g in games:
@@ -317,9 +334,21 @@ def teacher_calibration(games: Sequence[TeacherGame]) -> dict[str, Any]:
             rungs[opponent] = {"games": n, "wins": wins, "win_rate": wins / n, "lo": lo, "hi": hi}
         teachers[name] = {"model": models[name], "rungs": rungs}
     summary: dict[str, Any] = {"games": len(games), "teachers": teachers}
-    best = pick_teacher(summary)
+    ranked = rank_teachers(summary)
+    best = ranked[0] if ranked else None
     rule = f"best win rate vs {CALIBRATION_RUNG}, ties {CALIBRATION_TIEBREAK}"
-    summary["best"] = {"name": best, "model": teachers[best]["model"], "rule": rule} if best else None
+    if best is None:
+        summary["best"] = None
+        return summary
+    overlaps = None
+    if len(ranked) > 1:
+        first, second = (teachers[n]["rungs"][CALIBRATION_RUNG] for n in ranked[:2])
+        overlaps = second["hi"] >= first["lo"]
+    summary["best"] = {
+        "name": best, "model": teachers[best]["model"], "rule": rule,
+        "runner_up": ranked[1] if len(ranked) > 1 else None,
+        "overlaps_runner_up": overlaps, "separated": None if overlaps is None else not overlaps,
+    }  # fmt: skip
     return summary
 
 
@@ -352,23 +381,30 @@ class SftCandidate:
 
 
 MIN_ENTROPY_RATIO = 0.7
+MIN_SFT_GAMES = 20  # a checkpoint's panel win rate on fewer games than this is noise
 
 
 def select_sft_checkpoint(
-    candidates: Sequence[SftCandidate], *, min_entropy_ratio: float = MIN_ENTROPY_RATIO
+    candidates: Sequence[SftCandidate], *, min_entropy_ratio: float = MIN_ENTROPY_RATIO, min_games: int = MIN_SFT_GAMES
 ) -> dict[str, Any]:
     """Which SFT checkpoint RL should start from: by held-out win rate, never by the SFT loss.
 
     SFT loss falls with every epoch whether or not the policy plays better, and a checkpoint trained too long has
     collapsed its entropy, which RL then cannot explore from. So a candidate is rejected when its mean token entropy
-    is under `min_entropy_ratio` (default 0.7) of the base model's, or when it has no panel games; of the rest the
-    highest panel win rate wins, and a tie goes to the earlier (less trained) checkpoint. `chosen` is None when none
-    passes: start RL from the base model."""
+    is under `min_entropy_ratio` (default 0.7) of the base model's, or when its panel has fewer than `min_games`
+    games (default 20) or a different number from the most-played checkpoint's (win rates over different games are not
+    comparable); of the rest the highest panel win rate wins, and a tie goes to the earlier (less trained)
+    checkpoint. `chosen` is None when none passes: start RL from the base model."""
     rows, chosen = [], None
+    most = max((c.games for c in candidates), default=0)
     for c in candidates:
         reason = None
         if c.win_rate is None:
             reason = "not played on the panel"
+        elif c.games < min_games:
+            reason = f"{c.games} panel games is under the {min_games} needed"
+        elif c.games != most:
+            reason = f"{c.games} panel games, not the {most} the most-played checkpoint has"
         elif c.entropy_ratio is None:
             reason = "no entropy measured"
         elif c.entropy_ratio < min_entropy_ratio:
@@ -387,7 +423,9 @@ def select_sft_checkpoint(
     return {
         "chosen": chosen.name if chosen else None,
         "min_entropy_ratio": min_entropy_ratio,
+        "min_games": min_games,
         "candidates": rows,
-        "rule": "highest panel win rate among checkpoints whose token entropy is at least the floor times the base's; "
-        "ties to the earlier epoch; never the SFT loss",
+        "rule": "highest panel win rate among checkpoints with at least min_games panel games, all the same number, "
+        "and "
+        "token entropy at least the floor times the base's; ties to the earlier epoch; never the SFT loss",
     }

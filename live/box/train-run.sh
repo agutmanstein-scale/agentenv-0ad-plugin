@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# train-run.sh CONFIG [--init DIR] [--anchor DIR] [--baseline FILE] [--play-only]: the zeroad-train unit's process (train.sh starts it).
+# train-run.sh CONFIG [--init DIR] [--anchor DIR|base] [--baseline FILE] [--play-only]: the zeroad-train unit's process (train.sh starts it).
 # Starts the learner in the trainer image on the training GPUs (torchrun, one process per GPU, its --root the run's
 # folder, which the config names and which must be under $STATE/train: that folder is also what the vLLM containers
 # mount at /train to hot-load adapters from), then runs the orchestrator with vLLM's key from its root-only file, in
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-PY=(uv run --project "$REPO" --frozen --no-dev python)
+PY=(uv run --project "$REPO" --frozen --no-dev --extra train python)
 if [ "$DRY_RUN" = 1 ]; then
   say "+ source $ETC/vllm.env (VLLM_API_KEY, never printed)"
   eval "$("${PY[@]}" -m agentenv_zeroad.train.config "$CONFIG")"
@@ -45,6 +45,9 @@ run mkdir -p "$TRAIN_ROOT"
 stop_learner() { docker stop -t 60 zeroad-learner >/dev/null 2>&1 || true; }
 if [ "$DRY_RUN" = 0 ] && [ "$PLAY_ONLY" = 0 ]; then trap ':' TERM; trap stop_learner EXIT; fi
 if [ "$PLAY_ONLY" = 0 ]; then
+  # The learner is the repo's trainer/learner.py baked into the image: rebuild (a cached no-op when trainer/ is unchanged)
+  # so a box bootstrapped before an update does not train with the old one.
+  run docker build -q -t zeroad-trainer "$REPO/trainer"
   run docker rm -f zeroad-learner >/dev/null 2>&1 || true
   run docker run -d --name zeroad-learner --gpus "\"device=$TRAIN_GPUS\"" --ipc=host -v "$TRAIN:$TRAIN" \
     -v "$STATE/hf:/root/.cache/huggingface" zeroad-trainer torchrun --nproc_per_node "$(awk -F, '{print NF}' <<<"$TRAIN_GPUS")" \
