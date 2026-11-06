@@ -159,6 +159,8 @@ else
   docker run --rm curlimages/curl:8.10.1 -fsS -o /dev/null -w 'a container reaches vLLM: %{http_code}\n' "http://$BRIDGE:${PORTS[0]}/health"
   echo "gpus: $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | paste -sd' ')"
 fi
+step "power-off armed (zeroad-poweroff, from the launch deadline)"
+run "$BOX_HOME/box/poweroff.sh" check
 if [ "$TRAIN" = 1 ]; then
   echo "training box done; nothing is played or trained (live/train.sh ID start CONFIG --yes)"
 else

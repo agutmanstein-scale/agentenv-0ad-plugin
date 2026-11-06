@@ -90,7 +90,7 @@ case $CMD in
     echo "--- spend"; "$BOX_HOME/box/budget.sh" show || true
     echo "--- pilot folders"; du -sh "$STATE"/pilot "$STATE"/pilot-solo-* 2>/dev/null | sed "s#$STATE/##" || true
     echo "--- disk"; df -h "$STATE" | tail -1
-    echo "--- power-off"; busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null || echo none
+    echo "--- power-off"; "$BOX_HOME/box/poweroff.sh" status
     ;;
   stop)
     if [ "${1:-}" = --now ]; then

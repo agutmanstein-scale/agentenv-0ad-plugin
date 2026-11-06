@@ -72,17 +72,9 @@ else
   ami=$(aws_run ami-DLAMI-PLACEHOLDER ssm get-parameter \
     --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id \
     --query Parameter.Value --output text)
-  # A boothook runs on every boot, not just the first: a stopped box that is started again is powered off at the same
-  # absolute deadline (at least 30 minutes after it is up, so its results can still be fetched).
-  userdata=$(cat <<BOOTHOOK | base64 | tr -d '\n'
-#cloud-boothook
-#!/bin/bash
-DEADLINE=$(( $(date +%s) + MAX_HOURS * 3600 ))
-mins=\$(( (DEADLINE - \$(date +%s)) / 60 ))
-[ "\$mins" -ge 30 ] || mins=30
-shutdown -h +"\$mins" "zeroad-live: MAX_HOURS reached"
-BOOTHOOK
-)
+  # The boothook only records the absolute deadline and installs zeroad-poweroff.service, which arms the power-off after
+  # systemd-logind on every boot: a `shutdown -h` from the boothook itself runs before logind can take it and is lost.
+  userdata=$(sed "s/@DEADLINE@/$(( $(date +%s) + MAX_HOURS * 3600 ))/" "$LIVE_DIR/lib/poweroff-boothook.sh" | base64 | tr -d '\n')
   for t in $TYPES; do
     trate=$(rate_for "$t")
     tags="{Key=Name,Value=$NAME},{Key=owner,Value=${LIVE_TAG_OWNER:-${USER:-zeroad}}},{Key=purpose,Value=$PURPOSE},{Key=zeroad-box-usd-per-hour,Value=$trate},{Key=zeroad-instance-type,Value=$t}"

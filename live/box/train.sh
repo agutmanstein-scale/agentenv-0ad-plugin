@@ -85,7 +85,7 @@ case $CMD in
     for url in $(cat "$ETC/vllm.urls" 2>/dev/null); do echo "$url $(curl -s -o /dev/null -w '%{http_code}' "$url/health" || echo down)"; done
     echo "--- spend"; "$BOX_HOME/box/budget.sh" show || true
     echo "--- disk"; df -h "$STATE" | tail -1
-    echo "--- power-off"; busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager ScheduledShutdown 2>/dev/null || echo none
+    echo "--- power-off"; "$BOX_HOME/box/poweroff.sh" status
     ;;
   stop)
     say "stopping zeroad-train: the learner is told to stop, the run is uploaded, then it ends"

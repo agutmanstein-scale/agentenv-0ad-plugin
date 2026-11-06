@@ -204,7 +204,8 @@ def test_the_launch_plan_is_one_l4_box_on_the_nvidia_dlami_that_powers_itself_of
     assert "Key=purpose,Value=zeroad-live" in plan and "Key=Name,Value=zeroad-live-onair" in plan
     user_data = re.search(r"--user-data (\S+)", plan).group(1)
     script = base64.b64decode(user_data).decode()
-    assert script.startswith("#cloud-boothook\n") and 'shutdown -h +"$mins" "zeroad-live: MAX_HOURS reached"' in script
+    assert script.startswith("#cloud-boothook\n") and "zeroad-poweroff.service" in script
+    assert "shutdown -h" not in script.split("<<'ARM'")[0]  # nothing is scheduled from the boothook itself
     assert "at most about $3.96" in plan
     assert out.stdout.strip() == ID  # the id is the only stdout, for ID=$(live/launch.sh --yes)
 
@@ -535,7 +536,7 @@ def test_health_flags_a_match_whose_stream_does_not_reach_the_relay(stubs):
     write_exe(stubs["bin"] / "docker", "#!/bin/sh\necho 'localhost:5000/mcp-server-zeroad-live:v3 Up 3 minutes'\n")
     write_exe(stubs["bin"] / "curl", '#!/bin/sh\necho \'{"ready": false, "bytesReceived": 0}\'\n')
     write_exe(stubs["bin"] / "nvidia-smi", "#!/bin/sh\necho '41, 12, 3100, 55'\n")
-    write_exe(stubs["bin"] / "busctl", "#!/bin/sh\necho 't 0'\n")
+    write_exe(stubs["bin"] / "busctl", "#!/bin/sh\necho '(st) \"poweroff\" 1800003600000000'\n")
     state = stubs["tmp"] / "state"
     state.mkdir()
     (state / "push.wanted").touch()
@@ -1172,12 +1173,38 @@ def test_a_stream_box_without_rates_still_falls_back_at_its_default_rate_and_war
     )
 
 
-def test_the_power_off_is_armed_on_every_boot_from_the_launch_deadline(stubs, tmp_path):
-    out = run(stubs, "launch.sh", "--max-hours", "12", forbid_aws=True)
+def boothook(stubs, root: Path, hours: int = 12) -> tuple[str, int]:
+    out = run(stubs, "launch.sh", "--max-hours", str(hours), forbid_aws=True)
     script = base64.b64decode(re.search(r"--user-data (\S+)", out.stderr).group(1)).decode()
+    subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "ZEROAD_ROOT": str(root)}, check=True)
+    return script, int((root / "etc/zeroad-live/deadline").read_text())
+
+
+def test_the_boothook_only_records_the_deadline_and_installs_a_unit_that_arms_after_logind(stubs, tmp_path):
+    script, deadline = boothook(stubs, tmp_path / "root", 12)
     assert script.startswith("#cloud-boothook\n")  # cloud-init runs a boothook at every boot, user-data scripts once
-    deadline = int(re.search(r"^DEADLINE=(\d+)$", script, re.M).group(1))
     assert abs(deadline - (time.time() + 12 * 3600)) < 120
+    unit = (tmp_path / "root/etc/systemd/system/zeroad-poweroff.service").read_text()
+    assert "After=systemd-logind.service" in unit and "Type=oneshot" in unit
+    assert "WantedBy=multi-user.target" in unit and "ExecStart=/usr/local/sbin/zeroad-poweroff-arm" in unit
+    assert "enable zeroad-poweroff.service" in script and "--now" not in script  # the unit never blocks boot
+    arm = (tmp_path / "root/usr/local/sbin/zeroad-poweroff-arm").read_text()
+    assert 'shutdown -h +"$mins" "zeroad-live: MAX_HOURS reached"' in arm and '[ "$mins" -ge 30 ]' in arm
+
+
+def test_the_deadline_survives_a_second_boot_so_a_restart_keeps_the_absolute_deadline(stubs, tmp_path):
+    root = tmp_path / "root"
+    _, first = boothook(stubs, root, 12)
+    (root / "etc/zeroad-live/deadline").write_text("1234\n")
+    script, _ = boothook(stubs, root, 12)  # the same user-data runs again on a later boot
+    assert (root / "etc/zeroad-live/deadline").read_text() == "1234\n" != f"{first}\n"
+    assert script
+
+
+def test_the_arm_script_schedules_the_minutes_left_and_at_least_thirty(stubs, tmp_path):
+    root = tmp_path / "root"
+    _, deadline = boothook(stubs, root, 12)
+    arm = root / "usr/local/sbin/zeroad-poweroff-arm"
 
     def minutes_scheduled(boot_epoch: int) -> int:
         bin_dir = tmp_path / f"bin{boot_epoch}"
@@ -1185,16 +1212,78 @@ def test_the_power_off_is_armed_on_every_boot_from_the_launch_deadline(stubs, tm
         write_exe(bin_dir / "date", f"#!/bin/sh\necho {boot_epoch}\n")
         write_exe(bin_dir / "shutdown", '#!/bin/sh\necho "$@" > "$STUB_SHUTDOWN"\n')
         log = tmp_path / f"shutdown{boot_epoch}"
-        # DEADLINE is computed from the launch's `date`; the boot's `date` is the stub's
-        body = script.replace(re.search(r"^DEADLINE=.*$", script, re.M).group(0), f"DEADLINE={deadline}")
-        subprocess.run(
-            ["bash", "-c", body], env={"PATH": f"{bin_dir}:/usr/bin:/bin", "STUB_SHUTDOWN": str(log)}, check=True
-        )
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin", "STUB_SHUTDOWN": str(log),
+            "ZEROAD_DEADLINE_FILE": str(root / "etc/zeroad-live/deadline"),
+        }  # fmt: skip
+        subprocess.run(["sh", str(arm)], env=env, check=True)
         return int(log.read_text().split()[1].lstrip("+"))
 
     assert minutes_scheduled(deadline - 12 * 3600) == 720  # first boot
     assert minutes_scheduled(deadline - 5 * 3600) == 300  # started again after a stop: the remaining hours, not 12
     assert minutes_scheduled(deadline + 3600) == 30  # started after the deadline: a half hour to fetch the results
+
+
+def busctl_stub(stubs, answer: str, after_arm: str | None = None):
+    """busctl answers `answer`; once the arm stub has run, `after_arm` (default: the same)."""
+    flag = stubs["tmp"] / "armed.flag"
+    write_exe(
+        stubs["bin"] / "busctl",
+        f"#!/bin/sh\nif [ -f '{flag}' ]; then echo '{after_arm or answer}'; else echo '{answer}'; fi\n",
+    )
+    arm = write_exe(stubs["bin"] / "arm", f"#!/bin/sh\ntouch '{flag}'\n")
+    return arm
+
+
+NOT_ARMED = '(st) "" 18446744073709551615'
+ARMED = '(st) "poweroff" 1800003600000000'
+
+
+def test_a_bootstrap_re_arms_a_missing_power_off_and_fails_loudly_if_it_stays_unset(stubs):
+    arm = busctl_stub(stubs, NOT_ARMED, after_arm=ARMED)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 0 and "power-off armed" in out.stdout and "arming it" in out.stderr
+    arm = busctl_stub(stubs, NOT_ARMED)  # re-arming does not take
+    (stubs["tmp"] / "armed.flag").unlink(missing_ok=True)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 1 and "NOT ARMED" in out.stdout and "NOT ARMED" in out.stderr
+
+
+def test_a_bootstrap_does_not_rearm_a_power_off_that_is_already_scheduled(stubs):
+    arm = busctl_stub(stubs, ARMED)
+    out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
+    assert out.returncode == 0 and not (stubs["tmp"] / "armed.flag").exists()
+
+
+@pytest.mark.parametrize("script", ["bootstrap.sh", "pilot-bootstrap.sh"])
+def test_every_bootstrap_ends_with_the_power_off_check(stubs, script):
+    args = ["https://payload", "https://repo"]
+    out = run_box(stubs, script, *args, DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert "poweroff.sh check" in out.stdout
+    if script == "pilot-bootstrap.sh":
+        assert "poweroff.sh check" in run_box(stubs, script, *args, "--train", DRY_RUN="1").stdout
+
+
+def test_status_prints_a_clear_warning_instead_of_the_raw_busctl_tuple(stubs):
+    busctl_stub(stubs, NOT_ARMED)
+    out = run_box(stubs, "poweroff.sh", "status")
+    assert (
+        out.returncode == 0
+        and out.stdout.startswith("power-off NOT ARMED")
+        and "18446744073709551615" not in out.stdout
+    )
+    busctl_stub(stubs, ARMED)
+    out = run_box(stubs, "poweroff.sh", "status")
+    assert out.stdout.startswith("power-off armed") and "NOT ARMED" not in out.stdout
+
+
+def test_health_reports_an_unarmed_power_off_as_a_problem(box_stubs):
+    write_exe(box_stubs["bin"] / "busctl", f"#!/bin/sh\necho '{NOT_ARMED}'\n")
+    write_exe(box_stubs["bin"] / "df", "#!/bin/sh\necho Avail; echo 100G\n")  # BSD df has no -BG
+    out = run_box(box_stubs, "health.sh")
+    health = json.loads(out.stdout)
+    assert "power-off NOT ARMED: no shutdown is scheduled" in health["problems"] and health["poweroff_utc"] is None
 
 
 def test_the_box_config_carries_the_rate_the_cap_and_the_free_disk_floor(stubs):

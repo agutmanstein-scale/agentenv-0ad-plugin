@@ -102,4 +102,5 @@ if [ "$DRY_RUN" = 0 ]; then
   echo "mediamtx: $("$BOX_HOME/bin/mediamtx" --version 2>&1 | head -1)"
   echo "units: $(systemctl is-active zeroad-x zeroad-relay zeroad-health.timer | paste -sd' ') (x relay health)"
 fi
+run "$BOX_HOME/box/poweroff.sh" check
 echo "bootstrap done; no match is running and nothing is pushed"

@@ -52,8 +52,10 @@ if disk is not None and disk < min_free:
     problems.append(f"disk {disk} GB free")
 poweroff = None
 parts = (e("H_POWEROFF") or "").split()
-if len(parts) >= 3 and parts[2].isdigit() and int(parts[2]):
+if len(parts) >= 3 and parts[1].strip('"') and parts[2].isdigit() and int(parts[2]) and int(parts[2]) != 2**64 - 1:
     poweroff = datetime.datetime.fromtimestamp(int(parts[2]) / 1e6, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+if poweroff is None:
+    problems.append("power-off NOT ARMED: no shutdown is scheduled")
 print(json.dumps({
     "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "status": "warn" if problems else "ok", "problems": problems, "units": units,
