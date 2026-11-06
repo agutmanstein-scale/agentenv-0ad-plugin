@@ -1556,3 +1556,43 @@ def test_the_game_stream_carries_its_state_across_a_restart(tmp_path):
     b = GameFactory(config(tmp_path))
     b.load_state_dict(json.loads(json.dumps(a.state_dict())))
     assert [a.next(2, HOSTS[1]) for _ in range(5)] == [b.next(2, HOSTS[1]) for _ in range(5)]
+
+
+# ---- the multi-box transport is off unless asked for -------------------------------------------------------------
+async def test_with_the_transport_off_a_run_is_the_single_box_run_it_was(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=2)
+    assert not t.cfg.transport.enabled and t.orch.xport is None
+    publish(t.root, 1)
+    await t.orch.refresh_serving()
+    t.orch.fill()
+    await settle(t.orch)
+    assert {s.game_id for s in t.play.specs} == {"r1-g000000", "r1-g000001"}
+    t.orch.check_budget(t.clock())
+    status = json.loads((t.root / "orchestrator" / "status.json").read_text())
+    assert "actors" not in status and "transport" not in status
+    assert not (t.root / "remote").exists() and not (t.root / "orchestrator" / "ship.json").exists()
+    assert len(list((t.root / "inbox").glob("*.jsonl"))) == 2 and t.credit.games == ["r1-g000000", "r1-g000001"]
+
+
+def test_a_toml_transport_table_loads(tmp_path):
+    path = tmp_path / "actor.toml"
+    path.write_text(
+        f"""run_id = "run1"
+root = "{tmp_path}/run1"
+budget_usd = 50
+box_usd_per_hour = 10.49
+duration_hours = 6
+[servers]
+urls = ["http://a:8000"]
+adapter_dir = "/train/run1/adapters"
+[transport]
+enabled = true
+uri = "s3://b/p/transport"
+role = "actor"
+actor_id = "a1"
+max_version_lag = 2
+"""
+    )
+    cfg = load_config(path)
+    assert cfg.transport.actor and cfg.transport.actor_id == "a1" and cfg.transport.max_version_lag == 2
+    assert cfg.s3_uri is None and cfg.game_prefix == "run1-a1"

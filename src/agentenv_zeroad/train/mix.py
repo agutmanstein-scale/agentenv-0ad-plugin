@@ -53,7 +53,7 @@ class GameFactory:
     def __init__(self, cfg: RunConfig, *, start_index: int = 0):
         self.cfg = cfg
         self.index = start_index
-        self.rng = random.Random(cfg.seed)
+        self.rng = random.Random(cfg.stream_seed)
         self._opponents: list[str] = []
         self._uncapped: list[bool] = []
         self._pairs = cfg.training_civ_pairs()
@@ -65,7 +65,7 @@ class GameFactory:
         policy = self._llm_seat(policy_civ, version, url, trainable=True)
         other = self._opponent_seat(opponent, opponent_civ, url)
         seats = (policy, other) if self.rng.random() < 0.5 else (other, policy)
-        game_id = f"{self.cfg.run_id}-g{self.index:06d}"
+        game_id = f"{self.cfg.game_prefix}-g{self.index:06d}"
         self.index += 1
         return GameSpec(
             game_id=game_id,

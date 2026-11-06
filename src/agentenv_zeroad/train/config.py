@@ -17,6 +17,7 @@
     [s3]
     uri = "s3://bucket/prefix/run1"
     [hard_states]                               # optional: teacher labels on all-loss opponents (off)
+    [transport]                                 # optional: several boxes through S3, `role` learner or actor (off)
     [credit]                                    # optional: train.credit.CreditConfig fields (margin_scale ...)
     [credit.critic]                             # optional: train.critic.CriticConfig fields; absent: no critic
     [[panels]]
@@ -48,6 +49,11 @@ train_root>/adapters` in them. `servers.adapter_dir` is derived from `root` that
 box's one ledger is `$STATE/spend.jsonl` and its box hours are `$STATE/boxtime.json` (`budget.sh`'s), both found from
 `train_root`'s parent when `root` is under `train_root`.
 
+`[transport]` (`train/transport.py`, docs/s4-actors.md) turns the run into a multi-box one: `enabled = true`, `uri` (an
+s3:// prefix every box can reach with its instance role, or file:///dir in tests), `role` ("learner": the box that
+trains, or "actor": a rollout box with its own `actor_id`), `max_version_lag`, `poll_s`, `actor_stale_minutes` and
+`learner_stale_minutes`. Absent or `enabled = false`, a run is the single-box run it always was.
+
 A key the config doesn't know is an error, and so is a mix or map list that would put a held-out map, seed or civ pair
 into a training game. The three amounts that decide when the run stops (`budget_usd`, `box_usd_per_hour`,
 `duration_hours`) have no defaults.
@@ -55,6 +61,7 @@ into a training game. The three amounts that decide when the run stops (`budget_
 
 from __future__ import annotations
 
+import re
 import shlex
 import sys
 import tomllib
@@ -307,6 +314,48 @@ class HardStateConfig:
 
 
 @dataclass(frozen=True)
+class TransportConfig:
+    """The multi-box actor-learner transport (`train.transport`), off by default.
+
+    Boxes only meet through the S3 prefix `uri`: the learner publishes adapter versions and ingests the games the
+    actors ship, which is why no inbound port or shared network is needed. `max_version_lag` is how many versions
+    behind the learner's current a shipped game may have been pinned to and still be trained on; `actor_stale_minutes`
+    is how long without a heartbeat before the learner calls an actor stale, `learner_stale_minutes` how long without
+    the learner's pulse before an actor stops."""
+
+    enabled: bool = False
+    uri: str = ""
+    role: str = "learner"
+    actor_id: str = ""
+    max_version_lag: int = 4
+    poll_s: float = 15.0
+    actor_stale_minutes: float = 10.0
+    learner_stale_minutes: float = 15.0
+
+    def __post_init__(self) -> None:
+        if self.role not in ("learner", "actor"):
+            raise ValueError(f"transport.role must be learner or actor, not {self.role!r}")
+        if not self.enabled:
+            return
+        if not (self.uri.startswith("s3://") or self.uri.startswith("file:///")):
+            raise ValueError("transport.uri must start with s3:// (or file:/// in tests)")
+        if self.role == "actor" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.actor_id):
+            raise ValueError("transport.actor_id is required for an actor: letters, digits, . _ -")
+        if self.max_version_lag < 0:
+            raise ValueError("transport.max_version_lag is not negative")
+        if min(self.poll_s, self.actor_stale_minutes, self.learner_stale_minutes) <= 0:
+            raise ValueError("transport.poll_s and the stale minutes must be positive")
+
+    @property
+    def learner(self) -> bool:
+        return self.enabled and self.role == "learner"
+
+    @property
+    def actor(self) -> bool:
+        return self.enabled and self.role == "actor"
+
+
+@dataclass(frozen=True)
 class RunConfig:
     run_id: str
     root: Path
@@ -350,6 +399,7 @@ class RunConfig:
     stop_when_done: bool = False  # end with reason "complete" once every panel has finished and brief_target is met
     brief_target: int = 0  # stop_when_done also waits until this many distillation briefs could be labelled (0: none)
     brief_per_game: int = 8  # distill.select's cap per game, which the supply is counted under
+    transport: TransportConfig = field(default_factory=TransportConfig)
 
     def __post_init__(self) -> None:
         if not self.run_id or "/" in self.run_id:
@@ -371,6 +421,8 @@ class RunConfig:
             raise ValueError("brief_target is not negative and brief_per_game is at least 1")
         if self.panels_only and not self.panels:
             raise ValueError("panels_only needs at least one panel")
+        if self.transport.actor and (self.panels or self.panels_only or self.hard_states.enabled):
+            raise ValueError("an actor plays training games only: no panels, panels_only or hard_states")
         self._resolve_adapter_dir()
         self._check_held_out()
 
@@ -421,6 +473,17 @@ class RunConfig:
             raise ValueError("every seed from games.seed_low up to seed_high is held out")
 
     @property
+    def game_prefix(self) -> str:
+        """What a game id starts with: the run id, and on an actor box its actor id too, so games never collide."""
+        return f"{self.run_id}-{self.transport.actor_id}" if self.transport.actor else self.run_id
+
+    @property
+    def stream_seed(self) -> int | str:
+        """The game stream's random seed: the run's, and on an actor box the run's and its actor id's, so actors
+        draw different games from each other and from the learner box."""
+        return f"{self.seed}:{self.transport.actor_id}" if self.transport.actor else self.seed
+
+    @property
     def ledger_path(self) -> Path:
         """The box's ledger (`$STATE/spend.jsonl`, the one budget.sh counts) on a box, else ROOT/spend.jsonl."""
         return self.ledger or (self.state_dir or self.root) / "spend.jsonl"
@@ -447,6 +510,7 @@ class RunConfig:
             if "specs" in p:
                 p["specs"] = Path(p["specs"])
         hard = _checked(top.pop("hard_states", {}), HardStateConfig, "hard_states")
+        transport = _checked(top.pop("transport", {}), TransportConfig, "transport")
         credit = dict(top.pop("credit", {}))
         critic = credit.pop("critic", None)
         s3 = top.pop("s3", {})
@@ -473,6 +537,7 @@ class RunConfig:
             ),
             panels=tuple(PanelConfig(**p) for p in panels),
             hard_states=HardStateConfig(**hard),
+            transport=TransportConfig(**transport),
             s3_uri=s3_uri,
             credit=credit,
             critic=dict(critic) if critic is not None else None,

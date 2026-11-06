@@ -1,0 +1,630 @@
+"""The multi-box transport: the stores, the bundle protocol and one learner orchestrator with two actor orchestrators
+exchanging adapters and games through a LocalStore, against the fake vLLM, fake game player and fake credit of the
+orchestrator's own tests. Nothing here starts an engine, a container or an AWS call."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agentenv_zeroad.train import orchestrate
+from agentenv_zeroad.train.config import TransportConfig
+from agentenv_zeroad.train.mix import GameFactory
+from agentenv_zeroad.train.serving import Fleet
+from agentenv_zeroad.train.sync import Syncer
+from agentenv_zeroad.train.transport import (
+    ActorLink,
+    BundleError,
+    LocalStore,
+    S3Store,
+    StoreError,
+    fetch_dir,
+    get_json,
+    publish_dir,
+    put_json,
+    unpack_game,
+)
+from tests import test_train_orchestrate as base
+
+pytestmark = pytest.mark.anyio
+
+URI_KEYS = ("current.json", "stop.json")
+
+
+# ---- config -------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"role": "boss"}, "transport.role"),
+        ({"enabled": True, "uri": "https://x"}, "transport.uri"),
+        ({"enabled": True, "uri": "s3://b/p", "role": "actor"}, "transport.actor_id"),
+        ({"enabled": True, "uri": "s3://b/p", "role": "actor", "actor_id": "a/b"}, "transport.actor_id"),
+        ({"enabled": True, "uri": "s3://b/p", "max_version_lag": -1}, "max_version_lag"),
+        ({"enabled": True, "uri": "s3://b/p", "poll_s": 0}, "must be positive"),
+        ({"surprise": 1}, "unknown transport keys"),
+    ],
+)
+def test_a_transport_section_that_could_not_work_is_refused(tmp_path, change, message):
+    with pytest.raises(ValueError, match=message):
+        base.config(tmp_path, transport=change)
+
+
+def test_an_actor_plays_training_games_only(tmp_path):
+    actor = {"enabled": True, "uri": "s3://b/p", "role": "actor", "actor_id": "a1"}
+    with pytest.raises(ValueError, match="training games only"):
+        base.config(tmp_path, transport=actor, hard_states={"enabled": True})
+    cfg = base.config(tmp_path, transport=actor)
+    assert cfg.transport.actor and not cfg.transport.learner and cfg.game_prefix == "r1-a1"
+    assert base.config(tmp_path).game_prefix == "r1" and not base.config(tmp_path).transport.enabled
+
+
+def test_actors_draw_different_games_from_each_other_and_from_the_learner(tmp_path):
+    def stream(role, actor_id=""):
+        t = {"enabled": True, "uri": "s3://b/p", "role": role, "actor_id": actor_id}
+        cfg = base.config(tmp_path, transport=t, seed=7)
+        factory = GameFactory(cfg)
+        return [factory.next(0, base.HOSTS[0]) for _ in range(20)]
+
+    one, two, learner = stream("actor", "a1"), stream("actor", "a2"), stream("learner")
+    assert stream("actor", "a1") == one  # a restarted actor draws the same stream
+    assert [s.seed for s in one] != [s.seed for s in two] and [s.seed for s in one] != [s.seed for s in learner]
+    ids = {s.game_id for s in [*one, *two, *learner]}
+    assert len(ids) == 60 and one[0].game_id == "r1-a1-g000000" and learner[0].game_id == "r1-g000000"
+
+
+# ---- the stores ---------------------------------------------------------------------------------------------------
+class FakeAws:
+    """`aws s3 cp|rm` and `s3api list-objects-v2|head-object` over a directory, the way S3 answers them."""
+
+    def __init__(self, root: Path, bucket: str = "bkt"):
+        self.root, self.bucket, self.calls = root, bucket, []
+        self.fail: str | None = None
+
+    def _path(self, url: str) -> Path:
+        assert url.startswith(f"s3://{self.bucket}/"), url
+        return self.root / url.removeprefix(f"s3://{self.bucket}/")
+
+    def __call__(self, cmd: list[str]) -> tuple[int, str]:
+        self.calls.append(cmd)
+        if self.fail and self.fail in " ".join(cmd):
+            return 1, "Could not connect to the endpoint URL"
+        match cmd[1:3]:
+            case ["s3", "cp"]:
+                src, dst = cmd[3], cmd[4]
+                if src.startswith("s3://"):
+                    path = self._path(src)
+                    if not path.is_file():
+                        return (
+                            1,
+                            f'fatal error: An error occurred (404) when calling HeadObject: Key "{src}" does not exist',
+                        )
+                    shutil.copyfile(path, dst)
+                else:
+                    path = self._path(dst)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, path)
+                return 0, ""
+            case ["s3", "rm"]:
+                self._path(cmd[3]).unlink(missing_ok=True)
+                return 0, ""
+            case ["s3api", "head-object"]:
+                key = cmd[cmd.index("--key") + 1]
+                if (self.root / key).is_file():
+                    return 0, "{}"
+                return 254, "An error occurred (404) when calling the HeadObject operation: Not Found"
+            case ["s3api", "list-objects-v2"]:
+                prefix = cmd[cmd.index("--prefix") + 1]
+                keys = sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*") if p.is_file())
+                found = [k for k in keys if k.startswith(prefix)]
+                return 0, json.dumps(found or None)
+        raise AssertionError(cmd)
+
+
+@pytest.fixture(params=["local", "s3"])
+def store(request, tmp_path):
+    if request.param == "local":
+        return LocalStore(tmp_path / "bucket")
+    return S3Store("s3://bkt/runs/r1", run=FakeAws(tmp_path / "bucket" / "runs" / "r1"))
+
+
+def test_a_store_puts_gets_lists_checks_and_deletes(store, tmp_path):
+    src = tmp_path / "src.txt"
+    src.write_text("hello")
+    store.put("games/a1/g1.tgz", src)
+    store.put("games/a1/g1.json", src)
+    store.put("current.json", src)
+    assert store.list("games") == ["games/a1/g1.json", "games/a1/g1.tgz"] and store.list("nothing") == []
+    assert store.exists("current.json") and not store.exists("stop.json")
+    out = tmp_path / "out.txt"
+    store.get("current.json", out)
+    assert out.read_text() == "hello"
+    with pytest.raises(FileNotFoundError):
+        store.get("stop.json", out)
+    store.delete("current.json")
+    store.delete("current.json")  # deleting what is not there is fine
+    assert not store.exists("current.json")
+    assert get_json(store, "stop.json") is None
+    put_json(store, "stop.json", {"reason": "x"})
+    assert get_json(store, "stop.json") == {"reason": "x"}
+    with pytest.raises(ValueError):
+        store.put("../escape", src)
+
+
+def test_an_s3_failure_that_is_not_a_missing_object_raises_a_store_error(tmp_path):
+    aws = FakeAws(tmp_path / "bucket")
+    store = S3Store("s3://bkt", run=aws)
+    aws.fail = "s3 cp"
+    with pytest.raises(StoreError):
+        store.put("a.json", tmp_path)
+    with pytest.raises(StoreError):
+        store.get("a.json", tmp_path / "x")
+    aws.fail = "head-object"
+    with pytest.raises(StoreError):
+        store.exists("a.json")
+
+
+def test_the_s3_store_names_objects_under_its_prefix_and_uses_the_cli(tmp_path):
+    aws = FakeAws(tmp_path / "bucket")
+    store = S3Store("s3://bkt/pre/fix/", run=aws)
+    put_json(store, "actors/a1.json", {"actor_id": "a1"})
+    assert (tmp_path / "bucket" / "pre" / "fix" / "actors" / "a1.json").is_file()
+    assert aws.calls[0][:3] == ["aws", "s3", "cp"] and aws.calls[0][4] == "s3://bkt/pre/fix/actors/a1.json"
+    assert store.list("actors") == ["actors/a1.json"]
+
+
+# ---- marker-last items -------------------------------------------------------------------------------------------
+def adapter_folder(tmp_path: Path) -> Path:
+    folder = tmp_path / "v3"
+    folder.mkdir()
+    (folder / "adapter_model.safetensors").write_bytes(b"w" * 5000)
+    (folder / "adapter_config.json").write_text("{}")
+    (folder / "manifest.json").write_text(json.dumps({"version": 3}))
+    return folder
+
+
+def test_a_published_folder_round_trips_and_every_file_is_checked(store, tmp_path):
+    publish_dir(store, "adapters/v3", adapter_folder(tmp_path))
+    fetch_dir(store, "adapters/v3", tmp_path / "got")
+    assert (tmp_path / "got" / "adapter_model.safetensors").read_bytes() == b"w" * 5000
+    got = tmp_path / "got2"
+    store.put("adapters/v3/adapter_model.safetensors", tmp_path / "v3" / "adapter_config.json")  # a corrupt object
+    with pytest.raises(BundleError):
+        fetch_dir(store, "adapters/v3", got)
+
+
+def test_a_folder_without_its_ready_marker_is_not_there(store, tmp_path):
+    folder = adapter_folder(tmp_path)
+    for path in folder.iterdir():
+        store.put(f"adapters/v3/{path.name}", path)  # every file, but the process died before READY
+    with pytest.raises(FileNotFoundError):
+        fetch_dir(store, "adapters/v3", tmp_path / "got")
+    link = ActorLink(store, TransportConfig())
+    assert link.pull_adapter(3, tmp_path / "adapters") is False
+    assert not list((tmp_path / "adapters").glob("v*")) and not list((tmp_path / "adapters").glob(".dl-*"))
+
+
+def test_a_pulled_adapter_appears_whole_or_not_at_all(store, tmp_path):
+    publish_dir(store, "adapters/v3", adapter_folder(tmp_path))
+    link = ActorLink(store, TransportConfig())
+    adapters = tmp_path / "adapters"
+    assert link.pull_adapter(3, adapters) is True
+    assert sorted(p.name for p in (adapters / "v3").iterdir()) == [
+        "adapter_config.json", "adapter_model.safetensors", "manifest.json"
+    ]  # fmt: skip
+    assert not list(adapters.glob(".dl-*"))
+    store.put("adapters/v3/manifest.json", tmp_path / "v3" / "adapter_config.json")
+    shutil.rmtree(adapters / "v3")
+    with pytest.raises(BundleError):
+        link.pull_adapter(3, adapters)
+    assert not (adapters / "v3").exists() and not list(adapters.glob(".dl-*"))
+
+
+def test_an_archive_that_reaches_outside_its_game_folder_is_refused(tmp_path):
+    import tarfile
+
+    bad = tmp_path / "bad.tgz"
+    (tmp_path / "x.txt").write_text("x")
+    with tarfile.open(bad, "w:gz") as tar:
+        tar.add(tmp_path / "x.txt", arcname="../evil.txt")
+    with pytest.raises(BundleError):
+        unpack_game(bad, "g1", tmp_path / "out")
+    other = tmp_path / "other.tgz"
+    with tarfile.open(other, "w:gz") as tar:
+        tar.add(tmp_path / "x.txt", arcname="g2/x.txt")
+    with pytest.raises(BundleError):
+        unpack_game(other, "g1", tmp_path / "out")
+
+
+# ---- one learner and two actors ----------------------------------------------------------------------------------
+def node(tmp_path, monkeypatch, store, clock, name, role, *, aws_code=0, lag=4, **over):
+    monkeypatch.setenv("VLLM_API_KEY", "k")
+    transport = {"enabled": True, "uri": f"file://{store.root}", "role": role, "poll_s": 0.01, "max_version_lag": lag}
+    if role == "actor":
+        transport["actor_id"] = name
+    extra = {"s3": {}} if role == "actor" else {}
+    cfg = base.config(tmp_path / name, transport=transport, engines=2, concurrency=2, **{**extra, **over})
+    fake, play = base.FakeVllm(), base.FakePlay()
+    credit = base.FakeCredit(2) if role == "learner" else orchestrate.PlayOnly()
+    powered: list[bool] = []
+
+    async def aws(cmd: list[str]) -> tuple[int, str]:
+        return aws_code, ""
+
+    http = fake.client()
+    orch = orchestrate.Orchestrator(
+        cfg,
+        fleet=Fleet(cfg.servers, "k", http),
+        play=play,
+        credit=credit,
+        syncer=Syncer(cfg.root, cfg.s3_uri, run=aws),
+        http=http,
+        now=clock,
+        power_off=lambda: powered.append(True),
+        learner=role == "learner",
+        store=store,
+    )
+    return SimpleNamespace(orch=orch, fake=fake, play=play, credit=credit, root=cfg.root, cfg=cfg, powered=powered)
+
+
+def games_in(root: Path) -> list[str]:
+    return sorted(p.name for p in (root / "inbox").glob("*.jsonl")) if (root / "inbox").is_dir() else []
+
+
+async def play_games(actor, n: int) -> None:
+    """Let the actor's orchestrator finish `n` games (it starts `concurrency` at a time)."""
+    while actor.orch.counts["train_finished"] < n:
+        actor.orch.fill()
+        await base.until(lambda: not actor.orch.in_flight)
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    store = LocalStore(tmp_path / "bucket")
+    clock = base.Clock()
+    learner = node(tmp_path, monkeypatch, store, clock, "learner", "learner", lag=3)
+    actors = {n: node(tmp_path, monkeypatch, store, clock, n, "actor") for n in ("a1", "a2")}
+    return SimpleNamespace(store=store, clock=clock, learner=learner, actors=actors, tmp=tmp_path)
+
+
+async def bring_up(w, version: int = 1) -> None:
+    """The learner serves `version` and publishes it; both actors read it, pull it and serve it."""
+    base.publish(w.learner.root, version)
+    await w.learner.orch.refresh_serving()
+    w.learner.orch.xport.start()
+    await w.learner.orch.xport.run_all()
+    for a in w.actors.values():
+        a.orch.xport.start()
+        await a.orch.xport.run_all()
+        await a.orch.refresh_serving()
+
+
+async def test_actor_games_are_credited_once_on_the_learner(world):
+    await bring_up(world)
+    for a in world.actors.values():
+        await play_games(a, 3)
+        await a.orch.xport.run_all()
+    learner = world.learner
+    await learner.orch.xport.run_all()
+    credited = sorted(learner.credit.games)
+    assert len(credited) == len(set(credited)) >= 6
+    assert {g.split("-g")[0] for g in credited} == {"r1-a1", "r1-a2"}
+    assert games_in(learner.root) == sorted(f"{g}.jsonl" for g in credited)
+    assert all(
+        (learner.root / "remote" / g.split("-g")[0].removeprefix("r1-") / g / "results.json").is_file()
+        for g in credited
+    )
+    await learner.orch.xport.run_all()
+    assert sorted(learner.credit.games) == credited  # a second poll credits nothing again
+    assert learner.orch.counts["remote_credited"] == len(credited) and learner.orch.counts["rows"] == 2 * len(credited)
+    first = {a: world.actors[a].play.specs[0] for a in world.actors}
+    assert first["a1"].seed != first["a2"].seed
+
+
+async def test_a_partial_bundle_without_its_manifest_is_ignored(world, tmp_path):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 1)
+    folder_id = next(iter(a.orch.xport.queue))
+    link = ActorLink(world.store, a.cfg.transport)
+    link.ship("a1", a.root / "games" / folder_id, 1, "bot")
+    (world.store.root / "games" / "a1" / f"{folder_id}.json").unlink()  # the upload died before the marker
+    await world.learner.orch.xport.run_all()
+    assert world.learner.credit.games == [] and world.learner.orch.counts["remote_credited"] == 0
+    (world.store.root / "games" / "a1" / "junk.json").write_text("{not json")
+    await world.learner.orch.xport.run_all()
+    assert world.learner.credit.games == []
+
+
+async def test_a_bundle_whose_sha_does_not_match_is_rejected_and_not_retried_forever(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 1)
+    await a.orch.xport.run_all()
+    bad, good = sorted((world.store.root / "games" / "a1").glob("*.tgz"))
+    manifest = json.loads(bad.with_suffix(".json").read_text())
+    bad.write_bytes(b"x" * manifest["size"])  # the right length, the wrong bytes
+    for _ in range(5):
+        await world.learner.orch.xport.run_all()
+    assert world.learner.credit.games == [good.stem] and world.learner.orch.counts["remote_rejected"] == 1
+    assert world.learner.orch.xport.status(world.clock())["dropped"] == {"rejected": 1}
+
+
+async def test_a_game_pinned_to_a_version_too_far_behind_is_dropped_and_counted(world, tmp_path):
+    await bring_up(world, version=10)
+    folder = tmp_path / "made" / "r1-a1-g000900"
+    folder.mkdir(parents=True)
+    (folder / "results.json").write_text(json.dumps({"spec": {"game_id": folder.name}}))
+    link = ActorLink(world.store, world.actors["a1"].cfg.transport, world.clock)
+    link.ship("a1", folder, 6, "bot")  # lag 4 against max_version_lag 3
+    folder2 = tmp_path / "made" / "r1-a1-g000901"
+    shutil.copytree(folder, folder2)
+    (folder2 / "results.json").write_text(json.dumps({"spec": {"game_id": folder2.name}}))
+    link.ship("a1", folder2, 7, "bot")  # lag 3: still trained on
+    await world.learner.orch.xport.run_all()
+    assert world.learner.credit.games == ["r1-a1-g000901"]
+    assert world.learner.orch.counts["remote_stale"] == 1
+    assert world.learner.orch.xport.status(world.clock())["dropped"] == {"stale": 1}
+    assert not (world.learner.root / "remote" / "a1" / "r1-a1-g000900").exists()  # not even downloaded
+
+
+async def test_a_new_adapter_version_reaches_the_actors_and_their_new_games_pin_it(world):
+    await bring_up(world, version=1)
+    a = world.actors["a1"]
+    await play_games(a, 2)
+    assert {base.policy_version(s) for s in a.play.specs} == {1}
+    base.publish(world.learner.root, 2)
+    await world.learner.orch.refresh_serving()
+    await world.learner.orch.xport.run_all()
+    assert get_json(world.store, "current.json")["version"] == 2 and world.store.exists("adapters/v2/READY")
+    await a.orch.xport.run_all()
+    await a.orch.refresh_serving()
+    assert a.orch.current == 2 and (a.root / "adapters" / "v2" / "manifest.json").is_file()
+    before = len(a.play.specs)
+    await play_games(a, a.orch.counts["train_finished"] + 2)
+    assert {base.policy_version(s) for s in a.play.specs[before:]} == {2}
+    await a.orch.xport.beat_pass()
+    assert get_json(world.store, "actors/a1.json")["version"] == 2
+
+
+async def test_the_learner_publishes_each_current_version_once(world):
+    await bring_up(world, version=1)
+    puts = []
+    original = world.store.put
+    world.store.put = lambda key, src: (puts.append(key), original(key, src))[1]
+    await world.learner.orch.xport.run_all()
+    assert not [k for k in puts if k.startswith("adapters/")]  # v1 is already there
+    assert world.learner.orch.counts["published"] == 1
+
+
+async def test_actors_do_not_start_games_before_the_learner_has_published_a_pulse(world):
+    a = world.actors["a1"]
+    a.orch.xport.start()
+    await a.orch.xport.run_all()
+    await a.orch.refresh_serving()
+    a.orch.fill()
+    assert a.play.specs == [] and not a.orch.xport.ready
+    world.learner.orch.xport.start()
+    await a.orch.xport.run_all()
+    a.orch.fill()
+    await base.until(lambda: len(a.play.specs) == 2)  # concurrency 2, at the base model
+
+
+async def test_the_heartbeats_become_the_actors_block_of_status_json(world):
+    await bring_up(world)
+    for a in world.actors.values():
+        await play_games(a, 2)
+        await a.orch.xport.run_all()
+    learner = world.learner
+    await learner.orch.xport.run_all()
+    learner.orch.check_budget(world.clock())
+    status = json.loads((learner.root / "orchestrator" / "status.json").read_text())
+    members = status["actors"]["members"]
+    assert set(members) == {"a1", "a2"} and members["a1"]["state"] == "alive" and members["a1"]["version"] == 1
+    assert members["a1"]["games_done"] >= 2 and members["a1"]["lag"] == 0
+    world.clock.t += 11 * 60  # actor_stale_minutes is 10
+    await learner.orch.xport.run_all()
+    status = learner.orch.xport.status(world.clock())
+    assert {m["state"] for m in status["members"].values()} == {"stale"}
+    assert set(learner.orch.alarms) == {"actor:a1", "actor:a2"}
+
+
+async def test_the_budget_counts_every_actors_box_hours_and_frontier_spend(world):
+    learner = world.learner
+    learner.orch.xport.start()
+    link = ActorLink(world.store, world.actors["a1"].cfg.transport, world.clock)
+    now = world.clock()
+    beat = {"time": now, "version": 0, "box_hours": 6.0, "box_usd_per_hour": 10.0, "model_usd": 5.0, "in_flight": 0}
+    link.heartbeat("a1", beat)
+    link.heartbeat("a2", {**beat, "box_hours": 2.0, "box_usd_per_hour": 15.0, "model_usd": 0.0})
+    await learner.orch.xport.run_all()
+    spent = learner.orch.check_budget(now)
+    assert spent.box_usd == pytest.approx(60 + 30) and spent.model_usd == pytest.approx(5)
+    assert learner.orch.stop_reason is None  # 95 of 100
+    link.heartbeat("a1", {**beat, "box_hours": 6.6})
+    await learner.orch.xport.run_all()
+    learner.orch.check_budget(now)
+    assert learner.orch.stop_reason and learner.orch.stop_reason.startswith("budget:")
+
+
+async def test_an_actor_that_went_quiet_keeps_costing_for_the_stale_window_only(world):
+    learner = world.learner
+    learner.orch.xport.start()
+    now = world.clock()
+    ActorLink(world.store, learner.cfg.transport, world.clock).heartbeat(
+        "a1", {"time": now, "box_hours": 1.0, "box_usd_per_hour": 10.0, "model_usd": 0.0}
+    )
+    await learner.orch.xport.run_all()
+    world.clock.t += 3600
+    assert learner.orch.xport.spend_extra(world.clock())[0] == pytest.approx(10 + 10 * 10 / 60)
+    ActorLink(world.store, learner.cfg.transport, world.clock).heartbeat(
+        "a1", {"time": now, "box_hours": 1.0, "box_usd_per_hour": 10.0, "final": True}
+    )
+    await learner.orch.xport.run_all()
+    assert learner.orch.xport.spend_extra(world.clock())[0] == pytest.approx(10)
+
+
+async def test_stop_json_drains_the_actors_which_ship_their_games_and_power_off(tmp_path, monkeypatch):
+    store, clock = LocalStore(tmp_path / "bucket"), base.Clock()
+    w = SimpleNamespace(store=store, clock=clock)
+    w.learner = node(tmp_path, monkeypatch, store, clock, "learner", "learner")
+    w.actors = {"a1": node(tmp_path, monkeypatch, store, clock, "a1", "actor", shutdown=True)}
+    await bring_up(w)
+    a = w.actors["a1"]
+    a.play.hold()
+    a.orch.fill()
+    await base.until(lambda: len(a.play.specs) == 2)
+    await w.learner.orch.finish("complete")
+    stop = get_json(store, "stop.json")
+    assert stop["reason"] == "complete" and stop["by"] == "learner" and w.learner.orch.xport.closing
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason == "transport: stop requested by learner: complete"
+    asyncio.get_running_loop().call_later(0.05, a.play.release)
+    await a.orch.finish(a.orch.stop_reason)
+    assert a.orch.counts["train_finished"] == 2 and a.orch.counts["train_stopped"] == 0  # drained, not cancelled
+    assert a.orch.xport.unshipped() == 0 and len(list((store.root / "games" / "a1").glob("*.json"))) == 2
+    final = get_json(store, "actors/a1.json")
+    assert final["final"] is True and final["unshipped"] == 0
+    assert a.powered == [True]
+
+
+async def test_a_stop_json_older_than_the_actor_is_not_for_it(world):
+    put_json(world.store, "stop.json", {"reason": "an earlier run", "by": "learner", "time": world.clock() - 3600})
+    await bring_up(world)  # the learner's start removes it too; put it back for the actor to read
+    put_json(world.store, "stop.json", {"reason": "an earlier run", "by": "learner", "time": world.clock() - 3600})
+    a = world.actors["a1"]
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason is None
+    put_json(world.store, "stop.json", {"reason": "by hand", "by": "human", "time": world.clock()})
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason == "transport: stop requested by human: by hand"
+
+
+async def test_a_learner_that_goes_stale_stops_the_actors(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    world.clock.t += 14 * 60
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason is None  # learner_stale_minutes is 15
+    world.clock.t += 2 * 60
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason.startswith("transport: the learner's pulse is 16 min old")
+    await world.learner.orch.xport.run_all()  # the learner is back: a pulse, but the actor has stopped
+    assert a.orch.stop_reason.startswith("transport: the learner's")
+
+
+async def test_an_actor_started_with_no_learner_gives_up_after_the_stale_window(world):
+    a = world.actors["a1"]
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason is None
+    world.clock.t += 16 * 60
+    await a.orch.xport.run_all()
+    assert a.orch.stop_reason == "transport: no learner has published a pulse"
+
+
+async def test_a_restarted_learner_does_not_ingest_again(world, tmp_path, monkeypatch):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 2)
+    await a.orch.xport.run_all()
+    await world.learner.orch.xport.run_all()
+    credited = sorted(world.learner.credit.games)
+    assert credited
+    put_json(world.store, "stop.json", {"reason": "x", "by": "learner", "time": world.clock()})
+    again = node(tmp_path, monkeypatch, world.store, world.clock, "learner", "learner")
+    again.orch.current = 1
+    again.orch.xport.start()
+    assert not world.store.exists("stop.json")  # a new learner process is a new go-ahead
+    await again.orch.xport.run_all()
+    assert (
+        sorted(again.credit.games) == credited and again.orch.counts["remote_credited"] == 0
+    )  # restored, not added to
+    assert again.orch.xport.status(world.clock())["ingested"] == len(credited)
+
+
+async def test_a_game_credited_before_a_crash_could_record_it_is_not_credited_twice(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 1)
+    await a.orch.xport.run_all()
+    game_id = next(iter(a.orch.xport.shipped))
+    inbox = world.learner.root / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / f"{game_id}.jsonl").write_text("{}\n")  # rows written, ingested.json never saved
+    await world.learner.orch.xport.run_all()
+    assert game_id not in world.learner.credit.games
+
+
+async def test_a_failed_upload_is_retried_with_backoff_and_the_game_is_not_lost(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    failing = {"on": True}
+    original = world.store.put
+
+    def put(key, src):
+        if failing["on"] and key.startswith("games/"):
+            raise StoreError("the endpoint is unreachable")
+        original(key, src)
+
+    world.store.put = put
+    await play_games(a, 1)
+    await a.orch.xport.run_all()
+    queued = a.orch.xport.unshipped()
+    assert queued >= 1 and "unreachable" in a.orch.xport.last_error and a.orch.counts["ship_failed"] >= 1
+    failed = a.orch.counts["ship_failed"]
+    await a.orch.xport.ship_pass()
+    assert a.orch.counts["ship_failed"] == failed  # still inside the backoff
+    failing["on"] = False
+    world.clock.t += 6
+    await a.orch.xport.ship_pass()
+    assert a.orch.xport.unshipped() == 0 and a.orch.counts["shipped"] == queued
+    await a.orch.xport.beat_pass()
+    assert get_json(world.store, "actors/a1.json")["unshipped"] == 0
+
+
+async def test_an_actor_that_cannot_ship_stays_up_when_it_finishes(world, tmp_path, monkeypatch):
+    store, clock = world.store, world.clock
+    a = node(tmp_path, monkeypatch, store, clock, "a3", "actor", shutdown=True, sync_retry_s=0)
+    await bring_up(world)
+    a.orch.xport.start()
+    await a.orch.xport.run_all()
+    await a.orch.refresh_serving()
+    store.put = lambda key, src: (_ for _ in ()).throw(StoreError("down")) if key.startswith("games/") else None
+    await play_games(a, 1)
+    await a.orch.finish("duration")
+    assert a.powered == [] and "unshipped" in a.orch.alarms
+    assert json.loads((a.root / "orchestrator" / "final.json").read_text())["unshipped"] >= 1
+
+
+async def test_a_shipped_game_leaves_the_actors_disk_but_a_failed_one_stays(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 2)
+    await a.orch.xport.run_all()
+    assert not list((a.root / "games").glob("*/results.json"))
+    assert a.orch.xport.unshipped() == 0
+
+
+async def test_an_actor_learns_nothing_and_has_no_inbox_or_panels(world):
+    await bring_up(world)
+    a = world.actors["a1"]
+    await play_games(a, 2)
+    assert not (a.root / "inbox").exists() and not (a.root / "panels").exists() and a.orch.counts["rows"] == 0
+    assert not a.orch.learner and a.orch.hard is None
+
+
+async def test_the_cli_reads_and_stops(world, capsys):
+    from agentenv_zeroad.train import transport
+
+    await bring_up(world)
+    uri = f"file://{world.store.root}"
+    await world.actors["a1"].orch.xport.beat_pass()
+    assert transport.main(["status", "--uri", uri]) == 0
+    out = capsys.readouterr().out
+    assert '"version": 1' in out and "a1: v1" in out
+    assert transport.main(["stop", "--uri", uri, "--reason", "enough"]) == 0
+    assert get_json(world.store, "stop.json")["reason"] == "enough"
