@@ -12,6 +12,8 @@
 # The power-off terminates the box (and deletes its volume) unless --shutdown-behavior stop (or LIVE_SHUTDOWN_BEHAVIOR):
 # then it only stops, the disk stays (billed as storage) and `aws ec2 start-instances` brings it back, which a training
 # run wants: its power-off at MAX_HOURS must not destroy results that were not yet copied out.
+# The types are LIVE_GPU_TYPES whatever they are: a CPU box (the S1 tool check, live/s1.env.example) lists CPU types
+# there, and sets LIVE_AMI_SSM_PARAM to the public SSM parameter of a plain Ubuntu 24.04 AMI instead of the GPU one.
 # shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
 parse_mode change "$@"
@@ -69,9 +71,9 @@ if [ -n "$id" ] && [ "$id" != None ]; then
   log "$NAME is already up as $id"
 else
   id=
-  ami=$(aws_run ami-DLAMI-PLACEHOLDER ssm get-parameter \
-    --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id \
-    --query Parameter.Value --output text)
+  ami_param=${LIVE_AMI_SSM_PARAM:-/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id}
+  ami=$(aws_run "$([ -z "${LIVE_AMI_SSM_PARAM:-}" ] && echo ami-DLAMI-PLACEHOLDER || echo ami-PLACEHOLDER)" ssm get-parameter \
+    --name "$ami_param" --query Parameter.Value --output text)
   # The boothook only records the absolute deadline and installs zeroad-poweroff.service, which arms the power-off after
   # systemd-logind on every boot: a `shutdown -h` from the boothook itself runs before logind can take it and is lost.
   userdata=$(sed "s/@DEADLINE@/$(( $(date +%s) + MAX_HOURS * 3600 ))/" "$LIVE_DIR/lib/poweroff-boothook.sh" | base64 | tr -d '\n')

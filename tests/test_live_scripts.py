@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -158,6 +159,11 @@ CHANGE_SCRIPTS = [
     ("train.sh", ID, "start", str(LIVE / "train-run.example.toml")),
     ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "--play-only"),
     ("train.sh", ID, "stop"),
+    ("bootstrap.sh", ID, "--cpu"),
+    ("bootstrap.sh", ID, "--cpu", "--images", "build"),
+    ("s1.sh", ID, "start"),
+    ("s1.sh", ID, "start", "--n", "10", "--replays", "5", "--wall-hours", "1.5", "--engines", "20"),
+    ("s1.sh", ID, "fetch"),
 ]
 
 
@@ -178,6 +184,7 @@ def test_every_script_that_changes_anything_is_a_dry_run_without_yes_and_calls_n
         ("health.sh", ID, "--dry-run"),
         ("pilot.sh", ID, "status", "--dry-run"),
         ("train.sh", ID, "status", "--dry-run"),
+        ("s1.sh", ID, "status", "--dry-run"),
     ],
 )
 def test_the_read_only_scripts_plan_with_dry_run_and_call_no_aws(stubs, cmd):
@@ -246,6 +253,17 @@ def test_launch_tries_the_next_subnet_when_one_has_no_capacity(stubs):
         ("train.sh", ID, "start", "/no/such/config.toml"),
         ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "bad arg"),
         ("train.sh", ID, "stop", "--now"),
+        ("bootstrap.sh", ID, "--cpu", "--pilot"),
+        ("bootstrap.sh", ID, "--cpu", "--train"),
+        ("s1.sh", ID, "go"),
+        ("s1.sh", ID, "start", "--n", "0"),
+        ("s1.sh", ID, "start", "--replays", "x"),
+        ("s1.sh", ID, "start", "--wall-hours", "0"),
+        ("s1.sh", ID, "start", "--engines", "0"),
+        ("s1.sh", ID, "start", "--bogus"),
+        ("s1.sh", ID, "status", "1", "2"),
+        ("s1.sh", ID, "fetch", "extra"),
+        ("s1.sh", "not-an-id", "start"),
     ],
     ids=" ".join,
 )
@@ -1413,3 +1431,284 @@ def test_the_train_run_stops_the_learner_container_when_it_is_stopped_too():
     text = (BOX / "train-run.sh").read_text()
     assert "trap ':' TERM" in text and "trap stop_learner EXIT" in text
     assert text.count("docker stop -t 60 zeroad-learner") == 1  # in the trap's function, not after the orchestrator
+
+
+# ---- the S1 tool-check box: CPU types on a plain Ubuntu AMI, the CPU bootstrap, live/s1.sh, box/s1.sh ----------------
+S1_ENV = LIVE / "s1.env.example"
+
+
+def s1_stubs(stubs, extra: str = ""):
+    env_file = stubs["tmp"] / "s1.env"
+    env_file.write_text(
+        S1_ENV.read_text()
+        + "LIVE_INSTANCE_PROFILE=zeroad-box\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+        + "LIVE_SUBNETS='subnet-a subnet-b'\nLIVE_SECURITY_GROUP=sg-1\n"
+        + extra
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    return stubs
+
+
+def test_the_s1_env_example_is_a_cpu_box_on_the_plain_ubuntu_ami_with_a_rate_for_every_type(stubs):
+    env = dict(line.split("=", 1) for line in S1_ENV.read_text().splitlines() if re.match(r"^[A-Z0-9_]+=", line))
+    types = env["LIVE_GPU_TYPES"].strip('"').split()
+    rates = dict(pair.split("=") for pair in env["LIVE_GPU_RATES"].strip('"').split())
+    assert rates == {"c7i.12xlarge": "2.142", "c6a.12xlarge": "1.836", "c7a.12xlarge": "2.463"}
+    assert types == list(rates) and env["LIVE_BOX_USD_PER_HOUR"] == rates[types[0]]
+    assert (env["LIVE_REQUIRE_RATE"], env["LIVE_MAX_HOURS"], env["LIVE_BUDGET_USD"]) == ("1", "4", "15")
+    assert env["LIVE_SHUTDOWN_BEHAVIOR"] == "stop" and env["LIVE_TAG_PURPOSE"] == "zeroad-s1"
+    out = run(s1_stubs(stubs), "launch.sh", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "one of [c7i.12xlarge c6a.12xlarge c7a.12xlarge], about $2.142/h" in plan
+    assert "powers off (stop) after 4 h" in plan and "at most about $8.57" in plan
+    assert "--instance-type c7i.12xlarge" in plan
+    ami = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+    assert f"aws ssm get-parameter --name {ami}" in plan
+    assert "deeplearning" not in plan and "nvidia" not in plan.lower()
+    assert "Key=purpose,Value=zeroad-s1" in plan and "--instance-initiated-shutdown-behavior stop" in plan
+
+
+def test_the_default_launch_still_asks_for_the_gpu_ami_and_a_configured_one_replaces_it(stubs):
+    plan = run(stubs, "launch.sh", forbid_aws=True).stderr
+    assert "base-oss-nvidia-driver-gpu-ubuntu-22.04" in plan and "--image-id ami-DLAMI-PLACEHOLDER" in plan
+    plan = run(stubs, "launch.sh", extra={"LIVE_AMI_SSM_PARAM": "/my/ami"}, forbid_aws=True).stderr
+    assert "ssm get-parameter --name /my/ami " in plan and "--image-id ami-PLACEHOLDER" in plan
+    assert "deeplearning" not in plan
+
+
+def test_an_s1_launch_that_falls_back_to_the_next_cpu_type_is_tagged_with_that_types_rate(stubs):
+    rules = launch_rules(
+        ["run-instances&&c7i.12xlarge", "", 254], ["run-instances&&c6a.12xlarge", "i-00000000000000004\n", 0]
+    )
+    out = run(s1_stubs(stubs), "launch.sh", "--yes", extra={"STUB_AWS_RULES": rules})
+    assert out.returncode == 0, out.stderr
+    runs = [c["argv"] for c in aws_calls(stubs) if "run-instances" in c["argv"]]
+    assert [a[a.index("--instance-type") + 1] for a in runs] == ["c7i.12xlarge", "c6a.12xlarge"]
+    tags = runs[-1][runs[-1].index("--tag-specifications") + 1]
+    assert "Key=zeroad-box-usd-per-hour,Value=1.836" in tags and "Key=zeroad-instance-type,Value=c6a.12xlarge" in tags
+    assert "costs $1.836/h, not the $2.142/h" in out.stderr
+    ami = next(c["argv"] for c in aws_calls(stubs) if "get-parameter" in c["argv"])
+    assert "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id" in ami
+
+
+GPU_WORDS = ("nvidia", "xserver", "xorg", "ffmpeg", "mediamtx", "vllm", "zeroad-x", "zeroad-relay", "hidepid", "shim")
+
+
+def cpu_bootstrap(*args):
+    return subprocess.run(
+        ["bash", str(BOX / "cpu-bootstrap.sh"), "https://payload", "https://repo", *args],
+        env={**os.environ, "DRY_RUN": "1"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_the_cpu_bootstrap_installs_docker_uv_the_engine_image_and_the_timer_and_no_gpu_steps():
+    out = cpu_bootstrap("--images", "build")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    assert not [w for w in GPU_WORDS if w in text.lower()]
+    assert "docker.io" in text and "astral.sh/uv/" in text and "uv sync --project" in text
+    assert "scripts/build-engine.sh" in text
+    assert "docker run --rm zeroad-engine:0.28 test -x /usr/games/pyrogenesis" in text
+    assert "zeroad-boxtime.timer" in text and "zeroad-live.conf" in text
+    assert text.index("docker.io") < text.index("build-engine.sh") < text.index("zeroad-boxtime.timer")
+    assert "cpu bootstrap done" in text
+
+
+def test_the_cpu_bootstrap_can_pull_the_engine_image_instead_of_building_it():
+    out = cpu_bootstrap("--images", "pull", "--registry", "reg.example/zeroad", "--tag", "v2")
+    text = out.stdout.replace("\\", "")
+    assert out.returncode == 0, out.stderr
+    assert "docker pull reg.example/zeroad/zeroad-engine:v2" in text
+    assert "docker tag reg.example/zeroad/zeroad-engine:v2 zeroad-engine:0.28" in text
+    assert "build-engine.sh" not in text
+    assert cpu_bootstrap("--images", "pull").returncode == 2
+    assert cpu_bootstrap("--images", "rsync").returncode == 2
+    assert cpu_bootstrap("--bogus").returncode == 2
+
+
+def test_the_existing_bootstrap_still_checks_the_gpu_and_the_cpu_mode_is_a_separate_script(stubs):
+    gpu = run_box(stubs, "bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1").stdout
+    assert "nvidia-smi" in gpu and "xserver-xorg-core" in gpu and "mediamtx" in gpu and "zeroad-x" in gpu
+    out = run(s1_stubs(stubs), "bootstrap.sh", ID, "--cpu", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "box/cpu-bootstrap.sh https://PRESIGNED-payload-url https://PRESIGNED-repo-url --images build" in plan
+    assert "on the box, box/cpu-bootstrap.sh would" in plan and "nvidia" not in plan.lower()
+    assert "Next: live/s1.sh" in plan
+    pull_env = "LIVE_IMAGES=pull\nLIVE_IMAGE_REGISTRY=reg.example/z\nLIVE_IMAGE_TAG=t1\n"
+    pull = run(s1_stubs(stubs, pull_env), "bootstrap.sh", ID, "--cpu", forbid_aws=True)
+    assert "--images pull --registry reg.example/z --tag t1" in pull.stderr
+
+
+def test_the_s1_start_plan_picks_and_packs_the_specs_sends_them_and_starts_the_batch_with_the_budget(stubs):
+    out = run(s1_stubs(stubs), "s1.sh", ID, "start", "--engines", "44", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "600 bot games, 80 replay games from 40 pilot games" in plan
+    assert "at most 2.5 h" in plan and "against $15" in plan
+    assert "scripts/s1_specs.py" in plan and "--n 40 --petra-only --delay-ms 5000" in plan
+    assert "agentenv_zeroad.s1_batch package" in plan and "live/fetched/pilot-final" in plan
+    assert "aws s3 cp" in plan and "s3://bucket-1/zeroad-s1/s1/inputs-" in plan and "aws s3 presign" in plan
+    assert plan.index("put-inputs") < plan.index("s1.sh start --n 100 --wall-hours 2.5 --engines 44 --budget 15")
+    assert "box/s1.sh put-inputs https://PRESIGNED-inputs-url" in plan
+    assert "systemd-run --unit zeroad-s1" in plan and "RuntimeMaxSec=9600" in plan
+    assert "s1-run.sh --n 100 --wall-s 9000 --engines 44" in plan.replace("\\", "")
+    assert "litellm" not in plan.lower()  # no model, no key
+    assert not stubs["log"].exists()
+
+
+def test_the_s1_batch_size_comes_from_the_env_and_the_flags_override_it(stubs):
+    s1_stubs(stubs, "LIVE_S1_PER_CELL=10\nLIVE_S1_REPLAYS=5\nLIVE_S1_WALL_HOURS=1\nLIVE_S1_ENGINES=20\n")
+    plan = run(stubs, "s1.sh", ID, "start", forbid_aws=True).stderr
+    assert "60 bot games, 10 replay games from 5 pilot games" in plan and "--n 5 --petra-only" in plan
+    assert "s1.sh start --n 10 --wall-hours 1 --engines 20 --budget 15" in plan
+    plan = run(stubs, "s1.sh", ID, "start", "--n", "7", "--wall-hours", "2", forbid_aws=True).stderr
+    assert "--n 7 --wall-hours 2 --engines 20" in plan
+
+
+def test_a_wall_clock_limit_that_leaves_no_hour_for_bootstrap_and_fetch_is_refused(stubs):
+    out = run(s1_stubs(stubs), "s1.sh", ID, "start", "--wall-hours", "3.5", forbid_aws=True)
+    assert out.returncode != 0 and "less than an hour for the bootstrap and the fetch" in out.stderr
+    assert run(stubs, "s1.sh", ID, "start", "--wall-hours", "3", forbid_aws=True).returncode == 0
+
+
+def test_an_s1_batch_whose_wall_clock_would_pass_the_budget_is_refused_by_the_box_check(stubs):
+    out = run(s1_stubs(stubs, "LIVE_BUDGET_USD=4\n"), "s1.sh", ID, "start", forbid_aws=True)
+    assert out.returncode != 0 and "REFUSED: $5.35 would pass the $4 budget" in out.stderr
+    assert "systemd-run" not in out.stderr
+
+
+def test_the_s1_status_and_fetch_plans(stubs):
+    s1_stubs(stubs)
+    status = run(stubs, "s1.sh", ID, "status", "--dry-run", forbid_aws=True).stderr
+    assert "box/s1.sh status" in status and "games.jsonl per phase" in status
+    out = run(stubs, "s1.sh", ID, "fetch", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "DRY RUN (fetch.sh)" in plan and "box/fetch.sh https://PRESIGNED-PUT-url  s1/out" in plan
+    assert "aws s3 cp s3://bucket-1/zeroad-s1/fetch/" in plan and "live/fetched/s1-<time>/" in plan
+
+
+def test_s1_fetch_unpacks_the_results_into_a_folder_of_its_own_and_prints_the_summary(stubs, tmp_path):
+    if not shutil.which("zstd"):
+        pytest.skip("zstd is needed to build and unpack the archive")
+    s1_stubs(stubs)
+    src = tmp_path / "src" / "s1" / "out"
+    (src / "calibration").mkdir(parents=True)
+    (src / "s1-summary.txt").write_text("S1 gates\noverall: PASS\n")
+    (src / "calibration" / "calibration.json").write_text("{}")
+    (tmp_path / "src" / "spend.jsonl").write_text("")
+    archive = tmp_path / "fixture.tar.zst"
+    subprocess.run(f"tar -C {tmp_path / 'src'} -cf - . | zstd -q > {archive}", shell=True, check=True)
+    fake_aws = f"""\
+#!{sys.executable}
+import json, shutil, sys
+argv = sys.argv[1:]
+if argv[:2] == ["s3", "cp"]:
+    shutil.copy("{archive}", argv[3] + argv[2].rsplit("/", 1)[1])
+elif "send-command" in argv:
+    print("cmd-1")
+elif "get-command-invocation" in argv:
+    print("Success" if "--query" in argv else json.dumps({{"StandardOutputContent": "uploaded 3 paths\\n"}}))
+"""
+    write_exe(stubs["bin"] / "aws", fake_aws)
+    write_exe(stubs["bin"] / "uv", "#!/bin/sh\necho https://presigned.example/put\n")  # fetch.sh's boto3 presign
+    fetched = tmp_path / "fetched"
+    env = {"LIVE_FETCHED_DIR": str(fetched), "AWS_ACCESS_KEY_ID": "x", "AWS_SECRET_ACCESS_KEY": "y"}
+    out = run(stubs, "s1.sh", ID, "fetch", "--yes", extra=env)
+    assert out.returncode == 0, out.stderr
+    [folder] = [p for p in fetched.iterdir() if p.is_dir()]
+    assert folder.name.startswith("s1-") and (folder / "s1" / "out" / "s1-summary.txt").is_file()
+    assert "overall: PASS" in out.stdout and f"live/fetched/{folder.name}/s1/out" in out.stderr
+    assert "live/teardown.sh" in out.stderr
+
+
+def test_the_box_takes_the_s1_inputs_only_from_an_https_url_and_refuses_them_while_a_batch_runs(box_stubs):
+    out = run_box(box_stubs, "s1.sh", "put-inputs", "file:///etc/passwd", DRY_RUN="0")
+    assert out.returncode != 0 and "needs an https URL" in out.stderr
+    units = json.dumps({"zeroad-s1": "active"})
+    out = run_box(box_stubs, "s1.sh", "put-inputs", "https://x/in.tgz", DRY_RUN="0", STUB_UNITS=units)
+    assert out.returncode != 0 and "a batch is running" in out.stderr
+
+
+def start_s1(stubs, *args, units=None, inputs=True, **extra):
+    state = stubs["tmp"] / "state"
+    if inputs:
+        (state / "s1" / "inputs" / "specs").mkdir(parents=True, exist_ok=True)
+    clock = {"ZEROAD_NOW_EPOCH": "1800000000", "ZEROAD_BOOT_EPOCH": "1800000000"}
+    return run_box(
+        stubs, "s1.sh", "start", *args, "--budget", "15", DRY_RUN="0",
+        STUB_UNITS=json.dumps(units or {}), **clock, **extra,
+    )  # fmt: skip
+
+
+def test_the_s1_batch_starts_in_its_own_unit_with_a_hard_stop_and_a_second_is_refused(box_stubs):
+    out = start_s1(box_stubs, "--n", "10", "--wall-hours", "2", "--engines", "44")
+    assert out.returncode == 0, out.stderr
+    [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert "--unit zeroad-s1" in call and "KillMode=control-group" in call and "RuntimeMaxSec=7800" in call
+    assert "After=network-online.target docker.service" in call
+    assert call.endswith("s1-run.sh --n 10 --wall-s 7200 --engines 44")
+    assert start_s1(box_stubs, units={"zeroad-s1": "active"}).returncode != 0
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_the_s1_batch_is_refused_without_inputs_over_the_budget_and_moves_an_earlier_out_aside(box_stubs):
+    out = start_s1(box_stubs, inputs=False)
+    assert out.returncode != 0 and "no inputs" in out.stderr
+    out = start_s1(box_stubs, "--wall-hours", "20")  # 20 h at $1.32 is $26.40 against $15
+    assert out.returncode != 0 and "REFUSED" in out.stdout
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    old = box_stubs["tmp"] / "state" / "s1" / "out"
+    old.mkdir(parents=True)
+    (old / "progress.log").write_text("earlier")
+    assert start_s1(box_stubs).returncode == 0
+    assert not old.exists() and list(old.parent.glob("out-*"))
+
+
+def test_the_s1_run_plans_the_phases_in_order_each_under_its_own_limit_with_a_pool_sized_in_workers(stubs):
+    out = run_box(stubs, "s1-run.sh", "--n", "100", "--wall-s", "9000", "--engines", "44", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout
+    order = [
+        "agentenv_zeroad.s1_batch build", "phase replay starts (limit 1500s)", "phase calibration starts (limit 3000s)",
+        "phase bot starts (limit 8820s)", "scripts/s1_summary.py",
+    ]  # fmt: skip
+    positions = [text.index(item) for item in order]
+    assert positions == sorted(positions)
+    runner = [line for line in text.splitlines() if "agentenv_zeroad.train.runner" in line]
+    assert len(runner) == 2
+    assert all("--engines 44 --concurrency 11 --workers 4" in line and "timeout -k 30" in line for line in runner)
+    assert "specs/replay.jsonl" in runner[0] and "specs/bot.jsonl" in runner[1]
+    assert "agentenv_zeroad.s1_calibrate --out" in text and "--level-timeout-s 800" in text
+    summary = text.split("scripts/s1_summary.py")[1]
+    assert "--calibration" in summary and "--out" in summary
+    assert "litellm" not in text.lower() and "vllm" not in text.lower()
+
+
+def test_a_batch_with_no_time_left_skips_its_phases_and_still_writes_the_summary(stubs):
+    out = run_box(stubs, "s1-run.sh", "--n", "10", "--wall-s", "100", "--engines", "8", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.count("skipped") == 3 and "agentenv_zeroad.train.runner" not in out.stdout
+    assert "scripts/s1_summary.py" in out.stdout
+    assert run_box(stubs, "s1-run.sh", "--n", "10", DRY_RUN="1").returncode != 0
+
+
+def test_a_failed_phase_is_logged_and_the_batch_goes_on_to_the_summary_and_marks_itself_done(stubs):
+    log = stubs["tmp"] / "uv.log"
+    write_exe(stubs["bin"] / "timeout", '#!/bin/sh\nshift 3\nexec "$@"\n')  # GNU timeout, not on every machine
+    write_exe(stubs["bin"] / "docker", "#!/bin/sh\nexit 0\n")
+    write_exe(stubs["bin"] / "uv", f'#!/bin/sh\necho "$*" >> {log}\ncase "$*" in *s1_calibrate*) exit 3 ;; esac\n')
+    out = run_box(stubs, "s1-run.sh", "--n", "10", "--wall-s", "9000", "--engines", "24", DRY_RUN="0")
+    assert out.returncode == 0, out.stderr
+    calls = log.read_text()
+    assert calls.count("agentenv_zeroad.train.runner") == 2 and "s1_summary.py" in calls and "--workers 2" in calls
+    out_dir = stubs["tmp"] / "state" / "s1" / "out"
+    progress = (out_dir / "progress.log").read_text()
+    assert "phase calibration FAILED (exit 3)" in progress and "phase bot done" in progress
+    assert "S1 batch done" in progress and (out_dir / "DONE").is_file()

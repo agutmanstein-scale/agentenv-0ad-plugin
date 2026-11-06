@@ -33,6 +33,7 @@ from agentenv_zeroad.replay import ReplaySpec
 FOCUS_KINDS = ("replay", "bot")
 POLICY_NAME = re.compile(r"^policy v(\d+)$")
 PETRA_IN_ID = re.compile(r"petra-(\d)")
+PETRA_LABEL = re.compile(r"petra-\d")
 TOWN_PHASES = ("town", "city")
 MINUTE_MS = 60_000
 
@@ -121,16 +122,24 @@ def load_games(root: Path) -> Iterator[Game]:
 
 
 def pick_games(
-    games: Sequence[Game], n: int, *, version: int | None = 0, min_turns: int = 15, seed: int = 0
+    games: Sequence[Game],
+    n: int,
+    *,
+    version: int | None = 0,
+    min_turns: int = 15,
+    seed: int = 0,
+    petra_only: bool = False,
 ) -> list[Game]:
     """`n` games whose policy seat logged at least `min_turns` turns (those of policy `version`, if any), spread
-    over the opponents round-robin; the order within an opponent is shuffled by `seed`."""
+    over the opponents round-robin; the order within an opponent is shuffled by `seed`. With `petra_only`, only
+    games against Petra at a known level (`petra-3`): the ones a replay can set up again without a model seat."""
     pool = [
         g
         for g in games
         if g.focus is not None
         and len(g.results["seats"][g.focus].get("turns") or []) >= min_turns
         and (version is None or g.policy_version == version)
+        and (not petra_only or PETRA_LABEL.fullmatch(g.opponent))
     ]
     by_opponent: dict[str, list[Game]] = defaultdict(list)
     for g in pool:
@@ -252,3 +261,17 @@ def format_summary(metrics: Sequence[GameMetrics]) -> str:
 def _wins(ms: Sequence[GameMetrics]) -> str:
     decided = [m.points for m in ms if m.points is not None]
     return f"{sum(decided) / len(decided):.0%} ({sum(decided):g}/{len(decided)})" if decided else "-"
+
+
+def load_metrics(roots: Sequence[Path]) -> tuple[list[GameMetrics], int]:
+    """The metrics of every game under `roots`, and how many were left out because they did not finish (a failed or
+    cancelled game's results hold what it had when it stopped, which says nothing about the interface)."""
+    metrics: list[GameMetrics] = []
+    excluded = 0
+    for root in roots:
+        for game in load_games(Path(root)):
+            if game.results.get("status", "finished") != "finished":
+                excluded += 1
+            elif (m := game_metrics(game)) is not None:
+                metrics.append(m)
+    return metrics, excluded

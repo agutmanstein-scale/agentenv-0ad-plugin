@@ -39,6 +39,7 @@ print(s3.generate_presigned_url("put_object", Params={"Bucket": bucket, "Key": k
 ' "$LIVE_BUCKET" "$key" "$AWS_REGION")
 fi
 ssm_box "$ID" 3600 fetch.sh "$url" "$NAME" ${ONLY:+"$ONLY"}
-[ "$DRY_RUN" = 1 ] || mkdir -p "$LIVE_DIR/fetched"
-aws_run "" s3 cp "s3://$LIVE_BUCKET/$key" "$LIVE_DIR/fetched/" --only-show-errors
+FETCHED=${LIVE_FETCHED_DIR:-$LIVE_DIR/fetched}  # where the archive lands (tests point it elsewhere)
+[ "$DRY_RUN" = 1 ] || mkdir -p "$FETCHED"
+aws_run "" s3 cp "s3://$LIVE_BUCKET/$key" "$FETCHED/" --only-show-errors
 log "fetched to live/fetched/$(basename "$key") (zstd -d, then tar x)"
