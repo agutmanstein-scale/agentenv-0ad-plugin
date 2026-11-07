@@ -51,15 +51,24 @@ EOF
 ]}
 EOF
   log "role $NAME: AmazonSSMManagedInstanceCore + s3://$LIVE_BUCKET/$PREFIX/$SCOPE/* + $SSM_PREFIX/* parameters; then on $*"
-  aws_run "" iam create-role --role-name "$NAME" --assume-role-policy-document "file://$tmp/trust.json" \
-    --description "zeroad pilot boxes: SSM, the $SSM_PREFIX parameters, the $SCOPE S3 prefix" \
-    --tags "Key=purpose,Value=$PURPOSE" "Key=owner,Value=${LIVE_TAG_OWNER:-${USER:-zeroad}}" --query Role.Arn --output text
+  # Run again for another box (an actor), it finds the role and profile already there and only attaches the box.
+  if [ "$(aws_run absent iam list-roles --query "Roles[?RoleName=='$NAME'].RoleName | [0]" --output text)" = "$NAME" ]; then
+    log "role $NAME exists: updating its policy and attaching the boxes"
+  else
+    aws_run "" iam create-role --role-name "$NAME" --assume-role-policy-document "file://$tmp/trust.json" \
+      --description "zeroad pilot boxes: SSM, the $SSM_PREFIX parameters, the $SCOPE S3 prefix" \
+      --tags "Key=purpose,Value=$PURPOSE" "Key=owner,Value=${LIVE_TAG_OWNER:-${USER:-zeroad}}" --query Role.Arn --output text
+  fi
   aws_run "" iam attach-role-policy --role-name "$NAME" --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
   aws_run "" iam put-role-policy --role-name "$NAME" --policy-name "zeroad-pilot-$SCOPE" --policy-document "file://$tmp/scope.json"
-  aws_run "" iam create-instance-profile --instance-profile-name "$NAME" --tags "Key=purpose,Value=$PURPOSE" \
-    --query InstanceProfile.Arn --output text
-  aws_run "" iam add-role-to-instance-profile --instance-profile-name "$NAME" --role-name "$NAME"
-  [ "$DRY_RUN" = 1 ] || sleep 15  # a new instance profile takes a few seconds before EC2 accepts it
+  if [ "$(aws_run absent iam list-instance-profiles --query "InstanceProfiles[?InstanceProfileName=='$NAME'].InstanceProfileName | [0]" --output text)" = "$NAME" ]; then
+    log "instance profile $NAME exists"
+  else
+    aws_run "" iam create-instance-profile --instance-profile-name "$NAME" --tags "Key=purpose,Value=$PURPOSE" \
+      --query InstanceProfile.Arn --output text
+    aws_run "" iam add-role-to-instance-profile --instance-profile-name "$NAME" --role-name "$NAME"
+    [ "$DRY_RUN" = 1 ] || sleep 15  # a new instance profile takes a few seconds before EC2 accepts it
+  fi
   for id in "$@"; do swap_profile "$id" "$NAME"; done
   log "done. Undo with: LIVE_ENV=$LIVE_ENV live/pilot-iam.sh delete $* $([ "$SCOPE" = run ] && echo --train) --yes"
 else

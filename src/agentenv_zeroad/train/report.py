@@ -94,6 +94,7 @@ def build(
     panels: Path | None = None,
     panel: tuple[str, str] | None = None,
     ledger: Path | None = None,
+    remote: Path | None = None,
     bootstrap: int = 200,
     now: float | None = None,
     calibration: str = CALIBRATION_PANEL,
@@ -106,7 +107,7 @@ def build(
     now = time.time() if now is None else now
     health = read_health(learner)
     published = published_at(learner)
-    played, unfinished = read_games(games, learners)
+    played, unfinished = read_games(games, learners, remote)
     if health:
         start = float(health[0]["time"]) - float(health[0].get("seconds") or 0)
     else:
@@ -190,9 +191,12 @@ def hours_function(published: Mapping[int, float], start: float) -> Callable[[in
     return hours_of
 
 
-def read_games(games: Path, learners: Sequence[str] | None) -> tuple[list[Played], int]:
+def read_games(games: Path, learners: Sequence[str] | None, remote: Path | None = None) -> tuple[list[Played], int]:
+    """The games in `games`, and with `remote` (the learner's ROOT/remote) the games the actor boxes played, which the
+    learner keeps as slim results.json records under remote/ACTOR/GAME."""
     played, unfinished = [], 0
-    for path in sorted(games.glob("*/results.json")):
+    paths = [*games.glob("*/results.json"), *(remote.glob("*/*/results.json") if remote else ())]
+    for path in sorted(paths):
         results = json.loads(path.read_text())
         game = _played(results, path, learners)
         if game is None:
@@ -447,6 +451,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     p.add_argument("--learner", type=Path)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--ledger", type=Path)
+    p.add_argument(
+        "--remote", type=Path, help="the learner's ROOT/remote: games played by actor boxes (default: --learner's)"
+    )
     p.add_argument("--panels", type=Path, help="the orchestrator's ROOT/panels")
     p.add_argument("--panel", help="BASE:OTHER, two panel folder names under --panels")
     p.add_argument("--learner-slot", help="comma-separated learner slots, when the specs do not mark them")
@@ -464,8 +471,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit("--panel BASE:OTHER needs two panel names and --panels")
         panel = (base, other)
     learners = [s for s in a.learner_slot.split(",") if s] if a.learner_slot else None
+    remote = a.remote or (a.learner / "remote" if a.learner and (a.learner / "remote").is_dir() else None)
     report = build(
-        a.games, a.learner, learners=learners, panels=a.panels, panel=panel, ledger=a.ledger, bootstrap=a.bootstrap,
+        a.games, a.learner, learners=learners, remote=remote, panels=a.panels, panel=panel, ledger=a.ledger,
+        bootstrap=a.bootstrap,
         calibration=a.calibration, sft_epochs=a.sft_epochs, sft_panel_prefix=a.sft_panel_prefix,
         min_entropy_ratio=a.min_entropy_ratio, min_sft_games=a.min_sft_games,
     )  # fmt: skip

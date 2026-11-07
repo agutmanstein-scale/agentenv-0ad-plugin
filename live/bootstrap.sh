@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap.sh ID [--images build|pull] [--pilot|--train|--cpu] [--yes|--dry-run]
+# bootstrap.sh ID [--images build|pull] [--pilot|--train|--actor|--cpu] [--yes|--dry-run]
 # Makes box ID a stream box: ships this checkout's HEAD (`git archive`; uncommitted changes don't go) and live/box
 # with the box config from live.env through S3 (presigned, so the box needs no S3 rights), then runs box/bootstrap.sh
 # through SSM: the GPU and driver check, Docker's address pools, Xorg on the L4, ffmpeg, mediamtx, uv, the images
@@ -7,7 +7,9 @@
 # units. Nothing is streamed or played. About 30 min when the images are built. With --pilot it makes a post-training
 # pilot box instead (box/pilot-bootstrap.sh: the headless env, vLLM serving Qwen, the trainer image; no display or
 # stream; about 25 min). With --train it makes a post-training run box (g6e.12xlarge: two vLLM instances on GPU 0 and 1,
-# the learner's GPUs 2 and 3 left free, a log-prob smoke check on both servers; live/train.sh runs the run). With --cpu
+# the learner's GPUs 2 and 3 left free, a log-prob smoke check on both servers; live/train.sh runs the run). With --actor
+# it makes a rollout-actor box for a multi-box run (every GPU serves, one vLLM instance each, the rt engine image, no
+# trainer image, the same power-off check; live/actor.sh runs it, docs/s4-actors.md). With --cpu
 # it makes a CPU box on a plain Ubuntu 24.04 AMI (the S1 tool check, live/s1.sh; box/cpu-bootstrap.sh): no GPU or
 # driver check, no Xorg, ffmpeg, mediamtx or vLLM; Docker, uv, the zeroad-engine image (--images build, about 10 min,
 # or pull zeroad-engine:TAG from LIVE_IMAGE_REGISTRY), the repo and the box-time timer. A dry run unless --yes.
@@ -18,17 +20,19 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 ID=${1:-}; shift || true
 check_instance_id "$ID"
 IMAGES=${LIVE_IMAGES:-build}
-PILOT=0 TRAIN=0 CPU=0
+PILOT=0 TRAIN=0 ACTOR=0 CPU=0
 while [ $# -gt 0 ]; do
   case $1 in
     --images) IMAGES=${2:?--images needs build or pull}; shift 2 ;;
     --pilot) PILOT=1; shift ;;
     --train) PILOT=1 TRAIN=1; shift ;;
+    --actor) PILOT=1 ACTOR=1; shift ;;
     --cpu) CPU=1; shift ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
-[ "$CPU" = 0 ] || [ "$PILOT" = 0 ] || die "--cpu is not combined with --pilot or --train"
+[ "$CPU" = 0 ] || [ "$PILOT" = 0 ] || die "--cpu is not combined with --pilot, --train or --actor"
+[ "$ACTOR" = 0 ] || [ "$TRAIN" = 0 ] || die "--actor and --train are different boxes"
 case $IMAGES in
   build) IMAGE_ARGS=(--images build) ;;
   pull)
@@ -71,7 +75,10 @@ if [ "$CPU" = 1 ]; then
   exit 0
 fi
 if [ "$PILOT" = 1 ]; then
-  if [ "$TRAIN" = 1 ]; then
+  if [ "$ACTOR" = 1 ]; then
+    ssm_box "$ID" 5400 pilot-bootstrap.sh "$payload_url" "$repo_url" --actor
+    log "bootstrapped actor box $ID at $rev. Next: live/train-iam.sh create $ID --yes, then live/actor.sh $ID start CONFIG --yes"
+  elif [ "$TRAIN" = 1 ]; then
     ssm_box "$ID" 5400 pilot-bootstrap.sh "$payload_url" "$repo_url" --train
     log "bootstrapped training box $ID at $rev. Next: live/train-iam.sh create $ID --yes, then live/train.sh $ID start CONFIG --yes"
   else
