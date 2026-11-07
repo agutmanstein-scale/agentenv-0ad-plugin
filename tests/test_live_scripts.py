@@ -145,6 +145,7 @@ CHANGE_SCRIPTS = [
     ("teardown.sh", ID),
     ("grow-disk.sh", ID, "500"),
     ("extend-poweroff.sh", ID, "6"),
+    ("start-box.sh", ID),
     ("fetch.sh", ID),
     ("fetch.sh", ID, "livestream-1"),
     ("fetch.sh", ID, "--only", "rec/zeroad/2026-10-29_01-00-00-000000.mp4"),
@@ -593,6 +594,22 @@ def test_teardown_cancels_a_spot_boxs_persistent_request_before_terminating_it(s
         "wait",
     ]
     assert "sir-0abc" in calls[2]
+
+
+def test_start_box_starts_a_stopped_box_waits_for_ssm_and_checks_its_power_off(stubs):
+    rules = [
+        ["describe-instances", "stopped zeroad-live-onair zeroad-live\n", 0],
+        ["start-instances", "pending\n", 0],
+        ["describe-instance-information", "Online\n", 0],
+        ["send-command", "cmd-1\n", 0],
+        ["get-command-invocation&&Status", "Success\n", 0],
+        ["get-command-invocation", '{"StandardOutputContent": "power-off armed\\n"}', 0],
+    ]
+    out = run(stubs, "start-box.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"})
+    assert out.returncode == 0, out.stderr
+    verbs = [c["argv"][1] for c in aws_calls(stubs)]
+    assert verbs.index("start-instances") < verbs.index("send-command")
+    assert "--resume" in out.stderr
 
 
 @pytest.mark.parametrize("tags", WRONG_TAGS, ids=["wrong-purpose", "wrong-name"])
