@@ -42,7 +42,7 @@ minute = 10.0
 
 [baselines]                # play-only v0: panels, calibration, briefs
 config = "baselines.toml"
-cap_hours = 5.0            # 6 Nov: one orchestrator loop held games to ~216 an hour (a saturated core)
+cap_hours = 6.0            # 6 Nov: one orchestrator loop held games to ~216 an hour (a saturated core)
 expected_hours = 3.9
 min_finished_share = 0.9   # of each panel's games that must have finished
 planned_usd = 110.0        # frontier spend the guard counts ahead: 20 baseline + 16 calibration games at about $2.5-3.5 each (6 Nov)

@@ -503,7 +503,7 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
     S.sequence(ctx)
     assert asked == [
         (0.75, 0),
-        (5.0, 110.0),
+        (6.0, 110.0),
         (0.1, 0),
         (0.5, 0),
         (2.6, 0),
@@ -519,7 +519,7 @@ def test_a_budget_refusal_stops_the_sequence_before_the_step_with_the_guards_wor
     order: list[str] = []
     step_stubs(monkeypatch, {}, order)
     ctx, _ = make_ctx(
-        tmp_path, FakeRunner(), refuse=lambda h, u: "REFUSED: $340.00 would pass the $350 budget" if h > 5 else None
+        tmp_path, FakeRunner(), refuse=lambda h, u: "REFUSED: $340.00 would pass the $350 budget" if h > 6 else None
     )
     verdict, reason = S.sequence(ctx)
     assert verdict == "stopped" and order == list(S.STEPS)[:-1]
