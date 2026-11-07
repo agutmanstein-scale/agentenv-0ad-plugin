@@ -1312,6 +1312,27 @@ async def test_a_stop_records_the_games_in_flight_as_stopped_and_the_panels_and_
     assert not (t.root / "voided").exists()
 
 
+async def test_a_restart_after_a_stop_replays_the_panel_games_the_stop_cancelled_once(tmp_path, monkeypatch):
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "mid", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels, budget_usd=5)
+    publish(t.root, 1)
+    t.play.hold()
+    run = asyncio.create_task(t.orch.run())
+    await until(lambda: len(t.play.specs) == 1)
+    t.clock.t += 3600
+    assert (await asyncio.wait_for(run, 5)).startswith("budget")
+    second = reborn(t)
+    assert [p.game_id for p in second.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert second.counts["panel_replayed_after_stop"] == 1 and second.panels["mid"].remaining == 3
+    second.save_state()
+    third = reborn(t)
+    assert [p.game_id for p in third.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert third.counts["panel_replayed_after_stop"] == 1
+    t.play.release()
+
+
 async def test_a_play_only_run_never_sends_stop_or_waits_for_a_learner(tmp_path, monkeypatch):
     t = make(tmp_path, monkeypatch, budget_usd=1, learner=False)
     t.clock.t += 3600

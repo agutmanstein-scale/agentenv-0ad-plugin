@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
+from agentenv_zeroad.interface import Interface
 from agentenv_zeroad.pilot.games import version_model
 from agentenv_zeroad.scenario import AI_BEHAVIORS
 from agentenv_zeroad.spend import LOCAL_PREFIX
@@ -56,7 +57,6 @@ class GameFactory:
         self._opponents: list[str] = []
         self._uncapped: list[bool] = []
         self._pairs = cfg.training_civ_pairs()
-        self._held_seeds = set(cfg.held_out.seeds)
 
     def next(self, version: int, url: str) -> GameSpec:
         """The next training game, its policy seat on adapter `version` served at `url`."""
@@ -98,7 +98,7 @@ class GameFactory:
         g = self.cfg.games
         for _ in range(10_000):
             seed = self.rng.randrange(g.seed_low, g.seed_high)
-            if seed not in self._held_seeds:
+            if not self.cfg.held_out.is_held_seed(seed):
                 return seed
         raise ValueError("no seed in games.seed_low..seed_high is outside held_out.seeds")
 
@@ -118,18 +118,7 @@ class GameFactory:
         self._opponents, self._uncapped = list(state["opponents"]), list(state["uncapped"])
 
     def _llm_seat(self, civ: str, version: int, url: str, *, trainable: bool = False) -> SeatSpec:
-        return SeatSpec(
-            kind="llm",
-            civ=civ,
-            model=version_model(version),
-            base_url=url,
-            api_key_env=self.cfg.servers.api_key_env,
-            sampling=dict(TRAIN_SAMPLING),
-            extra_body=dict(EXTRA_BODY),
-            max_tokens=DEFAULT_MAX_TOKENS,
-            trainable=trainable,
-            interface=self.cfg.games.interface,
-        )
+        return llm_seat(self.cfg, civ, version, url, trainable=trainable)
 
     def _opponent_seat(self, opponent: str, civ: str, url: str) -> SeatSpec:
         if opponent == "bot":
@@ -138,6 +127,24 @@ class GameFactory:
             return self._llm_seat(civ, 0, url)
         level, behaviour = int(opponent.removeprefix("petra-")), self.rng.choice(PETRA_BEHAVIORS)
         return SeatSpec(kind="petra", civ=civ, difficulty=level, behaviour=behaviour)
+
+
+def llm_seat(
+    cfg: RunConfig, civ: str, version: int, url: str, *, trainable: bool = False, interface: Interface | None = None
+) -> SeatSpec:
+    """A seat on this box's vLLM playing adapter `version` (0 is the base model), sampled the way training samples."""
+    return SeatSpec(
+        kind="llm",
+        civ=civ,
+        model=version_model(version),
+        base_url=url,
+        api_key_env=cfg.servers.api_key_env,
+        sampling=dict(TRAIN_SAMPLING),
+        extra_body=dict(EXTRA_BODY),
+        max_tokens=DEFAULT_MAX_TOKENS,
+        trainable=trainable,
+        interface=interface or cfg.games.interface,
+    )
 
 
 def repin(spec: GameSpec, version: int, url: str, *, game_id: str | None = None) -> GameSpec:

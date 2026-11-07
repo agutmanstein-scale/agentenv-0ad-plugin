@@ -274,6 +274,64 @@ def select(
     return chosen[:n]
 
 
+class BriefSupply:
+    """How many briefs `select` could draw from the games seen so far, without keeping the briefs: per game, how many
+    turns each stratum has. The orchestrator of a baseline run adds each finished game and stops when there are enough
+    (`RunConfig.brief_target`); the count follows `select` (per-stratum shares, then the leftovers handed on, at most
+    `per_game` from a game), so what it promises is what the labelling pass will find."""
+
+    def __init__(self, n: int, weights: Mapping[str, float] = DEFAULT_WEIGHTS, per_game: int = 8):
+        self.n, self.weights, self.per_game = n, dict(weights), per_game
+        self.by_game: dict[str, dict[str, int]] = {}
+
+    def add(self, game_id: str, briefs: Sequence[Brief]) -> None:
+        counts: dict[str, int] = defaultdict(int)
+        for b in briefs:
+            counts[b.stratum] += 1
+        if counts:
+            self.by_game[game_id] = dict(counts)
+
+    def decisions(self) -> int:
+        return sum(sum(c.values()) for c in self.by_game.values())
+
+    def capacity(self) -> dict[str, Any]:
+        """{"selectable": briefs `select(n)` would return, "shares_met": whether every stratum filled its own share,
+        "strata": what was drawn from each, "candidates": every usable decision seen}."""
+        left = {g: dict(c) for g, c in sorted(self.by_game.items())}
+        taken: dict[str, int] = defaultdict(int)
+        drawn: dict[str, int] = defaultdict(int)
+
+        def take(stratum: str, count: int) -> int:
+            got = 0
+            for game, counts in left.items():
+                if got >= count:
+                    break
+                grab = min(counts.get(stratum, 0), count - got, self.per_game - taken[game])
+                if grab > 0:
+                    counts[stratum] -= grab
+                    taken[game] += grab
+                    got += grab
+            drawn[stratum] += got
+            return got
+
+        total, shares_met = sum(self.weights.values()), True
+        for stratum, w in self.weights.items():
+            want = round(self.n * w / total)
+            shares_met &= take(stratum, want) >= want
+        order = [*self.weights, "other"]
+        while sum(drawn.values()) < self.n:
+            before = sum(drawn.values())
+            for stratum in order:
+                if sum(drawn.values()) < self.n:
+                    take(stratum, 1)
+            if sum(drawn.values()) == before:
+                break
+        return {
+            "selectable": min(sum(drawn.values()), self.n), "shares_met": shares_met, "strata": dict(drawn),
+            "candidates": self.decisions(),
+        }  # fmt: skip
+
+
 # ---- labelling --------------------------------------------------------------------------------------------------
 @dataclass
 class Label:

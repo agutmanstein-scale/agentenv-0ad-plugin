@@ -1,0 +1,90 @@
+# The S2 + Run 1 sequence (src/agentenv_zeroad/train/s2.py, docs/s2-box-day.md): where it keeps its files, where its own
+# files go on S3, and each step's wall-clock cap and expected duration. `live/s2.sh ID start live/s2 --yes` sends this
+# directory to the box. A key that is not in the tables below is an error. No secret goes here.
+#
+# cap_hours is a hard stop (SIGTERM, so an orchestrator uploads, then SIGKILL 40 minutes later); expected_hours is what
+# the box's start check and the plan add up (the box's power-off deadline must leave their sum plus half an hour).
+# The step configs name their own roots, which must all be under `root`, and every s3.uri; the s3://BUCKET/ in them
+# becomes s3://LIVE_BUCKET/ when live/s2.sh sends them.
+
+root = "/var/lib/zeroad-live/train/s2"
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
+
+[e1]                       # GPU gates
+config = "e1.toml"
+cap_hours = 0.75
+expected_hours = 0.5
+levels = [16, 32, 48, 64]  # calls in flight per vLLM server
+window_s = 60              # seconds each level is held
+rows = 48                  # sampled decisions kept for the learner's probe
+min_decisions_per_s_per_gpu = 3.0
+max_learner_s_per_decision = 2.0
+max_logprob_gap = 0.05
+
+[tripwire]                 # v0's health records (no training) on the baseline games' decisions: the tripwire baseline
+cap_hours = 0.5            # the learner's start-up, then 10 or more forward-only batches of 256 on 2 GPUs
+expected_hours = 0.3
+min_records = 10           # the baseline file must come from at least this many records of 256 decisions; E2 and Run 1 refuse to start without it
+
+[e2]                       # positive control; runs after the baselines so it can be given the baseline
+config = "e2.toml"
+cap_hours = 2.6            # e2.toml's duration_hours (2) + its drain and upload
+expected_hours = 2.3
+control_panel = "control-v0"   # the frozen-v0 arm, a panel in e2.toml
+window_games = 40          # the policy's last games that are compared with the control
+min_games = 30             # in the smaller arm
+min_median_army = 6.0
+max_p = 0.01               # Mann-Whitney, one-sided
+min_updates = 5
+minute = 10.0
+
+[baselines]                # play-only v0: panels, calibration, briefs
+config = "baselines.toml"
+cap_hours = 6.0            # 6 Nov: one orchestrator loop held games to ~216 an hour (a saturated core)
+expected_hours = 3.9
+min_finished_share = 0.9   # of each panel's games that must have finished
+planned_usd = 110.0        # frontier spend the guard counts ahead: 20 baseline + 16 calibration games at about $2.5-3.5 each (6 Nov)
+heldout_panel = "heldout"
+v1_panel = "heldout-v1"
+frontier_panel = "frontier"
+calibration_panel = "teacher-calibration"
+
+[distill]                  # the labels (the SFT and its panels are the next two tables)
+cap_hours = 1.0
+expected_hours = 0.4
+n = 3000
+min_labels = 2400
+cap_usd = 120.0            # the first teacher's SpendGuard cap: 3,000 labels at about $0.036 (Opus, 6 Nov)
+second_cap_usd = 12.0      # the label-noise check's: 200 labels
+check = 200
+per_game = 8
+tokenizer = "Qwen/Qwen3-8B"
+weights = "losing=0.6,late=0.2,rejected=0.2"
+
+[sft]
+config = "sft.toml"
+cap_hours = 1.25
+expected_hours = 0.8
+epochs = 2
+lr = 1e-4
+
+[sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel; the chosen one then plays the rest
+config = "sft-panels.toml"
+cap_hours = 4.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games
+expected_hours = 2.8
+panel_games = 192          # per epoch: enough to choose between epochs
+heldout_games = 384        # the held-out panel's size (baselines.toml): the chosen epoch plays heldout_games - panel_games more,
+                           # so the init decision is on the same 384 configs v0 played
+min_entropy_ratio = 0.7
+min_games = 20
+max_p = 0.05               # Run 1 starts from the chosen epoch only if it beats v0 at this one-sided level
+
+[run1]
+config = "run1.toml"
+cap_hours = 11.0           # run1.toml's duration_hours (10) + its drain and final upload
+expected_hours = 10.3
+planned_usd = 70.0         # frontier spend: the end panels (20 games at about $2.5-3.5) with margin
+heldout_panel = "end-heldout"
+frontier_panel = "end-frontier"

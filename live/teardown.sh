@@ -15,6 +15,12 @@ read -r state name purpose < <(tags_of "$ID")
 [ "$name" = "$BOX_NAME" ] || die "$ID is named '$name', not '$BOX_NAME'; not terminating"
 [ "$purpose" = "$PURPOSE" ] || die "$ID has purpose '$purpose', not '$PURPOSE'; not terminating"
 if [ "$state" != terminated ]; then
+  # A persistent Spot request would launch a new box in place of a terminated one: cancel it first.
+  sir=$(aws_run None ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].SpotInstanceRequestId' --output text)
+  if [ -n "$sir" ] && [ "$sir" != None ]; then
+    log "cancelling its Spot request $sir"
+    aws_run "" ec2 cancel-spot-instance-requests --spot-instance-request-ids "$sir" --query 'CancelledSpotInstanceRequests[0].State' --output text
+  fi
   log "terminating $ID ($name, $state)"
   aws_run shutting-down ec2 terminate-instances --instance-ids "$ID" --query 'TerminatingInstances[0].CurrentState.Name' --output text
   aws_run "" ec2 wait instance-terminated --instance-ids "$ID"

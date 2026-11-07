@@ -143,6 +143,9 @@ CHANGE_SCRIPTS = [
     ("repair.sh", ID),
     ("stop-box.sh", ID),
     ("teardown.sh", ID),
+    ("grow-disk.sh", ID, "500"),
+    ("extend-poweroff.sh", ID, "6"),
+    ("start-box.sh", ID),
     ("fetch.sh", ID),
     ("fetch.sh", ID, "livestream-1"),
     ("fetch.sh", ID, "--only", "rec/zeroad/2026-10-29_01-00-00-000000.mp4"),
@@ -359,6 +362,30 @@ def test_put_secret_sends_the_value_in_a_json_body_on_stdin_never_on_a_command_l
     assert SECRET not in out.stdout + out.stderr
 
 
+def test_put_secret_stores_a_value_piped_in_without_a_trailing_newline(stubs):
+    rules = [["put-parameter", "1\n", 0]]
+    out = run(
+        stubs, "put-secret.sh", "litellm-key", "--yes", stdin=SECRET, extra={"STUB_AWS_RULES": json.dumps(rules)}
+    )  # printf %s "$KEY" | live/put-secret.sh litellm-key --yes
+    assert out.returncode == 0, out.stderr
+    [put] = [c for c in aws_calls(stubs) if c["argv"][:2] == ["ssm", "put-parameter"]]
+    assert json.loads(put["stdin"])["Value"] == SECRET
+    assert "stored /zeroad-live/litellm-key" in out.stderr and SECRET not in out.stdout + out.stderr
+
+
+def test_put_secret_says_why_when_there_is_no_value_or_aws_fails(stubs):
+    out = run(stubs, "put-secret.sh", "litellm-key", "--yes", stdin="")
+    assert out.returncode != 0 and "no value on stdin; nothing stored" in out.stderr and not stubs["log"].exists()
+    out = run(stubs, "put-secret.sh", "litellm-key", "--yes", stdin="\n")
+    assert out.returncode != 0 and "empty value; nothing stored" in out.stderr
+    failing = [["put-parameter", "", 255]]
+    out = run(
+        stubs, "put-secret.sh", "litellm-key", "--yes", stdin=SECRET, extra={"STUB_AWS_RULES": json.dumps(failing)}
+    )
+    assert out.returncode != 0 and "aws ssm put-parameter failed for /zeroad-live/litellm-key" in out.stderr
+    assert "nothing stored" in out.stderr and SECRET not in out.stdout + out.stderr
+
+
 def test_put_secret_refuses_an_rtmp_server_that_is_not_an_rtmp_url_and_the_wrong_account(stubs):
     out = run(stubs, "put-secret.sh", "rtmp-server", "--yes", stdin="https://x.example\n")
     assert out.returncode != 0 and "nothing stored" in out.stderr and not stubs["log"].exists()
@@ -487,6 +514,13 @@ def test_the_docker_shim_gives_only_the_live_env_container_the_gpu_the_display_a
     assert run_shim(stubs, "ps", "-a") == ["ps", "-a"]
 
 
+def test_every_script_outside_lib_is_executable():
+    """systemd units and SSM run box scripts by path, so a script committed without its exec bit fails on the box."""
+    scripts = [p for d in (LIVE, LIVE / "box") for p in sorted(d.glob("*.sh"))]
+    assert scripts
+    assert [p.relative_to(LIVE).as_posix() for p in scripts if not os.access(p, os.X_OK)] == []
+
+
 WRONG_TAGS = ["running zeroad-live-onair someone-elses\n", "running other-box zeroad-live\n"]
 
 
@@ -500,11 +534,82 @@ def test_teardown_refuses_a_box_whose_name_or_purpose_tag_is_not_ours(stubs, tag
 
 
 def test_teardown_terminates_a_box_with_both_tags(stubs):
-    rules = [["describe-instances", "running zeroad-live-onair zeroad-live\n", 0], ["terminate", "shutting-down\n", 0]]
+    rules = [
+        ["describe-instances&&SpotInstanceRequestId", "None\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["terminate", "shutting-down\n", 0],
+    ]
     out = run(stubs, "teardown.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
     assert out.returncode == 0, out.stderr
-    assert [c["argv"][1] for c in aws_calls(stubs)] == ["describe-instances", "terminate-instances", "wait"]
+    assert [c["argv"][1] for c in aws_calls(stubs)] == [
+        "describe-instances",
+        "describe-instances",
+        "terminate-instances",
+        "wait",
+    ]
     assert "aws ssm delete-parameters" in out.stderr
+
+
+def test_grow_disk_resizes_the_root_volume_then_the_filesystem_and_never_shrinks(stubs):
+    rules = [
+        ["describe-instances&&BlockDeviceMappings", "vol-0abc\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["describe-volumes-modifications", "optimizing\n", 0],
+        ["describe-volumes", "200\n", 0],
+        ["modify-volume", "modifying\n", 0],
+        ["send-command", "cmd-1\n", 0],
+        ["get-command-invocation&&Status", "Success\n", 0],
+        ["get-command-invocation", '{"StandardOutputContent": "grown\\n"}', 0],
+    ]
+    out = run(
+        stubs, "grow-disk.sh", ID, "500", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"}
+    )
+    assert out.returncode == 0, out.stderr
+    calls = [c["argv"] for c in aws_calls(stubs)]
+    modify = [c for c in calls if c[1] == "modify-volume"]
+    assert len(modify) == 1 and "vol-0abc" in modify[0] and "500" in modify[0]
+    assert [c[1] for c in calls].index("modify-volume") < [c[1] for c in calls].index("send-command")
+    rules[3] = ["describe-volumes", "500\n", 0]
+    stubs["log"].unlink()
+    out = run(stubs, "grow-disk.sh", ID, "400", "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
+    assert out.returncode != 0 and "only grows" in out.stderr
+    assert not [c for c in aws_calls(stubs) if c["argv"][1] == "modify-volume"]
+
+
+def test_teardown_cancels_a_spot_boxs_persistent_request_before_terminating_it(stubs):
+    rules = [
+        ["describe-instances&&SpotInstanceRequestId", "sir-0abc\n", 0],
+        ["describe-instances", "running zeroad-live-onair zeroad-live\n", 0],
+        ["cancel-spot-instance-requests", "cancelled\n", 0],
+        ["terminate", "shutting-down\n", 0],
+    ]
+    out = run(stubs, "teardown.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules)})
+    assert out.returncode == 0, out.stderr
+    calls = [c["argv"] for c in aws_calls(stubs)]
+    assert [c[1] for c in calls] == [
+        "describe-instances",
+        "describe-instances",
+        "cancel-spot-instance-requests",
+        "terminate-instances",
+        "wait",
+    ]
+    assert "sir-0abc" in calls[2]
+
+
+def test_start_box_starts_a_stopped_box_waits_for_ssm_and_checks_its_power_off(stubs):
+    rules = [
+        ["describe-instances", "stopped zeroad-live-onair zeroad-live\n", 0],
+        ["start-instances", "pending\n", 0],
+        ["describe-instance-information", "Online\n", 0],
+        ["send-command", "cmd-1\n", 0],
+        ["get-command-invocation&&Status", "Success\n", 0],
+        ["get-command-invocation", '{"StandardOutputContent": "power-off armed\\n"}', 0],
+    ]
+    out = run(stubs, "start-box.sh", ID, "--yes", extra={"STUB_AWS_RULES": json.dumps(rules), "LIVE_SSM_POLL_S": "0"})
+    assert out.returncode == 0, out.stderr
+    verbs = [c["argv"][1] for c in aws_calls(stubs)]
+    assert verbs.index("start-instances") < verbs.index("send-command")
+    assert "--resume" in out.stderr
 
 
 @pytest.mark.parametrize("tags", WRONG_TAGS, ids=["wrong-purpose", "wrong-name"])
@@ -1347,6 +1452,20 @@ def test_a_bootstrap_re_arms_a_missing_power_off_and_fails_loudly_if_it_stays_un
     assert out.returncode == 1 and "NOT ARMED" in out.stdout and "NOT ARMED" in out.stderr
 
 
+def test_extending_the_power_off_moves_the_deadline_and_re_arms_it(stubs):
+    arm = busctl_stub(stubs, ARMED)
+    deadline = stubs["tmp"] / "deadline"
+    deadline.write_text("1800000000\n")
+    out = run_box(stubs, "poweroff.sh", "extend", "6", ZEROAD_POWEROFF_ARM=str(arm), ZEROAD_DEADLINE_FILE=str(deadline))
+    assert out.returncode == 0, out.stderr
+    assert deadline.read_text().strip() == str(1800000000 + 6 * 3600) and (stubs["tmp"] / "armed.flag").exists()
+    assert "power-off armed" in out.stdout
+    for bad in ("0", "x", "100"):
+        bad_out = run_box(stubs, "poweroff.sh", "extend", bad, ZEROAD_DEADLINE_FILE=str(deadline))
+        assert bad_out.returncode == 2
+    assert deadline.read_text().strip() == str(1800000000 + 6 * 3600)
+
+
 def test_a_bootstrap_does_not_rearm_a_power_off_that_is_already_scheduled(stubs):
     arm = busctl_stub(stubs, ARMED)
     out = run_box(stubs, "poweroff.sh", "check", ZEROAD_POWEROFF_ARM=str(arm))
@@ -1771,3 +1890,407 @@ def test_a_failed_phase_is_logged_and_the_batch_goes_on_to_the_summary_and_marks
     progress = (out_dir / "progress.log").read_text()
     assert "phase calibration FAILED (exit 3)" in progress and "phase bot done" in progress
     assert "S1 batch done" in progress and (out_dir / "DONE").is_file()
+
+
+# ---- box day 1 and Run 1: live/s2.sh, box/s2.sh, box/s2-run.sh, the learner-only modes of train-run.sh ---------------
+S2_ENV = LIVE / "s2.env.example"
+S2_DIR = LIVE / "s2"
+
+
+def s2_stubs(stubs, extra: str = ""):
+    env_file = stubs["tmp"] / "s2.env"
+    env_file.write_text(
+        S2_ENV.read_text()
+        + "LIVE_INSTANCE_PROFILE=zeroad-box\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+        + "LIVE_SUBNETS='subnet-a subnet-b'\nLIVE_SECURITY_GROUP=sg-1\n"
+        + extra
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    return stubs
+
+
+def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_sequence():
+    from agentenv_zeroad.train.s2 import check_dir
+
+    env = dict(line.split("=", 1) for line in S2_ENV.read_text().splitlines() if re.match(r"^[A-Z0-9_]+=", line))
+    numbers = check_dir(S2_DIR, float(env["LIVE_BUDGET_USD"]))
+    assert env["LIVE_GPU_TYPES"].strip('"').split() == ["g6e.12xlarge", "g6e.24xlarge"]
+    assert dict(p.split("=") for p in env["LIVE_GPU_RATES"].strip('"').split()) == {
+        "g6e.12xlarge": "10.49",
+        "g6e.24xlarge": "15.07",
+    }
+    assert env["LIVE_REQUIRE_RATE"] == "1" and env["LIVE_SHUTDOWN_BEHAVIOR"] == "stop"
+    assert float(env["LIVE_BOX_USD_PER_HOUR"]) == numbers["rate"]
+    assert int(env["LIVE_MAX_HOURS"]) >= numbers["expected_hours"] + 2  # the bootstrap's hour and an hour of margin
+    box = numbers["expected_hours"] * numbers["rate"]
+    assert (
+        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 420
+    )  # box, two frontier panels, calibration, labels
+
+
+def test_the_s2_launch_plan_prices_a_g6e_box_for_the_whole_sequence_and_stops_it_rather_than_terminates(stubs):
+    out = run(s2_stubs(stubs), "launch.sh", "--max-hours", "21", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "--instance-type g6e.12xlarge" in plan and "--instance-initiated-shutdown-behavior stop" in plan
+    assert "Key=purpose,Value=zeroad-s2" in plan and "powers off (stop) after 21 h" in plan
+
+
+def test_a_spot_launch_asks_for_a_persistent_request_that_stops_when_reclaimed_and_tags_it(stubs):
+    out = run(s2_stubs(stubs, "LIVE_SPOT=1\n"), "launch.sh", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}" in plan
+    assert "ResourceType=spot-instances-request,Tags=[{Key=Name,Value=zeroad-s2}" in plan
+
+
+def test_a_spot_launch_refuses_a_box_that_would_terminate_on_shutdown(stubs):
+    out = run(s2_stubs(stubs, "LIVE_SPOT=1\nLIVE_SHUTDOWN_BEHAVIOR=terminate\n"), "launch.sh", forbid_aws=True)
+    assert out.returncode != 0 and "LIVE_SPOT=1 needs LIVE_SHUTDOWN_BEHAVIOR=stop" in out.stderr
+
+
+def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket_filled_in_then_starts_the_sequence(
+    stubs,
+):
+    import io
+    import tarfile
+
+    out = run(s2_stubs(stubs), "s2.sh", ID, "start", str(S2_DIR), forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "agentenv_zeroad.train.s2 check" in plan and "--budget 600" in plan and "against $600" in plan
+    assert plan.count("aws ssm send-command") == 2
+    assert "box/s2.sh put-config" in plan and "box/s2.sh start --budget 600" in plan
+    assert plan.index("put-config") < plan.index("s2.sh start --budget 600")
+    assert "systemd-run --unit zeroad-s2" in plan and "s2-run.sh --budget 600" in plan.replace("\\", "")
+    [blob] = [b for b in re.findall(r"[A-Za-z0-9+/=]{500,}", plan)]
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob)), mode="r:gz") as tar:
+        files = {m.name.removeprefix("./"): tar.extractfile(m).read().decode() for m in tar.getmembers() if m.isfile()}
+    assert set(files) == {p.name for p in S2_DIR.glob("*.toml")}
+    assert all("s3://BUCKET/" not in text for text in files.values())
+    assert (
+        's3://bucket-1/zeroad-train/run/s2-run1"' in files["run1.toml"] and "s3://bucket-1/" in files["sequence.toml"]
+    )
+    assert "litellm" not in plan.lower().replace("litellm.example", "")  # no key anywhere near a plan
+    assert not stubs["log"].exists()
+
+
+def test_the_s2_start_takes_resume_or_fresh_but_not_both_and_needs_a_config_directory(stubs):
+    s2_stubs(stubs)
+    assert (
+        "s2.sh start --budget 600 --resume"
+        in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", forbid_aws=True).stderr
+    )
+    assert (
+        "s2.sh start --budget 600 --fresh"
+        in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--fresh", forbid_aws=True).stderr
+    )
+    out = run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", "--fresh", forbid_aws=True)
+    assert out.returncode != 0 and "alternatives" in out.stderr
+    out = run(stubs, "s2.sh", ID, "start", str(stubs["tmp"]), forbid_aws=True)
+    assert out.returncode != 0 and "needs the config directory" in out.stderr
+    assert run(stubs, "s2.sh", ID, "start", forbid_aws=True).returncode != 0
+
+
+def test_the_s2_status_stop_and_fetch_plans(stubs):
+    s2_stubs(stubs)
+    status = run(stubs, "s2.sh", ID, "status", "--dry-run", forbid_aws=True).stderr
+    assert "box/s2.sh status" in status and "gates.json" in status
+    stop = run(stubs, "s2.sh", ID, "stop", forbid_aws=True)
+    assert stop.returncode == 0 and "box/s2.sh stop" in stop.stderr and "timeout 4200s" in stop.stderr
+    assert "systemctl stop zeroad-s2" in stop.stderr
+    fetch = run(stubs, "s2.sh", ID, "fetch", forbid_aws=True)
+    assert fetch.returncode == 0 and "box/fetch.sh https://PRESIGNED-PUT-url  train/s2" in fetch.stderr
+    assert "live/fetched/s2-<time>/" in fetch.stderr
+
+
+def test_s2_fetch_packs_the_sequences_own_files_and_not_the_step_roots(box_stubs):
+    train = box_stubs["tmp"] / "state" / "train"
+    (train / "s2" / "logs").mkdir(parents=True)
+    (train / "s2" / "e2" / "adapters" / "v1").mkdir(parents=True)
+    (train / "s2" / "e2" / "adapters" / "v1" / "adapter_model.safetensors").write_text("weights")
+    for name in ("gates.json", "progress.log"):
+        (train / "s2" / name).write_text("{}")
+    (train / "s2" / "logs" / "e1.log").write_text("x")
+    out_file = box_stubs["tmp"] / "sent.tar"
+    write_exe(box_stubs["bin"] / "zstd", "#!/bin/sh\ncat\n")
+    write_exe(
+        box_stubs["bin"] / "curl",
+        f'#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -T ] && cp "$2" "{out_file}"; shift; done\n',
+    )
+    out = run_box(box_stubs, "fetch.sh", "https://put.example/x", "", "train/s2", DRY_RUN="0")
+    assert out.returncode == 0, out.stderr
+    names = subprocess.run(["tar", "tf", str(out_file)], capture_output=True, text=True, check=True).stdout.split()
+    assert "train/s2/gates.json" in names and "train/s2/logs/e1.log" in names
+    assert not any("adapters" in n or "weights" in n for n in names)
+    assert run_box(box_stubs, "fetch.sh", "https://put.example/x", "", "train/nope", DRY_RUN="0").returncode != 0
+
+
+S2_UV = """\
+#!/bin/sh
+case "$*" in
+  *"train.s2 check"*) [ -z "$STUB_CHECK_FAIL" ] || { echo "the S2 config directory is not valid: stub" >&2; exit 1; }
+    echo "$*" >> "$STUB_UV_LOG"
+    printf 'S2_ROOT=/x\\nS2_CAP_HOURS=22\\nS2_EXPECTED_HOURS=%s\\nS2_RUN1_HOURS=10\\n' "${STUB_EXPECTED_HOURS:-18.3}"
+    printf 'S2_BOX_USD_PER_HOUR=%s\\nS2_FRONTIER=1\\n' "${STUB_RATE:-1.32}" ;;
+  *"train.config"*) printf 'TRAIN_RUN_ID=x\\nTRAIN_ROOT=%s/train/s2/sft\\n' "$ZEROAD_LIVE_STATE"
+    printf 'TRAIN_DURATION_HOURS=1\\nTRAIN_BOX_USD_PER_HOUR=1.32\\nTRAIN_FRONTIER=0\\n' ;;
+  *"orchestrate tools"*) echo hold,set_economy ;;
+  *) echo "$*" >> "$STUB_UV_LOG" ;;
+esac
+"""
+
+
+def s2_box(stubs, *, gates=False):
+    """A box with vLLM up, the config directory in place and a uv that answers `s2 check`."""
+    write_exe(stubs["bin"] / "curl", "#!/bin/sh\nexit 0\n")
+    write_exe(stubs["bin"] / "uv", S2_UV)
+    etc = stubs["tmp"] / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.urls").write_text("http://172.17.0.1:8000\nhttp://172.17.0.1:8001\n")
+    train = stubs["tmp"] / "state" / "train"
+    (train / "s2-config").mkdir(parents=True, exist_ok=True)
+    if gates:
+        (train / "s2").mkdir(parents=True, exist_ok=True)
+        (train / "s2" / "gates.json").write_text("{}")
+    stubs["env"]["STUB_UV_LOG"] = str(stubs["tmp"] / "uv.log")
+    return etc
+
+
+def start_s2(stubs, *args, units=None, hours="18.3", rate="1.32", **extra):
+    clock = {"ZEROAD_NOW_EPOCH": "1800000000", "ZEROAD_BOOT_EPOCH": "1800000000"}
+    return run_box(
+        stubs, "s2.sh", "start", *args, "--budget", "350", DRY_RUN="0", STUB_UNITS=json.dumps(units or {}),
+        ZEROAD_PILOT_ETC=str(stubs["tmp"] / "etc"), STUB_EXPECTED_HOURS=hours, STUB_RATE=rate, **clock, **extra,
+    )  # fmt: skip
+
+
+def test_the_s2_sequence_starts_in_its_own_unit_with_room_to_upload_and_a_second_is_refused(box_stubs):
+    s2_box(box_stubs)
+    out = start_s2(box_stubs, hours="1")  # the box's budget check: 1 h at $1.32 against $350
+    assert out.returncode == 0, out.stderr
+    [call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert "--unit zeroad-s2" in call and "KillMode=control-group" in call and "TimeoutStopSec=4200" in call
+    assert "After=network-online.target docker.service" in call and call.endswith("s2-run.sh --budget 350")
+    assert (
+        "check" in (box_stubs["tmp"] / "uv.log").read_text()
+        and "--budget 350" in (box_stubs["tmp"] / "uv.log").read_text()
+    )
+    out = start_s2(box_stubs, units={"zeroad-s2": "active"})
+    assert out.returncode != 0 and "a sequence is going" in out.stderr
+    out = start_s2(box_stubs, units={"zeroad-train": "active"})
+    assert out.returncode != 0 and "a training run is going" in out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1
+
+
+def test_the_s2_start_is_refused_for_a_wrong_rate_a_short_deadline_a_down_vllm_a_bad_config_or_the_budget(box_stubs):
+    s2_box(box_stubs)
+    assert "is not this box's rate" in start_s2(box_stubs, rate="10.49").stderr
+    deadline = box_stubs["tmp"] / "deadline"
+    deadline.write_text(str(1_800_000_000 + 10 * 3600))
+    out = start_s2(box_stubs, ZEROAD_DEADLINE_FILE=str(deadline), hours="18.3")
+    assert out.returncode != 0 and "powers off in 10.00 h" in out.stderr and "larger LIVE_MAX_HOURS" in out.stderr
+    deadline.write_text(str(1_800_000_000 + 20 * 3600))
+    assert start_s2(box_stubs, ZEROAD_DEADLINE_FILE=str(deadline), hours="1").returncode == 0
+    for call in list(systemctl_calls(box_stubs)):
+        assert call.startswith("systemd-run")
+    out = start_s2(box_stubs, hours="400")  # 400 h at $1.32 is $528 against $350
+    assert out.returncode != 0 and "REFUSED" in out.stdout
+    out = start_s2(box_stubs, STUB_CHECK_FAIL="1")
+    assert out.returncode != 0 and "is not valid for a budget" in out.stderr
+    write_exe(box_stubs["bin"] / "curl", "#!/bin/sh\nexit 22\n")
+    out = start_s2(box_stubs)
+    assert out.returncode != 0 and "vLLM is not up" in out.stderr
+    assert len([c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]) == 1  # only the good start
+
+
+def test_an_earlier_sequence_is_resumed_or_moved_aside_never_overwritten(box_stubs):
+    s2_box(box_stubs, gates=True)
+    out = start_s2(box_stubs, hours="1")
+    assert out.returncode != 0 and "--resume continues it, --fresh moves it aside" in out.stderr
+    assert start_s2(box_stubs, "--resume", hours="1").returncode == 0
+    assert (box_stubs["tmp"] / "state" / "train" / "s2" / "gates.json").exists()
+    assert start_s2(box_stubs, "--fresh", hours="1").returncode == 0
+    train = box_stubs["tmp"] / "state" / "train"
+    assert not (train / "s2" / "gates.json").exists() and list(train.glob("s2-old-*/gates.json"))
+    assert start_s2(box_stubs, "--resume", "--fresh", hours="1").returncode != 0
+
+
+def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_it_and_keeps_the_old_one_if_invalid(
+    box_stubs,
+):
+    import io
+    import tarfile
+
+    etc = s2_box(box_stubs)
+    (etc / "vllm.urls").write_text("http://172.20.0.1:8000\nhttp://172.20.0.1:8001\n")
+
+    def archive(files: dict[str, str]) -> str:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for name, text in files.items():
+                data = text.encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    def put(b64: str, **extra):
+        return run_box(
+            box_stubs,
+            "s2.sh",
+            "put-config",
+            b64,
+            DRY_RUN="0",
+            **{"STUB_UNITS": "{}", "ZEROAD_PILOT_ETC": str(etc), **extra},
+        )
+
+    config = box_stubs["tmp"] / "state" / "train" / "s2-config"
+    (config / "old.toml").write_text("old")
+    assert put("not base64!").returncode != 0
+    assert "outside its folder" in put(archive({"../evil.toml": "x"})).stderr
+    assert "outside its folder" in put(archive({"/etc/evil.toml": "x"})).stderr
+    assert (config / "old.toml").exists()
+    bad = put(archive({"sequence.toml": "x"}), STUB_CHECK_FAIL="1")
+    assert bad.returncode != 0 and "not valid" in bad.stderr and (config / "old.toml").exists()
+    e1 = '[servers]\nurls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]\nkey_env = "VLLM_API_KEY"\n'
+    good = put(archive({"sequence.toml": "root = 'x'", "e1.toml": e1}))
+    assert good.returncode == 0, good.stderr
+    assert (config / "sequence.toml").read_text() == "root = 'x'" and not (config / "old.toml").exists()
+    assert (config / "e1.toml").read_text() == (
+        '[servers]\nurls = ["http://172.20.0.1:8000", "http://172.20.0.1:8001"]\nkey_env = "VLLM_API_KEY"\n'
+    )  # the box's own vLLM URLs, whatever the configs were written with
+    assert (config.parent / "s2-config.old" / "old.toml").exists()
+    running = put(archive({"a.toml": "x"}), STUB_UNITS=json.dumps({"zeroad-s2": "active"}))
+    assert running.returncode != 0
+
+
+def test_a_stop_stops_the_unit_and_the_status_names_the_step_the_gates_and_the_power_off(box_stubs):
+    s2_box(box_stubs)
+    out = run_box(box_stubs, "s2.sh", "stop", DRY_RUN="0")
+    assert out.returncode == 0
+    assert "stop zeroad-s2" in systemctl_calls(box_stubs)
+    s2 = box_stubs["tmp"] / "state" / "train" / "s2"
+    (s2 / "e2" / "orchestrator").mkdir(parents=True)
+    (s2 / "status.json").write_text(json.dumps({"step": "e2", "verdict": "running"}))
+    (s2 / "e2" / "orchestrator" / "status.json").write_text(json.dumps({"run_hours": 0.5, "counts": {"rows": 7}}))
+    (s2 / "progress.log").write_text("10:00:00 e2: start (cap 2.6 h)\n")
+    status = run_box(box_stubs, "s2.sh", "status", DRY_RUN="0", ZEROAD_PILOT_ETC=str(box_stubs["tmp"] / "etc"))
+    assert status.returncode == 0, status.stderr
+    text = status.stdout
+    for part in (
+        "--- gates",
+        "--- progress",
+        "e2: start (cap 2.6 h)",
+        "--- e2 orchestrator",
+        '"run_hours":0.5',
+        "--- spend",
+        "--- power-off",
+    ):
+        assert part in text, part
+
+
+def test_the_s2_run_script_runs_the_python_sequence_with_the_vllm_key_in_its_environment_only(stubs):
+    out = run_box(stubs, "s2-run.sh", "--budget", "350", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    assert "source " in text and "vllm.env" in text and "never printed" in text
+    assert "agentenv_zeroad.train.s2 run --config-dir" in text and "s2-config --budget 350 --box-home" in text
+    assert "--no-shutdown" not in text and "litellm-key" not in text
+    assert "--no-shutdown" in run_box(stubs, "s2-run.sh", "--budget", "350", "--no-shutdown", DRY_RUN="1").stdout
+    assert run_box(stubs, "s2-run.sh", DRY_RUN="1").returncode != 0
+    assert run_box(stubs, "s2-run.sh", "--budget", "lots", DRY_RUN="1").returncode != 0
+
+
+def test_the_learner_only_modes_start_the_learner_in_sft_or_probe_mode_and_no_orchestrator(stubs):
+    out = run_box(stubs, "train-run.sh", str(S2_DIR / "sft.toml"), "--sft", "2", "--lr", "1e-4", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    text = out.stdout.replace("\\", "")
+    [learner] = [line for line in text.splitlines() if "docker run -d --name zeroad-learner" in line]
+    assert "--sft --sft-epochs 2 --lr 1e-4" in learner and "--probe" not in learner and '--gpus "device=2,3"' in learner
+    assert "orchestrate run" not in text and "sft-done.json" in text and "zeroad-s2/sft" not in text
+    out = run_box(
+        stubs, "train-run.sh", str(S2_DIR / "e1.toml"), "--probe", "/x/train/s2/e1/probe-rows.jsonl", DRY_RUN="1"
+    )
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--probe /x/train/s2/e1/probe-rows.jsonl" in learner and "--sft" not in learner
+    assert "orchestrate run" not in out.stdout and "probe.json" in out.stdout
+    out = run_box(
+        stubs, "train-run.sh", str(S2_DIR / "baselines.toml"), "--stats-only", "/x/train/s2/baselines/rows.jsonl",
+        DRY_RUN="1",
+    )  # fmt: skip
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--stats-only /x/train/s2/baselines/rows.jsonl" in learner and "--sft" not in learner
+    assert "--probe" not in learner and "orchestrate run" not in out.stdout and "baseline.json" in out.stdout
+    for bad in (
+        ("--stats-only", "/x/y", "--probe", "/x/z"),
+        ("--stats-only", "/x/y", "--sft", "2"),
+        ("--stats-only", "/x/y", "--play-only"),
+        ("--stats-only", "/x/y", "--init", "/x/a"),
+        ("--stats-only", "/x/y", "--baseline", "/x/b"),
+        ("--stats-only", "bad path"),
+        ("--sft", "2", "--probe", "/x/y"),
+        ("--sft", "2", "--play-only"),
+        ("--sft", "0"),
+        ("--lr", "fast", "--sft", "1"),
+    ):
+        assert run_box(stubs, "train-run.sh", str(S2_DIR / "sft.toml"), *bad, DRY_RUN="1").returncode != 0, bad
+    plain = run_box(
+        stubs, "train-run.sh", str(S2_DIR / "run1.toml"), "--init", "/x/train/s2/sft/epochs/epoch2", DRY_RUN="1"
+    )
+    [learner] = [
+        line for line in plain.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--sft" not in learner and "--probe" not in learner  # an RL run is unchanged
+
+
+def run_learner_only(stubs, *args, writes: bool, ps: str = ""):
+    """train-run.sh for real against a docker that (maybe) writes the learner's result file when it is started."""
+    state = stubs["tmp"] / "state"
+    (state / "train" / "s2" / "sft").mkdir(parents=True, exist_ok=True)
+    done = state / "train" / "s2" / "sft" / ("probe.json" if "--probe" in args else "sft-done.json")
+    write_exe(stubs["bin"] / "uv", S2_UV)
+    docker = f'case "$1" in run) [ "{int(writes)}" = 1 ] && echo "{{}}" > "{done}" ;; ps) echo "{ps}" ;; esac'
+    write_exe(stubs["bin"] / "docker", f"#!/bin/sh\n{docker}\nexit 0\n")
+    etc = stubs["tmp"] / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.env").write_text("VLLM_API_KEY=k\n")
+    stubs["env"]["STUB_UV_LOG"] = str(stubs["tmp"] / "uv.log")
+    config = stubs["tmp"] / "sft.toml"
+    config.write_text("x")
+    env = box_env(stubs, ZEROAD_PILOT_ETC=str(etc), DRY_RUN="0")
+    script = str(BOX / "train-run.sh")
+    cp = subprocess.run(
+        ["bash", script, str(config), *args],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return cp, done
+
+
+def test_a_learner_only_run_ends_when_the_learners_result_file_appears_and_fails_if_the_container_ends_without_one(
+    stubs,
+):
+    cp, done = run_learner_only(stubs, "--sft", "2", writes=True, ps="abc")
+    assert cp.returncode == 0, cp.stderr
+    uv_log = stubs["tmp"] / "uv.log"  # only the calls that are not a config check or the tools list land in it
+    assert done.exists() and not uv_log.exists()  # so no orchestrator was started
+    done.unlink()
+    cp, done = run_learner_only(stubs, "--probe", "/x/rows.jsonl", writes=False, ps="")
+    assert cp.returncode != 0 and "ended without writing" in cp.stderr and not done.exists()
+
+
+def test_a_stale_learner_result_file_is_removed_before_the_learner_starts(stubs):
+    state = stubs["tmp"] / "state"
+    stale = state / "train" / "s2" / "sft" / "sft-done.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("old")
+    cp, _ = run_learner_only(stubs, "--sft", "1", writes=False, ps="")
+    assert cp.returncode != 0 and not stale.exists()  # the old file did not stand in for this run's

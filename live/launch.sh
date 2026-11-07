@@ -77,9 +77,18 @@ else
   # The boothook only records the absolute deadline and installs zeroad-poweroff.service, which arms the power-off after
   # systemd-logind on every boot: a `shutdown -h` from the boothook itself runs before logind can take it and is lost.
   userdata=$(sed "s/@DEADLINE@/$(( $(date +%s) + MAX_HOURS * 3600 ))/" "$LIVE_DIR/lib/poweroff-boothook.sh" | base64 | tr -d '\n')
+  # LIVE_SPOT=1: a persistent Spot request that stops (keeps the disk) when reclaimed and starts again when capacity
+  # returns; teardown.sh cancels the request first. The box is still priced at its on-demand rate, the most Spot charges.
+  market=() spot_tags=()
+  if [ "${LIVE_SPOT:-0}" = 1 ]; then
+    [ "$SHUTDOWN" = stop ] || die "LIVE_SPOT=1 needs LIVE_SHUTDOWN_BEHAVIOR=stop (a reclaimed box stops and keeps its disk)"
+    market=(--instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}")
+    log "Spot: a persistent request, stopped when reclaimed (then live/s2.sh ID start --resume once it is back)"
+  fi
   for t in $TYPES; do
     trate=$(rate_for "$t")
     tags="{Key=Name,Value=$NAME},{Key=owner,Value=${LIVE_TAG_OWNER:-${USER:-zeroad}}},{Key=purpose,Value=$PURPOSE},{Key=zeroad-box-usd-per-hour,Value=$trate},{Key=zeroad-instance-type,Value=$t}"
+    [ ${#market[@]} -eq 0 ] || spot_tags=("ResourceType=spot-instances-request,Tags=[$tags]")
     for s in $SUBNETS; do
       if id=$(aws_run i-0123456789abcdef0 ec2 run-instances --image-id "$ami" --instance-type "$t" --count 1 \
           --subnet-id "$s" --security-group-ids "$LIVE_SECURITY_GROUP" \
@@ -88,8 +97,8 @@ else
           --metadata-options HttpTokens=required,HttpEndpoint=enabled \
           --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_GB,VolumeType=gp3,DeleteOnTermination=true}" \
           --user-data "$userdata" \
-          --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" \
-          --query 'Instances[0].InstanceId' --output text); then
+          --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" ${spot_tags[@]+"${spot_tags[@]}"} \
+          ${market[@]+"${market[@]}"} --query 'Instances[0].InstanceId' --output text); then
         log "launched $id ($t in $s at \$$trate/h, $ROOT_GB GB root, powers off ($SHUTDOWN) after $MAX_HOURS h)"
         if priced_at_default "$t"; then
           log "WARNING: no rate for $t in LIVE_GPU_RATES: it is priced at the \$$RATE/h of LIVE_BOX_USD_PER_HOUR, which may not be its cost"

@@ -1,0 +1,28 @@
+run_id = "s2-e1"
+root = "/var/lib/zeroad-live/train/s2/e1"
+duration_hours = 0.5
+budget_usd = 600            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false            # the sequence powers the box off itself, once, after the final upload
+engines = 4
+concurrency = 4
+seed = 1
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[games]
+time_cap_minutes = 30
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+# None of these appears in a training game; the panels draw from them. No held-out map yet: one that passes the bot
+# smoke test goes in `maps`; until then the panels take the training map with held-out seeds and civ pairs.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-e1"
