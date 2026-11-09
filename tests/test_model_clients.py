@@ -89,6 +89,18 @@ async def test_no_model_request_is_sent_once_it_could_pass_the_cap_and_a_failed_
     assert len(fake.requests) == 1
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_call_the_proxy_refuses_for_its_key_is_counted_but_not_charged(status):
+    guard = SpendGuard("t", cap_usd=0.2)
+    model = StrategistModel(
+        "anthropic/claude-opus-5-5", "https://p", KEY, guard, max_tokens=2000, http=FakeLiteLLM(fail=status).http()
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await model.call("s", "b", TOOLS)
+    assert guard.spent_usd == 0 and guard.calls == 1 and guard.unpriced_calls == 0
+    assert model.stats["failed_calls"] == 1
+
+
 async def test_a_decisions_call_asks_luna_every_question_at_once_on_the_openai_route():
     fake = FakeLiteLLM(choose=lambda q: q["choices"][-1]["value"])
     guard = SpendGuard("reflex")

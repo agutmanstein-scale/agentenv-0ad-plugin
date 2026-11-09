@@ -68,7 +68,7 @@ import httpx
 
 from agentenv_zeroad import brains, spend
 from agentenv_zeroad.interface import Interface
-from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, Reply, StrategistModel, ToolSpec
+from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, REFUSED_KEY, Reply, StrategistModel, ToolSpec
 from agentenv_zeroad.spend import SpendCapReached, SpendGuard
 from agentenv_zeroad.train import results as rs
 from agentenv_zeroad.train import stats
@@ -80,6 +80,7 @@ LATE_MIN = 20.0
 LOSING_OPPONENTS = ("petra-2", "petra-3")
 DEFAULT_WEIGHTS = {"losing": 0.6, "rejected": 0.2, "late": 0.2}
 DEFAULT_LABELS = 3000
+REFUSED_STOP = 20  # calls the proxy refused for the key, with none answered, before labelling stops
 
 
 class Teacher(Protocol):
@@ -416,6 +417,13 @@ async def label(
                     on_asked(brief)
                 stats["failed"] += 1
                 stats.setdefault("errors", []).append(f"{type(e).__name__}: {str(e)[:120]}")
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in REFUSED_KEY:
+                    stats["refused"] = stats.get("refused", 0) + 1
+                    if stats["refused"] >= REFUSED_STOP and not stats["labelled"] and not stats["stopped"]:
+                        stats["stopped"] = (
+                            f"the proxy refused the teacher's key (HTTP {e.response.status_code}) on "
+                            f"{stats['refused']} calls and answered none"
+                        )
                 return
             finally:
                 async with reserve:
