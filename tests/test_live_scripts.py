@@ -2165,6 +2165,23 @@ def test_the_box_takes_the_config_directory_as_base64_refuses_paths_that_leave_i
     assert running.returncode != 0
 
 
+def test_the_status_of_e2_shows_its_newest_run_the_baseline_games_or_the_training(box_stubs):
+    import os
+
+    s2_box(box_stubs)
+    s2 = box_stubs["tmp"] / "state" / "train" / "s2"
+    s2.mkdir(parents=True, exist_ok=True)
+    (s2 / "status.json").write_text(json.dumps({"step": "e2", "verdict": "running"}))
+    for age, name, hours in ((300, "e2", 2.06), (0, "e2-baseline", 0.25)):
+        (s2 / name / "orchestrator").mkdir(parents=True)
+        path = s2 / name / "orchestrator" / "status.json"
+        path.write_text(json.dumps({"run_hours": hours}))
+        os.utime(path, (1_800_000_000 - age, 1_800_000_000 - age))
+    status = run_box(box_stubs, "s2.sh", "status", DRY_RUN="0", ZEROAD_PILOT_ETC=str(box_stubs["tmp"] / "etc"))
+    assert status.returncode == 0, status.stderr
+    assert "--- e2-baseline orchestrator" in status.stdout and '"run_hours":0.25' in status.stdout
+
+
 def test_a_stop_stops_the_unit_and_the_status_names_the_step_the_gates_and_the_power_off(box_stubs):
     s2_box(box_stubs)
     out = run_box(box_stubs, "s2.sh", "stop", DRY_RUN="0")

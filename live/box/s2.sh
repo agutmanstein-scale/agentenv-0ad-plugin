@@ -114,6 +114,11 @@ PY
     case $step in
       e1) dir=e1 ;; e2) dir=e2 ;; baselines|calibration|tripwire|labels) dir=baselines ;; sft|sft_panels|init) dir=sft ;; run1) dir=run1 ;; *) dir= ;;
     esac
+    # E2 runs its v0 baseline games (e2-baseline) and then its training (e2b; e2 is the first attempt): the newest one.
+    if [ "$step" = e2 ]; then
+      newest=$(ls -t "$S2"/e2*/orchestrator/status.json 2>/dev/null | head -n 1 || true)
+      [ -z "$newest" ] || { newest=${newest%/orchestrator/status.json}; dir=${newest##*/}; }
+    fi
     if [ -n "$dir" ]; then
       echo "--- $dir orchestrator"; jq -c '{run_hours, spend, current, counts, panels, briefs, alarms, stop_reason}' "$S2/$dir/orchestrator/status.json" 2>/dev/null || echo "(none)"
       echo "--- $dir learner (latest health records)"; tail -n 3 "$S2/$dir/health.jsonl" 2>/dev/null | cut -c1-400 || true
