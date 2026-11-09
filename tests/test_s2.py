@@ -4,6 +4,7 @@ stops with its reason, a cap or a budget refusal stops too), all against fakes: 
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import shutil
@@ -330,14 +331,18 @@ def test_the_brief_supply_follows_the_selection_rule_under_the_per_game_cap():
 
 
 # ---- the sequencer -----------------------------------------------------------------------------------------------
-def make_config_dir(tmp_path: Path) -> Path:
-    """live/s2 with its roots moved under tmp_path/train so that nothing needs /var/lib."""
+def make_config_dir(tmp_path: Path, calls: str = "") -> Path:
+    """live/s2 with its roots moved under tmp_path/train so that nothing needs /var/lib, and with `calls` as its
+    [sequence] table in place of the one this run was given (the whole plan when `calls` is empty)."""
     out = tmp_path / "cfg"
     shutil.copytree(LIVE_S2, out)
     for path in out.glob("*.toml"):
         text = path.read_text().replace("/var/lib/zeroad-live/train/", f"{tmp_path}/train/")
         if path.name != "sequence.toml":
             text = re.sub(r"^(run_id = .*)$", rf'\1\ntrain_root = "{tmp_path}/train"', text, count=1, flags=re.M)
+        else:
+            text = re.sub(r"^\[sequence\].*?(?=^\[)", "", text, count=1, flags=re.M | re.S)
+            text += f"\n[sequence]\n{calls}\n" if calls else ""
         path.write_text(text)
     return out
 
@@ -363,8 +368,8 @@ class FakeRunner:
         return [" ".join(c) for c in self.calls]
 
 
-def make_ctx(tmp_path, runner, *, refuse=None, clock=None, **env):
-    cdir = make_config_dir(tmp_path)
+def make_ctx(tmp_path, runner, *, refuse=None, clock=None, calls="", **env):
+    cdir = make_config_dir(tmp_path, calls)
     settings = S.load_settings(cdir / "sequence.toml")
     t = clock or [1_800_000_000.0]
     now = lambda: t[0]  # noqa: E731
@@ -389,8 +394,9 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
         monkeypatch.setitem(S.STEP_FUNCS, name, stub(name))
 
 
-def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
-    numbers = S.check_dir(LIVE_S2, 600)
+def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tmp_path):
+    S.check_dir(LIVE_S2, 600)  # as shipped, with this run's [sequence] calls
+    numbers = S.check_dir(make_config_dir(tmp_path), 600)  # the whole plan
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
     assert 22 <= numbers["expected_hours"] <= 23 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
@@ -539,6 +545,75 @@ def test_a_resumed_sequence_skips_the_steps_that_passed_and_retries_the_one_that
     again.budget_ok = lambda hours, usd=0.0: None  # type: ignore[method-assign]
     assert S.sequence(again) == ("complete", None)
     assert order == ["sft", "sft_panels", "init", "run1"]
+
+
+def resumed(ctx, **calls):
+    """The same sequence started again (--resume) with its [sequence] calls changed."""
+    settings = dataclasses.replace(ctx.settings, **calls)
+    again = S.Ctx(
+        settings, ctx.configs, ctx.box_home, ctx.runner, 350.0, S.Record(ctx.s2, ctx.now), now=ctx.now, env=ctx.env
+    )
+    again.budget_ok = lambda hours, usd=0.0: None  # type: ignore[method-assign]
+    return again
+
+
+def test_a_failure_accepted_by_hand_stays_on_record_and_the_sequence_goes_on_past_it(tmp_path, monkeypatch):
+    order: list[str] = []
+    step_stubs(monkeypatch, {"e2": False}, order)
+    ctx, _ = make_ctx(tmp_path, FakeRunner())
+    assert S.sequence(ctx)[0] == "stopped" and order[-1] == "e2"
+    order.clear()
+    assert S.sequence(resumed(ctx, accept_failed=("e2",))) == ("complete", None)
+    assert order == ["labels", "sft", "sft_panels", "init", "run1"]  # e2 would fail again; it is not run
+    entry = json.loads((ctx.s2 / "gates.json").read_text())["steps"]["e2"]
+    assert entry["status"] == "accepted" and entry["accepted"] == ctx.now()
+    assert entry["gates"][0]["passed"] is False and "FAIL e2 gate" in entry["reason"]
+    assert "e2: its failure is accepted by hand ([sequence] accept_failed), skipped" in (
+        (ctx.s2 / "progress.log").read_text()
+    )
+    order.clear()
+    assert S.sequence(resumed(ctx, accept_failed=("e2",))) == ("complete", None) and order == []
+
+
+def test_accepting_a_steps_failure_never_skips_the_step_before_it_has_failed(tmp_path, monkeypatch):
+    order: list[str] = []
+    step_stubs(monkeypatch, {"e2": False}, order)
+    ctx, _ = make_ctx(tmp_path, FakeRunner(), calls='accept_failed = ["e2"]')
+    assert ctx.settings.accept_failed == ("e2",)
+    verdict, reason = S.sequence(ctx)
+    assert verdict == "stopped" and reason.startswith("e2: FAIL e2 gate") and order[-1] == "e2"
+
+
+def test_stop_after_ends_the_sequence_after_that_step_on_every_resume_until_it_is_removed(tmp_path, monkeypatch):
+    order: list[str] = []
+    step_stubs(monkeypatch, {}, order)
+    ctx, _ = make_ctx(tmp_path, FakeRunner(), calls='stop_after = "sft_panels"')
+    stop = "sft_panels: the sequence stops after it ([sequence] stop_after)"
+    assert S.sequence(ctx) == ("stopped", stop)
+    assert order == list(S.STEPS)[: S.STEPS.index("sft_panels") + 1]
+    order.clear()
+    assert S.sequence(resumed(ctx)) == ("stopped", stop) and order == []  # sft_panels passed: still the stop
+    assert S.sequence(resumed(ctx, stop_after="")) == ("complete", None) and order == ["init", "run1"]
+
+
+def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(tmp_path):
+    whole = S.check_dir(make_config_dir(tmp_path / "a"), 600)
+    cdir = make_config_dir(tmp_path / "b", 'stop_after = "sft_panels"')
+    part, settings = S.check_dir(cdir, 600), S.load_settings(cdir / "sequence.toml")
+    assert part["expected_hours"] == pytest.approx(whole["expected_hours"] - float(settings["run1"]["expected_hours"]))
+    assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
+
+
+@pytest.mark.parametrize(
+    ("calls", "message"),
+    [('stop_after = "run2"', "names no step 'run2'"),
+     ('accept_failed = ["e3"]', "names no step 'e3'"),
+     ('skip = ["e2"]', "unknown \\[sequence\\] keys: skip")],
+)  # fmt: skip
+def test_a_sequence_call_that_names_no_step_or_has_an_unknown_key_is_refused(tmp_path, calls, message):
+    cdir = make_config_dir(tmp_path, calls)
+    with pytest.raises(ValueError, match=message):
+        S.load_settings(cdir / "sequence.toml")
 
 
 def test_a_step_cap_is_enforced_as_a_timeout_on_each_command_inside_it(tmp_path):

@@ -12,6 +12,10 @@ root = "/var/lib/zeroad-live/train/s2"
 [s3]
 uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
 
+[sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
+accept_failed = ["e2"]     # 9 Nov: E2 failed twice; its gates stay on record and the sequence goes on to distillation
+stop_after = "sft_panels"  # 9 Nov: distillation only; whether Run 1 runs is decided on the SFT panels' results
+
 [e1]                       # GPU gates
 config = "e1.toml"
 cap_hours = 0.75

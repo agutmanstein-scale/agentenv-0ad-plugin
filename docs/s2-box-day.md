@@ -38,6 +38,15 @@ fails E1 has cost about $16 (bootstrap and E1). E2 comes after the baselines bec
 (next section), so a box that fails E2 has cost about $110: the baselines' $27 of box and $41 of frontier games are
 spent before the control runs. What it saves is the labels ($68), the SFT and its panels, and Run 1's $140.
 
+Going on past a failed step is a person's call, never the sequencer's, and it is written down in `sequence.toml`'s
+`[sequence]` table, which every `--resume` reads again. `accept_failed = ["e2"]` skips a step whose recorded failure was
+accepted (its gates stay in `gates.json`, its status becomes `accepted`; a step that never failed still runs), and
+`stop_after = "sft_panels"` stops the sequence after that step, with the usual report, upload and power-off. Only the
+steps up to `stop_after` count in the expected hours that `start` checks. 9 Nov: E2 failed twice (on the second attempt
+its trained policy's median army was 4 against the control's 2, p 0.36, with three trips; against 442 games of v0 on
+E2's kind of games both attempts were only marginally better, p 0.08 and 0.06), so E2 was accepted and the sequence
+runs the distillation steps only; Run 1 is decided on the SFT panels' results.
+
 ### Why the tripwire baseline sits between the baselines and E2
 
 The banded collapse tripwires (completion length, tool calls per decision, exact-completion share, distinct fraction,
