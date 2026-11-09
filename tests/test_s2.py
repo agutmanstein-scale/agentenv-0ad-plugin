@@ -392,7 +392,7 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day():
     numbers = S.check_dir(LIVE_S2, 600)
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
-    assert 21 <= numbers["expected_hours"] <= 22 and numbers["cap_hours"] > numbers["expected_hours"]
+    assert 22 <= numbers["expected_hours"] <= 23 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
@@ -506,7 +506,7 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (6.0, 110.0),
         (0.1, 0),
         (0.5, 0),
-        (2.6, 0),
+        (3.8, 0),
         (1.0, 132.0),
         (1.25, 0),
         (4.0, 0),
@@ -666,9 +666,19 @@ def install_baseline(ctx, records: int = 12) -> Path:
     return ctx.s2 / "baseline.json"
 
 
+def install_e2_baseline(ctx, records: int = 12) -> Path:
+    """What E2's own baseline run leaves in its root: baseline.json and the records it was made from."""
+    root = S.load_config(ctx.configs.path / "e2-baseline.toml").root
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "baseline.json").write_text(json.dumps({"distinct_fraction": {"mean": 0.36, "sd": 0.02}}))
+    (root / "baseline-records.jsonl").write_text("".join(json.dumps({"entropy": 1.0}) + "\n" for _ in range(records)))
+    return root
+
+
 def test_e2_and_run_one_refuse_to_start_without_a_tripwire_baseline_of_enough_records(tmp_path):
     runner = FakeRunner()
     ctx, _ = make_ctx(tmp_path, runner)
+    ctx.settings.tables["e2"]["baseline_config"] = ""  # E2 on the baselines' tripwire baseline, as on 6 Nov
     with pytest.raises(S.StepFailed, match="no tripwire baseline.*is missing with 0 of 10 records"):
         run_step(ctx, "e2")
     install_baseline(ctx, records=9)
@@ -681,31 +691,99 @@ def test_e2_passes_when_the_trained_policy_out_armies_the_frozen_arm_and_fails_o
     ok = FakeRunner()
     ctx, _ = make_ctx(tmp_path, ok)
     ok.effects = e2_world(ctx, policy_army=9, control_army=3)
-    install_baseline(ctx)
+    install_e2_baseline(ctx)
     out = run_step(ctx, "e2")
     assert out.passed, out.why()
     assert out.detail["medians"]["policy"] > 8 and out.detail["n_policy"] == 40 == out.detail["n_control"]
     assert len(ok.calls) == 1 and "e2.toml" in ok.calls[0][2]
     assert ok.calls[0][3:] == [
         "--baseline",
-        str(ctx.s2 / "baseline.json"),
-    ]  # an RL run: a learner with the tripwire baseline
+        str(ctx.s2 / "baseline-e2.json"),
+        "--lr",
+        "3e-05",
+    ]  # an RL run: a learner banded on E2's own games, at E2's learning rate
+    assert json.loads((ctx.s2 / "baseline-e2.json").read_text())["distinct_fraction"]["mean"] == 0.36
     flat = FakeRunner()
     ctx, _ = make_ctx(tmp_path / "flat", flat)
-    install_baseline(ctx)
+    install_e2_baseline(ctx)
     flat.effects = e2_world(ctx, policy_army=3, control_army=3)
     out = run_step(ctx, "e2")
     assert not out.passed and "Mann-Whitney" in out.why() and "median army" in out.why()
     tripped = FakeRunner()
     ctx, _ = make_ctx(tmp_path / "trip", tripped)
-    install_baseline(ctx)
+    install_e2_baseline(ctx)
     tripped.effects = e2_world(ctx, policy_army=9, control_army=3, trips=2)
     assert "tripwire trips" in run_step(ctx, "e2").why()
     crashed = FakeRunner()
     ctx, _ = make_ctx(tmp_path / "crash", crashed)
-    install_baseline(ctx)
+    install_e2_baseline(ctx)
     crashed.effects = e2_world(ctx, policy_army=9, control_army=3, reason="tripwire: grad norm")
     assert "the run ended normally" in run_step(ctx, "e2").why()
+
+
+def test_e2_first_plays_v0_on_its_own_games_and_bands_its_tripwires_on_them_then_reuses_that(tmp_path, monkeypatch):
+    from agentenv_zeroad.train import baseline
+
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    root = S.load_config(ctx.configs.path / "e2-baseline.toml").root
+    seen = {}
+
+    def v0_rows(games, out, credit):
+        seen["games"], seen["positive_control"] = games, credit.cfg.positive_control
+        out.write_text("{}\n")
+        return {"rows": 3000, "games": 300, "skipped": 0}
+
+    def play(argv):
+        (root / "orchestrator").mkdir(parents=True, exist_ok=True)
+        (root / "orchestrator" / "final.json").write_text(json.dumps({"reason": "duration"}))
+        return 0
+
+    monkeypatch.setattr(baseline, "v0_rows", v0_rows)
+    runner.effects = {
+        "e2-baseline.toml --play-only": play,
+        "e2-baseline.toml --stats-only": lambda argv: install_e2_baseline(ctx) and 0,
+        **e2_world(ctx, policy_army=9, control_army=3),
+    }
+    out = run_step(ctx, "e2")
+    assert out.passed, out.why()
+    lines = [line.split("box/train-run.sh ", 1)[1] for line in runner.lines()]
+    assert [line.split()[0].rsplit("/", 1)[1] + " " + line.split()[1] for line in lines] == [
+        "e2-baseline.toml --play-only", "e2-baseline.toml --stats-only", "e2.toml --baseline",
+    ]  # fmt: skip
+    assert seen == {"games": root / "games", "positive_control": True}  # E2's games, E2's credit
+    runner.calls.clear()
+    runner.effects = {}
+    run_step(ctx, "e2")  # resumed: the baseline is there, only the training run is started again
+    assert len(runner.calls) == 1 and "e2.toml" in runner.calls[0][2]
+
+
+def test_e2_without_enough_v0_decisions_on_its_games_stops_before_training(tmp_path, monkeypatch):
+    from agentenv_zeroad.train import baseline
+
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    monkeypatch.setattr(baseline, "v0_rows", lambda games, out, credit: {"rows": 900, "games": 90, "skipped": 0})
+    with pytest.raises(S.StepFailed, match="too few v0 decisions on E2's games.*900 of 2560"):
+        run_step(ctx, "e2")
+    assert len(runner.calls) == 1 and "--play-only" in runner.calls[0]
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (('seed = 2', 'seed = 2\n\n[[panels]]\nname = "x"\nkind = "heldout"\nat_hours = 0\nversion = 0\ngames = 4'),
+         "no panels"),
+        (("s2/e2-baseline", "s2/e2b"), "must not be E2's own"),
+    ],
+)  # fmt: skip
+def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_refused(tmp_path, edit, message):
+    cdir = make_config_dir(tmp_path)
+    path = cdir / "e2-baseline.toml"
+    assert edit[0] in path.read_text()
+    path.write_text(path.read_text().replace(edit[0], edit[1]))
+    with pytest.raises(ValueError, match=message):
+        S.check_dir(cdir, 600)
 
 
 def test_e2_counts_only_trained_games_for_the_policy_and_only_v0s_for_the_control(tmp_path):

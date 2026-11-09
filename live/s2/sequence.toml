@@ -30,8 +30,10 @@ min_records = 10           # the baseline file must come from at least this many
 
 [e2]                       # positive control; runs after the baselines so it can be given the baseline
 config = "e2.toml"
-cap_hours = 2.6            # e2.toml's duration_hours (2) + its drain and upload
-expected_hours = 2.3
+cap_hours = 3.8            # its baseline (0.75 h of games, then the stats-only learner) + e2.toml's 2 h + drains and uploads
+expected_hours = 3.3
+baseline_config = "e2-baseline.toml"   # 9 Nov: band E2's tripwires on its own kind of games (see that file)
+lr = 3e-5                  # 9 Nov: at the default 1e-5 the policy moved little (KL to base at most 0.0008, the alarm 0.10)
 control_panel = "control-v0"   # the frozen-v0 arm, a panel in e2.toml
 window_games = 40          # the policy's last games that are compared with the control
 min_games = 30             # in the smaller arm

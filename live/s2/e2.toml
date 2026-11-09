@@ -1,8 +1,9 @@
 # E2, the positive control: a short RL run on a reward the policy can raise with the tools it has (its army at minute
 # 10, z-scored per opponent), 12-minute games against Petra-1 and Petra-2. The frozen-v0 arm plays beside it as the
 # `control-v0` panel on the same kind of games. The adapters it publishes stay in this root and are never used again.
-run_id = "s2-e2"
-root = "/var/lib/zeroad-live/train/s2/e2"
+# Second attempt (9 Nov): its own root and prefix, so the first attempt's files (s2-e2) stay as they were.
+run_id = "s2-e2b"
+root = "/var/lib/zeroad-live/train/s2/e2b"
 duration_hours = 2
 budget_usd = 600            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
@@ -46,4 +47,4 @@ time_cap_minutes = 12
 opponents = { "petra-1" = 0.5, "petra-2" = 0.5 }
 
 [s3]
-uri = "s3://BUCKET/zeroad-train/run/s2-e2"
+uri = "s3://BUCKET/zeroad-train/run/s2-e2b"

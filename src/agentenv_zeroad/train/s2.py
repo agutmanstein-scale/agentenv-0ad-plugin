@@ -66,6 +66,7 @@ GRACE_S = 2400.0  # an orchestrator told to stop uploads for up to 3 x 10 minute
 SFT_PREFIX = "sft-epoch"
 SFT_REST = "sft-rest"  # the chosen epoch's second panel: the held-out configs the epoch panels did not play
 BASELINE_FILE = "baseline.json"  # ROOT/s2/baseline.json, the tripwire baseline; its records are in the baselines root
+E2_BASELINE_FILE = "baseline-e2.json"  # ROOT/s2/baseline-e2.json, E2's own when [e2] baseline_config is set
 DECISIONS_PER_UPDATE = 256  # the learner's batch: one health record per this many decisions
 
 # Every table of sequence.toml with its keys and their defaults; a key not listed is an error.
@@ -94,6 +95,8 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "max_p": 0.01,
         "min_updates": 5,
         "minute": 10.0,
+        "baseline_config": "",  # a play-only v0 run on E2's kind of games whose health records band E2's tripwires
+        "lr": 0.0,  # the learner's learning rate for E2; 0 keeps the learner's default
     },
     "baselines": {
         "config": "baselines.toml",
@@ -286,6 +289,20 @@ def check_dir(path: Path, budget: float | None = None) -> dict[str, Any]:
             )
         if cfg.s3_uri is None:
             raise ValueError(f"{step}: s3.uri is required: a step nobody uploads is lost with the box")
+    if settings["e2"]["baseline_config"]:
+        cfg = load_config(path / str(settings["e2"]["baseline_config"]))
+        check_run(cfg)
+        rates.add(cfg.box_usd_per_hour)
+        if cfg.shutdown or cfg.s3_uri is None or cfg.panels:
+            raise ValueError(
+                "e2 baseline_config: shutdown must be false, s3.uri set and no panels (its games are v0's)"
+            )
+        try:
+            cfg.root.relative_to(settings.root)
+        except ValueError as e:
+            raise ValueError(f"e2 baseline_config: root {cfg.root} is not under the sequence root") from e
+        if cfg.root == configs.load("e2").root:
+            raise ValueError("e2 baseline_config: its root must not be E2's own")
     if len(rates) != 1:
         raise ValueError(f"the step configs name different box rates: {sorted(rates)}")
     _check_panel_names(configs, settings)
@@ -597,7 +614,10 @@ def armies(folder: Path, minute: float, *, trained_only: bool, last: int | None 
 
 def step_e2(ctx: Ctx) -> Outcome:
     s, cfg = ctx.settings["e2"], ctx.cfg("e2")
-    ctx.train_run(ctx.configs.file("e2"), baseline_flags(ctx), label="control run")
+    flags = e2_baseline_flags(ctx) if s["baseline_config"] else baseline_flags(ctx)
+    if float(s["lr"]) > 0:
+        flags = [*flags, "--lr", f"{float(s['lr']):g}"]
+    ctx.train_run(ctx.configs.file("e2"), flags, label="control run")
     minute = float(s["minute"])
     policy = armies(cfg.root / "games", minute, trained_only=True, last=int(s["window_games"]))
     control = armies(cfg.root / "panels" / str(s["control_panel"]), minute, trained_only=False)
@@ -687,12 +707,46 @@ def step_calibration(ctx: Ctx) -> Outcome:
     return out
 
 
-def baseline_records(ctx: Ctx) -> int:
-    """Health records behind ROOT/s2/baseline.json (the stats-only learner's, in the baselines root); 0 if none."""
-    path = ctx.cfg("baselines").root / "baseline-records.jsonl"
+def baseline_records(ctx: Ctx, root: Path | None = None) -> int:
+    """Health records behind a stats-only learner's baseline.json in `root` (the baselines root unless given)."""
+    path = (root or ctx.cfg("baselines").root) / "baseline-records.jsonl"
     with contextlib.suppress(OSError):
         return sum(1 for line in path.read_text().splitlines() if line.strip())
     return 0
+
+
+def e2_baseline_flags(ctx: Ctx) -> list[str]:
+    """`--baseline ROOT/s2/baseline-e2.json`: v0's health records on E2's own kind of games. The tripwire baseline
+    comes from the 30-minute baseline games, and on E2's 12-minute games v0 itself falls outside its distinct-completion
+    band (6 Nov: both of E2's trips came at its first records, KL to base 0.0000). `baseline_config` is a play-only v0
+    run of those games; its games are credited with E2's credit and measured by the stats-only learner. A file already
+    made with enough records is reused, so a resumed E2 does not play them again."""
+    from agentenv_zeroad.train import baseline
+
+    need = int(ctx.settings["tripwire"]["min_records"])
+    path = ctx.configs.path / str(ctx.settings["e2"]["baseline_config"])
+    cfg = load_config(path)
+    produced, target = cfg.root / BASELINE_FILE, ctx.s2 / E2_BASELINE_FILE
+    if not (produced.is_file() and baseline_records(ctx, cfg.root) >= need):
+        if final_reason(cfg.root).split(":")[0] not in ("duration", "complete"):
+            ctx.train_run(path, ["--play-only"], "E2-type v0 games")
+        rows = cfg.root / "baseline-rows.jsonl"
+        made = baseline.v0_rows(cfg.root / "games", rows, baseline.credit_for(ctx.cfg("e2")))
+        if made["rows"] < need * DECISIONS_PER_UPDATE:
+            raise StepFailed(
+                f"too few v0 decisions on E2's games for its tripwire baseline: {made['rows']} of "
+                f"{need * DECISIONS_PER_UPDATE} ({made['games']} games)"
+            )
+        for stale in (produced, cfg.root / "baseline-records.jsonl"):
+            stale.unlink(missing_ok=True)
+        rc = ctx.train_run(path, ["--stats-only", str(rows)], "E2-type stats-only learner")
+        have = baseline_records(ctx, cfg.root)
+        if rc != 0 or not produced.is_file() or have < need:
+            raise StepFailed(f"no E2 tripwire baseline: exit {rc}, {have} of {need} records in {cfg.root}")
+        ctx.say(f"e2: tripwire baseline from {made['rows']} v0 decisions in {made['games']} of E2's games")
+    ctx.s2.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(produced, target)
+    return ["--baseline", str(target)]
 
 
 def baseline_flags(ctx: Ctx) -> list[str]:
