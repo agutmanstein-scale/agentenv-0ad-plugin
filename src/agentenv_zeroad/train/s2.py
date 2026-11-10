@@ -46,6 +46,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -258,11 +259,19 @@ def render_sft_panels(template: str, versions: Mapping[int, int], games: int) ->
     return template.rstrip() + "\n" + blocks
 
 
-def render_rest_panel(template: str, version: int, start: int, games: int) -> str:
+def render_rest_panel(template: str, version: int, start: int, games: int, hours_before: float = 0.0) -> str:
     """The chosen epoch's second config: the template plus one held-out panel of the configs `start` .. `start + games`
-    of the held-out sequence (the ones the epoch panels did not play), pinned to the chosen adapter version."""
+    of the held-out sequence (the ones the epoch panels did not play), pinned to the chosen adapter version. The root's
+    run clock counts on across runs, so its duration_hours is the template's on top of the `hours_before` the clock
+    already shows: the epoch panels' hours."""
+    own = float(tomllib.loads(template)["duration_hours"])
+    text, n = re.subn(
+        r"^duration_hours\s*=.*$", f"duration_hours = {hours_before + own:.4f}", template, count=1, flags=re.M
+    )
+    if n != 1:
+        raise ValueError("the sft_panels config has no duration_hours line")
     return (
-        template.rstrip()
+        text.rstrip()
         + f'\n\n[[panels]]\nname = "{SFT_REST}"\nkind = "heldout"\nat_hours = 0\nversion = {version}\n'
         + f"start = {start}\ngames = {games}\n"
     )
@@ -960,8 +969,15 @@ def step_sft_panels(ctx: Ctx) -> Outcome:
         if chosen:
             first, total = int(s["panel_games"]), int(s["heldout_games"])
             rest = ctx.s2 / "generated" / "sft-rest.toml"
+            clock = read_json(cfg.root / "orchestrator" / "clock.json") or {}
             rest.write_text(
-                render_rest_panel(text, versions[int(str(chosen).removeprefix("epoch"))], first, total - first)
+                render_rest_panel(
+                    text,
+                    versions[int(str(chosen).removeprefix("epoch"))],
+                    first,
+                    total - first,
+                    float(clock.get("hours", 0.0)),
+                )
             )
             ctx.say(f"sft_panels: {chosen} plays the other {total - first} held-out configs")
             ctx.train_run(rest, ["--play-only"], "chosen epoch rest")

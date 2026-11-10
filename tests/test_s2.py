@@ -1093,6 +1093,8 @@ def test_the_chosen_epoch_then_plays_the_remaining_held_out_configs_under_its_ow
             (folder / "summary.json").write_text(json.dumps({"games": n, "finished": n}))
         (root / "orchestrator").mkdir(parents=True, exist_ok=True)
         (root / "orchestrator" / "final.json").write_text(json.dumps({"reason": "complete"}))
+        if not rest:  # the root's run clock, which the second run counts on from
+            (root / "orchestrator" / "clock.json").write_text(json.dumps({"hours": 2.36}))
         return 0
 
     runner.effects = {"train-run.sh": play}
@@ -1104,6 +1106,8 @@ def test_the_chosen_epoch_then_plays_the_remaining_held_out_configs_under_its_ow
     cfg = S.load_config(ctx.s2 / "generated" / "sft-rest.toml")
     [panel] = cfg.panels
     assert (panel.name, panel.version, panel.start, panel.games, panel.kind) == ("sft-rest", 20, 192, 192, "heldout")
+    own = S.load_config(ctx.s2 / "generated" / "sft-panels.toml").duration_hours
+    assert cfg.duration_hours == pytest.approx(2.36 + own)  # its own hours, not what the epoch panels left of theirs
     assert any("sft-rest" in g.name for g in out.gates)
     first, total = 192, 384
     assert first + panel.games == total  # together: v0's 384 configs
