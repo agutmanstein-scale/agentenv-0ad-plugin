@@ -78,7 +78,8 @@ lr = 1e-4
 
 [sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel; the chosen one then plays the rest
 config = "sft-panels.toml"
-cap_hours = 5.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games
+cap_hours = 4.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games;
+                           # 10 Nov: 2.4 h, then 1.3 h at 147 games/h. The guard charges all of it before the step starts
 expected_hours = 2.8
 panel_games = 192          # per epoch: enough to choose between epochs
 heldout_games = 384        # the held-out panel's size (baselines.toml): the chosen epoch plays heldout_games - panel_games more,
