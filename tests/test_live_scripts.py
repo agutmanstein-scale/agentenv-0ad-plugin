@@ -1909,11 +1909,14 @@ def s2_stubs(stubs, extra: str = ""):
     return stubs
 
 
-def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_sequence():
+def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_sequence(tmp_path):
     from agentenv_zeroad.train.s2 import check_dir
 
     env = dict(line.split("=", 1) for line in S2_ENV.read_text().splitlines() if re.match(r"^[A-Z0-9_]+=", line))
-    numbers = check_dir(S2_DIR, float(env["LIVE_BUDGET_USD"]))
+    whole = shutil.copytree(S2_DIR, tmp_path / "s2")  # the whole plan: without this run's [sequence] calls
+    seq = whole / "sequence.toml"
+    seq.write_text(re.sub(r"^\[sequence\].*?(?=^\[)", "", seq.read_text(), count=1, flags=re.M | re.S))
+    numbers = check_dir(whole, float(env["LIVE_BUDGET_USD"]))
     assert env["LIVE_GPU_TYPES"].strip('"').split() == ["g6e.12xlarge", "g6e.24xlarge"]
     assert dict(p.split("=") for p in env["LIVE_GPU_RATES"].strip('"').split()) == {
         "g6e.12xlarge": "10.49",

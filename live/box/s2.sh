@@ -7,8 +7,8 @@
 # its panels and one sample game, the guards the sequence relies on). `start` refuses while a sequence is going, while
 # a vLLM instance is down, when the configs' box rate is not this box's, when a sequence already left gates.json
 # (--resume continues it, skipping the steps that passed; --fresh moves it aside), when the power-off deadline leaves less
-# than the sequence's expected hours, and when budget.sh says --budget would be passed by the box hours so far plus
-# those. `status` prints the unit, the gate verdicts, the step's orchestrator status and the learner's latest health.
+# than the sequence's expected hours (on --resume, those of the steps it still runs), and when budget.sh says --budget
+# would be passed by the box hours so far plus those. `status` prints the unit, the gate verdicts, the step's orchestrator status and the learner's latest health.
 # `stop` sends SIGTERM: the running step stops and uploads, the report and the sequence's files are uploaded, and the
 # box stays up (no power-off after a stop by hand).
 # shellcheck source=lib.sh
@@ -70,7 +70,8 @@ PY
       done
     fi
     if [ -d "$CONFIGDIR" ]; then
-      numbers=$("${PY[@]}" check "$CONFIGDIR" --budget "$BUDGET") || die "the config directory $CONFIGDIR is not valid for a budget of \$$BUDGET"
+      resume=(); [ "$MODE" != --resume ] || resume=(--resume-from "$S2")  # a resume is held to the steps it still runs
+      numbers=$("${PY[@]}" check "$CONFIGDIR" --budget "$BUDGET" ${resume[@]+"${resume[@]}"}) || die "the config directory $CONFIGDIR is not valid for a budget of \$$BUDGET"
       eval "$numbers"
     else
       S2_EXPECTED_HOURS=0.5 S2_BOX_USD_PER_HOUR=${ZEROAD_BOX_USD_PER_HOUR:-0}

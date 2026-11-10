@@ -604,6 +604,23 @@ def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(
     assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
 
 
+def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
+    cdir = make_config_dir(tmp_path / "c", 'accept_failed = ["e2"]\nstop_after = "sft_panels"')
+    settings = S.load_settings(cdir / "sequence.toml")
+    s2 = tmp_path / "s2"
+    s2.mkdir()
+    status = {"e1": "passed", "baselines": "passed", "calibration": "passed", "tripwire": "passed", "e2": "failed",
+              "labels": "passed", "sft": "failed"}  # fmt: skip
+    (s2 / "gates.json").write_text(
+        json.dumps({"verdict": "stopped", "steps": {k: {"status": v} for k, v in status.items()}})
+    )
+    left = S.check_dir(cdir, 600, s2)["expected_hours"]
+    assert left == pytest.approx(
+        float(settings["sft"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
+    )
+    assert S.check_dir(cdir, 600, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 600)["expected_hours"]
+
+
 @pytest.mark.parametrize(
     ("calls", "message"),
     [('stop_after = "run2"', "names no step 'run2'"),

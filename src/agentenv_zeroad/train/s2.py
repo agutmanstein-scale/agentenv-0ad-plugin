@@ -53,7 +53,7 @@ import sys
 import time
 import tomllib
 import traceback
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -203,18 +203,22 @@ class Settings:
     def cap_h(self, step: str) -> float:
         return float(self.tables[step]["cap_hours"])
 
-    def counted_tables(self) -> list[str]:
-        """The tables of the steps this sequence can still reach: all of them, or those up to stop_after."""
+    def counted_tables(self, skipped: Collection[str] = ()) -> list[str]:
+        """The tables of the steps this sequence can still reach (all of them, or those up to stop_after), less the
+        `skipped` steps a resume passes over."""
         steps = STEPS[: STEPS.index(self.stop_after) + 1] if self.stop_after else STEPS
-        return [CAP_TABLE.get(s, s) for s in steps if CAP_TABLE.get(s, s) in self.tables]
+        return [CAP_TABLE.get(s, s) for s in steps if s not in skipped and CAP_TABLE.get(s, s) in self.tables]
 
     @property
     def total_cap_hours(self) -> float:
         return sum(self.cap_h(t) for t in self.counted_tables())
 
+    def expected_hours(self, skipped: Collection[str] = ()) -> float:
+        return sum(float(self.tables[t]["expected_hours"]) for t in self.counted_tables(skipped))
+
     @property
     def total_expected_hours(self) -> float:
-        return sum(float(self.tables[t]["expected_hours"]) for t in self.counted_tables())
+        return self.expected_hours()
 
 
 def load_settings(path: Path) -> Settings:
@@ -281,9 +285,10 @@ class ConfigDir:
         return load_config(self.file(step))
 
 
-def check_dir(path: Path, budget: float | None = None) -> dict[str, Any]:
+def check_dir(path: Path, budget: float | None = None, resume_from: Path | None = None) -> dict[str, Any]:
     """Validate a config directory (every step's config through `check_run`, the guards the sequence relies on) and
-    return its numbers. Raises ValueError with the first problem."""
+    return its numbers. With `resume_from` (a sequence's folder), the expected hours are those of the steps a --resume
+    of it still runs. Raises ValueError with the first problem."""
     settings = load_settings(path / "sequence.toml")
     configs = ConfigDir(path, settings)
     rates, frontier = set(), False
@@ -342,7 +347,7 @@ def check_dir(path: Path, budget: float | None = None) -> dict[str, Any]:
     return {
         "root": str(settings.root),
         "cap_hours": settings.total_cap_hours,
-        "expected_hours": settings.total_expected_hours,
+        "expected_hours": settings.expected_hours(resumed_steps(settings, resume_from) if resume_from else ()),
         "run1_hours": configs.load("run1").duration_hours,
         "rate": rates.pop(),
         "frontier": frontier,
@@ -519,6 +524,18 @@ class Ctx:
 
     def cfg(self, step: str, **kw: Any) -> RunConfig:
         return self.configs.load(step, **kw)
+
+
+def resumed_steps(settings: Settings, s2: Path) -> set[str]:
+    """The steps a --resume of the sequence in `s2` passes over: those that passed, those accepted by hand, and the
+    failed ones its [sequence] accept_failed now accepts."""
+    steps = (read_json(s2 / "gates.json") or {}).get("steps", {})
+    return {
+        name
+        for name, entry in steps.items()
+        if entry.get("status") in ("passed", "accepted")
+        or (entry.get("status") == "failed" and name in settings.accept_failed)
+    }
 
 
 def read_json(path: Path) -> Any:
@@ -1187,6 +1204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     c = sub.add_parser("check", help="validate a config directory and print its numbers")
     c.add_argument("dir", type=Path)
     c.add_argument("--budget", type=float)
+    c.add_argument("--resume-from", type=Path, help="a sequence's folder: expect only the steps a --resume still runs")
     r = sub.add_parser("run", help="run the sequence (the zeroad-s2 unit's process)")
     r.add_argument("--config-dir", type=Path, required=True)
     r.add_argument("--budget", type=float, required=True)
@@ -1198,7 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.cmd == "check":
         try:
-            numbers = check_dir(args.dir, args.budget)
+            numbers = check_dir(args.dir, args.budget, args.resume_from)
         except (ValueError, OSError) as e:
             print(f"the S2 config directory is not valid: {e}", file=sys.stderr)
             return 1
