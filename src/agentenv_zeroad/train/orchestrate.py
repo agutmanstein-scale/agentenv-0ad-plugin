@@ -56,7 +56,10 @@ What it does, each on its own interval:
   tripwatch (`tripwatch.json`), credit (`credit.json`), the game stream's random state (`factory.json`), and the
   panels, queues, games in flight and counts (`state.json`, with `keep.json`'s hourly adapters). A restarted process
   loads them, moves the game folders the old one left half done to ROOT/voided and replays those games, and the
-  panel games a stop cancelled (`stopped` in the panel's games.jsonl).
+  panel games a stop cancelled (`stopped` or `dropped` in the panel's games.jsonl). A panel's games.jsonl is its
+  record: a game that finished there is never played again, even by a run that starts the panel afresh in a root
+  another run used (the SFT epoch panels, then the rest), and a queued game of a panel this run does not have is
+  dropped.
 - Stopping. On completion, budget, a second trip or SIGTERM (and on an unexpected error: `run` always ends in `finish`):
   no new games; a finished run drains the games in flight (up to `drain_timeout_s`) while the other reasons cancel them
   (recorded as `stopped`, not voided; a restart replays the panel ones); the learner is told to stop (unless
@@ -466,38 +469,66 @@ class Orchestrator:
                 continue
             (self.panel_queue if pending.kind == "panel" else self.requeue).appendleft(pending)
             self.counts["interrupted"] += 1
-        self._replay_stopped_panel_games()
+        self._reconcile_panels()
 
-    def _replay_stopped_panel_games(self) -> None:
-        """A panel game that a stop cancelled is written down as `stopped` and kept in no queue, so a restarted panel
-        would never finish: queue each game of an unfinished panel whose last ledger line says `stopped` again, as a
-        new attempt, up to the number of games the panel still lacks."""
+    def _panel_record(
+        self, name: str, version: int, specs: Sequence[GameSpec]
+    ) -> tuple[dict[str, GameSpec], set[str], dict[str, int], set[str]]:
+        """A panel's specs by base id, those that finished in its games.jsonl (not voided, results read), the highest
+        attempt of each, and those a stop cancelled or never started: last line `stopped` or `dropped`, or none."""
+        by_base = {f"{name}-v{version}-{s.game_id}": s for s in specs}
+        done: set[str] = set()
+        top: dict[str, int] = {}
+        last: dict[str, str] = {}
+        for line in _jsonl(self.root / "panels" / name / "games.jsonl"):
+            base, attempt = _base_and_attempt(str(line.get("game_id", "")), by_base)
+            if base is None:
+                continue
+            top[base] = max(top.get(base, 0), attempt)
+            last[base] = str(line.get("status"))
+            if last[base] == "finished" and "void" not in line and "error" not in line:
+                done.add(base)
+        open_ = {b for b in by_base if b not in done and last.get(b, "dropped") in ("stopped", "dropped")}
+        return by_base, done, top, open_
+
+    def _recorded_specs(self, name: str, run: PanelRun) -> list[GameSpec] | None:
+        folder = self.root / "panels" / name
+        try:
+            recorded = folder / "specs.jsonl"
+            return load_specs(recorded) if recorded.is_file() else panel_specs(self.cfg, run.config)
+        except (OSError, ValueError) as e:
+            log.error("panel %s: its specs are unreadable (%s); its stopped games are not replayed", name, e)
+            return None
+
+    def _reconcile_panels(self) -> None:
+        """Square the restored panels with their records. A queued game of a panel this run does not have, or one
+        that already finished, is dropped from the queue; a game a stop cancelled (`stopped`, kept in no queue) or a
+        dropped one no queue holds is queued again as a new attempt; and a panel's games left are the ones queued."""
+        configured = {p.name for p in self.cfg.panels}
+        foreign = sum(p.panel not in configured for p in self.panel_queue)
+        if foreign:
+            log.warning("dropping %d queued games of panels this run does not have", foreign)
+            self.panel_queue = deque(p for p in self.panel_queue if p.panel in configured)
         for name, run in self.panels.items():
+            specs = self._recorded_specs(name, run)
+            if specs is None:
+                continue
+            by_base, done, top, open_ = self._panel_record(name, run.version, specs)
+            before = len(self.panel_queue)
+            self.panel_queue = deque(p for p in self.panel_queue if p.panel != name or p.base_id not in done)
+            self.counts["panel_already_finished"] += before - len(self.panel_queue)
             queued = {p.base_id for p in self.panel_queue if p.panel == name}
-            lacking = run.remaining - len(queued)
-            if lacking <= 0:
-                continue
-            folder = self.root / "panels" / name
-            try:
-                recorded = folder / "specs.jsonl"
-                found = load_specs(recorded) if recorded.is_file() else panel_specs(self.cfg, run.config)
-            except (OSError, ValueError) as e:
-                log.error("panel %s: its specs are unreadable (%s); its stopped games are not replayed", name, e)
-                continue
-            specs = {f"{name}-v{run.version}-{s.game_id}": s for s in found}
-            last: dict[str, tuple[str, int]] = {}
-            for line in _jsonl(folder / "games.jsonl"):
-                base, attempt = _base_and_attempt(str(line.get("game_id", "")), specs)
-                if base is not None:
-                    last[base] = (str(line.get("status")), attempt)
-            stopped = [b for b in specs if b not in queued and last.get(b, ("", 0))[0] == "stopped"]
-            if len(stopped) != lacking:
-                log.warning("panel %s lacks %d games and %d were stopped", name, lacking, len(stopped))
-            replays = [Pending(specs[b], "panel", b, name, run.version, last[b][1] + 1) for b in stopped[:lacking]]
+            replays = [Pending(by_base[b], "panel", b, name, run.version, top.get(b, 0) + 1) for b in by_base
+                       if b in open_ and b not in queued and b in top]  # fmt: skip
             self.panel_queue.extendleft(reversed(replays))
             self.counts["panel_replayed_after_stop"] += len(replays)
             if replays:
                 log.info("panel %s: replaying %d games a stop cancelled", name, len(replays))
+            run.games, run.finished = len(by_base), max(run.finished, len(done))  # games: 0 if its adapter was gone
+            run.remaining = len(queued) + len(replays)
+            if run.remaining == 0:
+                self.adapters.release(run.version)
+                self._write_panel_summary(run)
 
     def _set_aside_unfinished(self) -> None:
         """A game folder with no results.json was cut off by a stop or a crash: it goes to ROOT/voided."""
@@ -982,21 +1013,28 @@ class Orchestrator:
                 continue
             calibration = panel.kind == "teacher_calibration"
             version = 0 if calibration else panel.version if panel.version is not None else self.current
+            specs = panel_specs(self.cfg, panel)
+            by_base, done, top, open_ = self._panel_record(panel.name, version, specs)
+            todo = [b for b in by_base if b in open_]  # a game this root's record has finished is not played again
+            if not todo:
+                self.panels[panel.name] = PanelRun(panel, version, 0, len(specs), finished=len(done))
+                self._write_panel_summary(self.panels[panel.name])
+                self.save_state()
+                continue
             if version and version not in self.adapters.on_disk():
                 log.error("panel %s: adapter v%d is not on disk; skipping it", panel.name, version)
                 self.panels[panel.name] = PanelRun(panel, version, 0, 0)
                 self.save_state()
                 continue
-            specs = panel_specs(self.cfg, panel)
             if panel.kind != "specs":
                 self._write_panel_specs(panel, specs)
             self.adapters.pin(version)
-            self.panels[panel.name] = PanelRun(panel, version, len(specs), len(specs))
-            for spec in specs:
-                base_id = f"{panel.name}-v{version}-{spec.game_id}"
-                self.panel_queue.append(Pending(spec, "panel", base_id, panel.name, version))
+            self.panels[panel.name] = PanelRun(panel, version, len(todo), len(specs), finished=len(done))
+            for base_id in todo:
+                attempt = top[base_id] + 1 if base_id in top else 0
+                self.panel_queue.append(Pending(by_base[base_id], "panel", base_id, panel.name, version, attempt))
             self.save_state()
-            log.info("panel %s: %d games on v%d", panel.name, len(specs), version)
+            log.info("panel %s: %d of its %d games on v%d", panel.name, len(todo), len(specs), version)
 
     def _write_panel_specs(self, panel: PanelConfig, specs: Sequence[GameSpec]) -> None:
         """A generated panel's specs, kept beside its games: what was played stays on record."""
