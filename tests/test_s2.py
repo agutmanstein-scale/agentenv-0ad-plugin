@@ -514,8 +514,8 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (0.5, 0),
         (3.8, 0),
         (1.0, 132.0),
-        (1.25, 0),
-        (4.0, 0),
+        (2.0, 0),
+        (5.0, 0),
         (0.1, 0),
         (11.0, 70.0),
     ]
