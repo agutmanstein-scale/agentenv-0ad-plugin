@@ -106,6 +106,7 @@ from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
 from agentenv_zeroad.train.spec import GameSpec, load_specs
 from agentenv_zeroad.train.sync import Syncer
+from agentenv_zeroad.train.transport import ActorSide, LearnerSide, Store, build_side, open_store
 
 if TYPE_CHECKING:
     from agentenv_zeroad.train.hardstate import HardStates
@@ -256,6 +257,7 @@ class Orchestrator:
         learner: bool = True,
         free_gb: Callable[[], float] | None = None,
         hard_states: HardStates | None = None,
+        store: Store | None = None,
     ):
         self.cfg, self.fleet, self.play, self.credit, self.syncer, self.http = cfg, fleet, play, credit, syncer, http
         self.now = now
@@ -302,6 +304,9 @@ class Orchestrator:
         self.loop_stats: dict[str, Any] = {}
         self.last_spend: budget.Spend | None = None
         self.supply = BriefSupply(cfg.brief_target, DEFAULT_WEIGHTS, cfg.brief_per_game) if cfg.brief_target else None
+        self.xport: LearnerSide | ActorSide | None = None
+        if cfg.transport.enabled:
+            self.xport = build_side(self, store or open_store(cfg.transport.uri))
         self._restore()
 
     # ---- the loop ------------------------------------------------------------------------------------------------
@@ -311,6 +316,8 @@ class Orchestrator:
         self.odir.mkdir(parents=True, exist_ok=True)
         self.monitor.start()
         try:
+            if self.xport is not None:
+                await self._step("transport start", lambda: asyncio.to_thread(self.xport.start))
             await self._step("serving", self.refresh_serving)
             while self.stop_reason is None:
                 await self.tick()
@@ -344,6 +351,8 @@ class Orchestrator:
             await self._step("loop", lambda: self.record_loop(now))
         if self.cfg.stop_when_done and self._due("done", now, self.cfg.poll_s):
             await self._step("done", self.check_done)
+        if self.xport is not None and self._due("transport", now, self.cfg.transport.poll_s):
+            self.xport.kick()
         if self._due("housekeeping", now, HOUSEKEEPING_S):
             await self._step("housekeeping", lambda: self.housekeeping(now))
         if self.counts["started"] and self._due("sync", now, self.cfg.sync_interval_s):
@@ -611,7 +620,7 @@ class Orchestrator:
     # ---- games ---------------------------------------------------------------------------------------------------
     def _existing_games(self) -> int:
         """One past the highest game number already on disk, in games/ or voided/."""
-        pattern = re.compile(rf"^{re.escape(self.cfg.run_id)}-g(\d+)")
+        pattern = re.compile(rf"^{re.escape(self.cfg.game_prefix)}-g(\d+)")
         found = (
             pattern.match(p.name) for folder in (self.root / "games", self.root / "voided") if folder.is_dir()
             for p in folder.iterdir()
@@ -625,6 +634,8 @@ class Orchestrator:
     def fill(self) -> None:
         """Start games until `concurrency` are in flight, panel games first, then replays, then new training games. A
         box short of disk starts none."""
+        if isinstance(self.xport, ActorSide) and not self.xport.ready:
+            return
         while self.stop_reason is None and not self.disk_paused and len(self.in_flight) < self.cfg.concurrency:
             if not (
                 self._start_pending(self.panel_queue)
@@ -741,7 +752,10 @@ class Orchestrator:
             else:
                 if game.kind == "train":
                     self._observe_supply(game.spec.game_id, results)
-                    rows, error = await self._credit_game(game, results)
+                    if isinstance(self.xport, ActorSide):
+                        self.xport.enqueue(game.spec.game_id, game.spec)
+                    else:
+                        rows, error = await self._credit_game(game, results)
                 self.counts[f"{game.kind}_finished"] += 1
                 self.counts["missed_calls"] += game.failed_calls
                 self._panel_done(game, finished=True)
@@ -762,14 +776,18 @@ class Orchestrator:
             return None, f"results.json: {type(e).__name__}: {str(e)[:200]}"
 
     async def _credit_game(self, game: Game, results: dict[str, Any]) -> tuple[int, str | None]:
+        return await self._credit_id(game.spec.game_id, results)
+
+    async def _credit_id(self, game_id: str, results: dict[str, Any]) -> tuple[int, str | None]:
+        """Credit a finished game, local or an actor's, into the one inbox: (rows, the error if credit failed)."""
         try:
             async with self._credit_lock:
-                rows = await asyncio.to_thread(self._credit, game.spec.game_id, results)
-            self._observe_hard(game.spec.game_id, results)
+                rows = await asyncio.to_thread(self._credit, game_id, results)
+            self._observe_hard(game_id, results)
             return rows, None
         except Exception as e:  # noqa: BLE001 - credit.rows raises its own errors; none of them may end the run
             self.counts["credit_failed"] += 1
-            log.exception("credit failed for %s", game.spec.game_id)
+            log.exception("credit failed for %s", game_id)
             return 0, f"credit: {type(e).__name__}: {str(e)[:200]}"
 
     def _credit(self, game_id: str, results: dict[str, Any]) -> int:
@@ -853,6 +871,9 @@ class Orchestrator:
 
     def check_budget(self, now: float) -> budget.Spend:
         spent = budget.spend(self.clock, now, self.cfg.box_usd_per_hour, self.cfg.ledger_path, self.boxtime)
+        if isinstance(self.xport, LearnerSide):
+            box, model = self.xport.spend_extra(now)
+            spent = replace(spent, box_usd=spent.box_usd + box, model_usd=spent.model_usd + model)
         self.clock.save(now)
         self._copy_box_files()
         hour = int(self.clock.hours(now))
@@ -918,8 +939,22 @@ class Orchestrator:
                 "sync": {"last_ok": self.syncer.last_ok, "failures": self.syncer.failures},
                 "loop": self.loop_stats,
                 "stop_reason": self.stop_reason,
+                **self._transport_status(now),
             },
         )
+
+    def _transport_status(self, now: float) -> dict[str, Any]:
+        if isinstance(self.xport, LearnerSide):
+            return {"actors": self.xport.status(now)}
+        if isinstance(self.xport, ActorSide):
+            return {
+                "transport": {
+                    "role": "actor", "actor_id": self.xport.actor_id, "ready": self.xport.ready,
+                    "learner_version": self.xport.learner_version, "unshipped": self.xport.unshipped(),
+                    "last_error": self.xport.last_error,
+                }
+            }  # fmt: skip
+        return {}
 
     def _write(self, name: str, value: dict[str, Any]) -> None:
         self.odir.mkdir(parents=True, exist_ok=True)
@@ -1080,7 +1115,15 @@ class Orchestrator:
         return kept - {0}
 
     async def sync_now(self, *, final: bool = False) -> bool:
-        return await self.syncer.sync(adapters=self.keep_adapters(final=final), checkpoint=self.trips.latest_healthy())
+        learner = isinstance(self.xport, LearnerSide)
+        ok = await self.syncer.sync(
+            adapters=self.keep_adapters(final=final),
+            checkpoint=self.trips.latest_healthy(),
+            extra=("remote/*",) if learner else (),
+        )
+        if ok and isinstance(self.xport, LearnerSide):
+            await asyncio.to_thread(self.xport.sweep_remote, self.syncer.last_start_ok)
+        return ok
 
     def _start_sync(self) -> None:
         """Sync in the background: a slow or hung upload must not hold up the games or the watchdog."""
@@ -1126,9 +1169,13 @@ class Orchestrator:
         """No new games (`fill` is already off); drain or cancel the ones in flight, stop the learner, write down what
         was left, upload, and power off if the config says so and the results are safe. Every stage is attempted even
         if an earlier one fails."""
-        if reason in DRAIN_REASONS:
+        if isinstance(self.xport, LearnerSide):
+            await self._stage("stop the actors", self.xport.close(reason))
+        if reason in DRAIN_REASONS or (isinstance(self.xport, ActorSide) and reason.startswith("transport-drain:")):
             await self._stage("drain", self._drain(self.cfg.drain_timeout_s))
         await self._stage("cancel", self._cancel_all())
+        if isinstance(self.xport, ActorSide):
+            await self._stage("ship the games", self.xport.close(reason))
         if self.learner:
             await self._stage("stop the learner", self._stop_learner())
         await self._stage("save critic", self.save_critic())
@@ -1150,6 +1197,12 @@ class Orchestrator:
             await asyncio.sleep(self.cfg.sync_retry_s)
         log.info("run stopped (%s); final upload %s", reason, "done" if ok else "FAILED or not configured")
         if not self.cfg.shutdown:
+            return
+        if isinstance(self.xport, ActorSide) and self.xport.unshipped():
+            log.critical(
+                "NOT powering off: %d finished games were not uploaded and are only on this box", self.xport.unshipped()
+            )
+            self._write("final.json", {"reason": reason, "time": now, "unshipped": self.xport.unshipped()})
             return
         if self.syncer.uri is not None and not ok:
             log.critical(
@@ -1184,8 +1237,27 @@ class Orchestrator:
 
     async def _drain(self, timeout_s: float) -> None:
         tasks = [g.task for g in self.in_flight.values() if g.task]
-        if tasks:
-            await asyncio.wait(tasks, timeout=timeout_s)
+        keeper = asyncio.create_task(self._keep_transport()) if isinstance(self.xport, ActorSide) else None
+        try:
+            if tasks:
+                await asyncio.wait(tasks, timeout=timeout_s)
+        finally:
+            if keeper is not None:
+                keeper.cancel()
+                await asyncio.gather(keeper, return_exceptions=True)
+
+    async def _keep_transport(self) -> None:
+        """While an actor drains, the loop is not ticking: keep shipping what finishes and beating, so the learner does
+        not take a draining actor for a dead one."""
+        assert isinstance(self.xport, ActorSide)
+        while True:
+            try:
+                await self.xport.ship_pass()
+                await self.xport.beat_pass()
+            except Exception:  # noqa: BLE001 - one failed upload must not end the shipping and the heartbeats
+                self.counts["transport_error_keep"] += 1
+                log.exception("a transport pass failed while draining")
+            await asyncio.sleep(self.cfg.transport.poll_s)
 
     async def _cancel_all(self) -> None:
         games = list(self.in_flight.values())
@@ -1334,7 +1406,8 @@ async def serve(args: argparse.Namespace) -> str:
         missing.append(LITELLM_URL_ENV)
     if missing:
         raise SystemExit(f"not set: {', '.join(missing)}")
-    credit = PlayOnly() if args.play_only else load_credit(cfg)
+    actor = cfg.transport.actor
+    credit = PlayOnly() if args.play_only or actor else load_credit(cfg)
     (cfg.root / "orchestrator").mkdir(parents=True, exist_ok=True)
     shutil.copy2(args.config, cfg.root / "orchestrator" / "config.toml")
     pool_options: dict[str, Any] = {
@@ -1359,8 +1432,10 @@ async def serve(args: argparse.Namespace) -> str:
             credit=credit,
             syncer=Syncer(cfg.root, cfg.s3_uri),
             http=http,
-            learner=not args.play_only,
-            hard_states=None if args.play_only else await asyncio.to_thread(load_hard_states, cfg, tools, http),
+            learner=not (args.play_only or actor),
+            hard_states=None
+            if args.play_only or actor
+            else await asyncio.to_thread(load_hard_states, cfg, tools, http),
         )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):

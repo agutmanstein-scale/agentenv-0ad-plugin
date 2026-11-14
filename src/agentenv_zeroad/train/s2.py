@@ -1186,6 +1186,7 @@ def final_report(ctx: Ctx) -> str | None:
             panels=panels,
             panel=("v0-heldout", "run1-heldout") if (panels / "run1-heldout").exists() else None,
             ledger=base.ledger_path,
+            remote=run1.root / "remote" if has_run and (run1.root / "remote").is_dir() else None,
             sft_epochs=sft.root / "epochs" if (sft.root / "epochs").is_dir() else None,
         )
         report.write(ctx.s2 / "s2-report.json", built)
