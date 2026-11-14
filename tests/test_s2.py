@@ -512,7 +512,7 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (6.0, 110.0),
         (0.1, 0),
         (0.5, 0),
-        (3.8, 0),
+        (3.6, 0),
         (1.0, 132.0),
         (2.0, 0),
         (4.0, 0),
@@ -845,16 +845,17 @@ def test_e2_and_run_one_refuse_to_start_without_a_tripwire_baseline_of_enough_re
 
 
 def test_e2_passes_the_learner_a_drift_of_alarm_only_when_asked_and_refuses_other_values(tmp_path):
-    runner = FakeRunner()
-    ctx, _ = make_ctx(tmp_path, runner)
-    runner.effects = e2_world(ctx, policy_army=9, control_army=3)
-    install_e2_baseline(ctx)
-    ctx.settings.tables["e2"]["drift"] = "alarm"
-    assert run_step(ctx, "e2").passed
-    assert runner.calls[0][-4:] == ["--lr", "3e-05", "--drift", "alarm"]
+    for drift, tail in (("alarm", ["--lr", "3e-05", "--drift", "alarm"]), ("trip", ["--lr", "3e-05"])):
+        runner = FakeRunner()
+        ctx, _ = make_ctx(tmp_path / drift, runner)
+        runner.effects = e2_world(ctx, policy_army=9, control_army=3)
+        install_e2_baseline(ctx)
+        ctx.settings.tables["e2"]["drift"] = drift
+        assert run_step(ctx, "e2").passed
+        assert runner.calls[0][-len(tail) :] == tail and runner.calls[0].count("--drift") == (drift == "alarm")
     cdir = make_config_dir(tmp_path / "bad")
     path = cdir / "sequence.toml"
-    path.write_text(re.sub(r"^\[e2\].*$", lambda m: m.group(0) + '\ndrift = "maybe"', path.read_text(), flags=re.M))
+    path.write_text(re.sub(r"^drift = .*$", 'drift = "maybe"', path.read_text(), count=1, flags=re.M))
     with pytest.raises(ValueError, match=r"\[e2\] drift"):
         S.load_settings(path)
 
@@ -873,7 +874,9 @@ def test_e2_passes_when_the_trained_policy_out_armies_the_frozen_arm_and_fails_o
         str(ctx.s2 / "baseline-e2.json"),
         "--lr",
         "3e-05",
-    ]  # an RL run: a learner banded on E2's own games, at E2's learning rate
+        "--drift",
+        "alarm",
+    ]  # an RL run: a learner banded on E2's own games, at E2's learning rate, its drift only alarmed
     assert json.loads((ctx.s2 / "baseline-e2.json").read_text())["distinct_fraction"]["mean"] == 0.36
     flat = FakeRunner()
     ctx, _ = make_ctx(tmp_path / "flat", flat)
@@ -946,7 +949,7 @@ def test_e2_without_enough_v0_decisions_on_its_games_stops_before_training(tmp_p
     [
         (('seed = 2', 'seed = 2\n\n[[panels]]\nname = "x"\nkind = "heldout"\nat_hours = 0\nversion = 0\ngames = 4'),
          "no panels"),
-        (("s2/e2-baseline", "s2/e2b"), "must not be E2's own"),
+        (("s2/e2-baseline", "s2/e2c"), "must not be E2's own"),
     ],
 )  # fmt: skip
 def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_refused(tmp_path, edit, message):

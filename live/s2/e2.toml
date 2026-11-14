@@ -2,9 +2,11 @@
 # 10, z-scored per opponent), 12-minute games against Petra-1 and Petra-2. The frozen-v0 arm plays beside it as the
 # `control-v0` panel on the same kind of games. The adapters it publishes stay in this root and are never used again.
 # Second attempt (9 Nov): its own root and prefix, so the first attempt's files (s2-e2) stay as they were.
-run_id = "s2-e2b"
-root = "/var/lib/zeroad-live/train/s2/e2b"
-duration_hours = 2
+# Third attempt (14 Nov): drift outside v0's bands only alarms ([e2] drift in sequence.toml), and 3 h, so about 20
+# updates run at the full lr after the learner's 10-update warmup (the second attempt had 2 before its first rollback).
+run_id = "s2-e2c"
+root = "/var/lib/zeroad-live/train/s2/e2c"
+duration_hours = 3
 budget_usd = 600            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false            # the sequence powers the box off itself, once, after the final upload
@@ -47,4 +49,4 @@ time_cap_minutes = 12
 opponents = { "petra-1" = 0.5, "petra-2" = 0.5 }
 
 [s3]
-uri = "s3://BUCKET/zeroad-train/run/s2-e2b"
+uri = "s3://BUCKET/zeroad-train/run/s2-e2c"
