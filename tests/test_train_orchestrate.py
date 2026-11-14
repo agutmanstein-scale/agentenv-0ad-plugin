@@ -1312,6 +1312,89 @@ async def test_a_stop_records_the_games_in_flight_as_stopped_and_the_panels_and_
     assert not (t.root / "voided").exists()
 
 
+async def test_a_restart_after_a_stop_replays_the_panel_games_the_stop_cancelled_once(tmp_path, monkeypatch):
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "mid", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels, budget_usd=5)
+    publish(t.root, 1)
+    t.play.hold()
+    run = asyncio.create_task(t.orch.run())
+    await until(lambda: len(t.play.specs) == 1)
+    t.clock.t += 3600
+    assert (await asyncio.wait_for(run, 5)).startswith("budget")
+    second = reborn(t)
+    assert [p.game_id for p in second.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert second.counts["panel_replayed_after_stop"] == 1 and second.panels["mid"].remaining == 3
+    second.save_state()
+    third = reborn(t)
+    assert [p.game_id for p in third.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert third.counts["panel_replayed_after_stop"] == 1
+    t.play.release()
+
+
+def ledger(root: Path, panel: str, *lines: tuple[str, str]) -> None:
+    folder = root / "panels" / panel
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "games.jsonl").open("a") as f:
+        f.writelines(json.dumps({"game_id": g, "status": status, "kind": "panel"}) + "\n" for g, status in lines)
+
+
+async def test_a_restart_plays_no_panel_game_again_that_its_record_finished_nor_a_panel_it_does_not_have(
+    tmp_path, monkeypatch
+):
+    """10 Nov: the SFT epoch panels and then the rest share one root. Restarted for its epoch panels, the run took the
+    rest's queue and a state that had lost the epoch panel it had finished, and dropped all of them at once."""
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels)
+    publish(t.root, 1)
+    t.orch.start_due_panels()  # queued, as the stale state had it
+    spec = t.orch.panel_queue[0].spec
+    t.orch.panel_queue.append(orchestrate.Pending(spec, "panel", "rest-v1-p9", "rest", 1))
+    t.orch.save_state()
+    ledger(t.root, "a", *[(f"a-v1-p{i}", "finished") for i in range(3)], *[(f"a-v1-p{i}", "dropped") for i in range(3)])
+    second = reborn(t)
+    assert list(second.panel_queue) == [] and second.counts["panel_already_finished"] == 3
+    assert (second.panels["a"].remaining, second.panels["a"].finished, second.panels["a"].games) == (0, 3, 3)
+    summary = json.loads((t.root / "panels" / "a" / "summary.json").read_text())
+    assert (summary["finished"], summary["games"]) == (3, 3) and second.panels_finished()
+
+
+async def test_a_panel_started_afresh_where_its_record_has_some_games_plays_only_the_ones_not_finished(
+    tmp_path, monkeypatch
+):
+    """The SFT rest panel, run again after a stop: its record has 1 game finished, 1 a stop cut off, 1 never begun."""
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=2, panels=panels)
+    publish(t.root, 1)
+    ledger(t.root, "a", ("a-v1-p0", "finished"), ("a-v1-p1", "stopped"), ("a-v1-p2", "dropped"))
+    t.orch.start_due_panels()
+    assert [p.game_id for p in t.orch.panel_queue] == ["a-v1-p1-r1", "a-v1-p2-r1"]
+    assert (t.orch.panels["a"].remaining, t.orch.panels["a"].finished, t.orch.panels["a"].games) == (2, 1, 3)
+    await t.orch.refresh_serving()
+    t.orch.fill()
+    await until(lambda: t.orch.panels["a"].remaining == 0)
+    assert [s.game_id for s in t.play.specs] == ["a-v1-p1-r1", "a-v1-p2-r1"]
+    summary = json.loads((t.root / "panels" / "a" / "summary.json").read_text())
+    assert (summary["finished"], summary["games"]) == (3, 3)
+    await settle(t.orch)
+
+
+async def test_a_panel_whose_record_has_every_game_finished_is_done_without_its_adapter(tmp_path, monkeypatch):
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 2)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 7}]  # v7 pruned since
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels)
+    ledger(t.root, "a", ("a-v7-p0", "finished"), ("a-v7-p1-r1", "finished"))
+    t.orch.start_due_panels()
+    assert not t.orch.panel_queue and t.orch.panels_finished() and 7 not in t.orch.adapters.pins
+    assert json.loads((t.root / "panels" / "a" / "summary.json").read_text())["finished"] == 2
+
+
 async def test_a_play_only_run_never_sends_stop_or_waits_for_a_learner(tmp_path, monkeypatch):
     t = make(tmp_path, monkeypatch, budget_usd=1, learner=False)
     t.clock.t += 3600

@@ -1,0 +1,65 @@
+# Run 1 (S3): 10 hours of RL from v0, or from the distilled SFT adapter when it beat v0 (the sequence adds --init and
+# --anchor itself). The end panels (the held-out panel and the frontier panel, the same as the baselines') start at
+# hour 8 so that they are played before the run ends at hour 10; they run ahead of training games and are pinned to the
+# version current when they start.
+run_id = "s2-run1"
+root = "/var/lib/zeroad-live/train/s2/run1"
+duration_hours = 10
+budget_usd = 600            # LIVE_BUDGET_USD: the box's hours (counted once, whatever the step) plus frontier spend
+box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false            # the sequence powers the box off itself, once, after the final upload
+engines = 24
+concurrency = 24
+seed = 1
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+# Run 1's fixed mix; the frozen base model ("base") is v0.
+[mix]
+bot = 0.10
+petra-1 = 0.35
+petra-2 = 0.35
+petra-3 = 0.10
+base = 0.10
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.15
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+# None of these appears in a training game; the panels draw from them. No held-out map yet: one that passes the bot
+# smoke test goes in `maps`; until then the panels take the training map with held-out seeds and civ pairs.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[credit]
+
+[credit.critic]
+
+# [hard_states]               # teacher labels on opponents the policy loses to every time; off unless enabled
+# enabled = true
+# calibration = "/var/lib/zeroad-live/train/s2/baselines/panels/teacher-calibration"   # the baselines' panel
+
+[[panels]]
+name = "end-heldout"
+kind = "heldout"
+at_hours = 8
+games = 384
+
+[[panels]]
+name = "end-frontier"
+kind = "frontier"
+at_hours = 8
+teachers = [
+  { name = "opus", model = "anthropic/claude-opus-5-5", games = 8 },
+  { name = "sonnet", model = "anthropic/claude-sonnet-5-5", games = 8 },
+  { name = "astra", model = "openai/gpt-6-astra", games = 4 },
+]
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-run1"

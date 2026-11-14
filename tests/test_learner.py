@@ -594,6 +594,21 @@ def test_a_window_mean_more_than_four_sd_from_the_baseline_trips_that_band(metri
     assert names(L.evaluate_tripwires([healthy(**{metric: bad})] * 10, BASELINE), "trips") == [name]
 
 
+def test_with_drift_alarm_a_band_is_an_alarm_while_a_breakage_check_still_trips():
+    drifted = healthy(tokens_p50=50.0, hold_share=0.9)
+    result = L.evaluate_tripwires([drifted] * 10, BASELINE, {"drift": "alarm"})
+    assert names(result, "trips") == ["hold_share"]
+    assert names(result, "alarms") == ["length"]
+    only_drift = L.evaluate_tripwires([healthy(tokens_p50=50.0)] * 10, BASELINE, {"drift": "alarm"})
+    assert names(only_drift, "trips") == [] and names(only_drift, "alarms") == ["length"]
+    assert names(L.evaluate_tripwires([healthy(tokens_p50=50.0)] * 10, BASELINE), "trips") == ["length"]
+
+
+def test_an_unknown_drift_value_is_refused_even_before_min_records():
+    with pytest.raises(ValueError, match="drift"):
+        L.evaluate_tripwires([], BASELINE, {"drift": "maybe"})
+
+
 @pytest.mark.parametrize("flags", [[], ["--known-tools", ""], ["--known-tools", ","]])
 def test_the_cli_refuses_to_start_without_known_tool_names(monkeypatch, flags):
     monkeypatch.setattr(sys, "argv", ["learner.py", "--base", "b", "--root", "r", *flags])
@@ -848,3 +863,88 @@ def types_tokenizer():
             return [ord(c) for c in text]
 
     return Tokenizer()
+
+
+# --- the box-day probe ---
+
+
+def probe_file(tmp_path: Path, learner: L.Learner, n: int = 12, *, offset: float = 0.0) -> Path:
+    """Rows as the throughput probe writes them: the learner's own log-probs plus `offset` stand in for vLLM's."""
+    out = []
+    for r in rows(n):
+        logp, _ = learner.logps(r, grad=False)
+        out.append({
+            "game_id": r.game_id, "version": 0, "prompt_token_ids": r.prompt, "token_ids": r.completion,
+            "logprobs": [float(x) + offset for x in logp], "advantage": 0.0,
+        })  # fmt: skip
+    path = tmp_path / "probe-rows.jsonl"
+    path.write_text("".join(json.dumps(x) + "\n" for x in out))
+    return path
+
+
+def test_the_probe_reports_the_log_prob_gap_to_vllm_and_the_seconds_per_trained_decision(tmp_path):
+    learner = make_learner(tmp_path)
+    path = probe_file(tmp_path, learner, offset=-0.03)
+    result = L.probe(learner, path, agree_rows=5, batch_rows=8, warmup_rows=2)
+    assert result["agreement"]["mean_abs_gap"] == pytest.approx(0.03, abs=1e-4) and result["agreement"]["rows"] == 5
+    assert result["agreement"]["tokens"] == sum(len(r.completion) for r in rows(5))
+    timing = result["timing"]
+    assert timing["decisions"] == 8 and timing["seconds_per_decision"] == pytest.approx(timing["seconds"] / 8)
+    assert learner.version == 2  # the warm-up update and the timed one, in a throwaway root
+
+
+def test_a_probe_with_too_few_rows_refuses_instead_of_timing_nothing(tmp_path):
+    learner = make_learner(tmp_path)
+    with pytest.raises(SystemExit, match="needs at least 32"):
+        L.probe(learner, probe_file(tmp_path, learner, 6))
+
+
+# --- the stats-only tripwire baseline ---
+
+
+def v0_rows_file(tmp_path: Path, n: int) -> Path:
+    out = [
+        {
+            "game_id": r.game_id, "version": 0, "prompt_token_ids": r.prompt, "token_ids": r.completion,
+            "logprobs": r.logprobs, "advantage": 0.0, "is_hold": False,
+        }
+        for r in rows(n)
+    ]  # fmt: skip
+    path = tmp_path / "baseline-rows.jsonl"
+    path.write_text("".join(json.dumps(x) + "\n" for x in out))
+    return path
+
+
+def test_measure_gives_the_fields_of_an_update_record_and_leaves_the_weights_alone(tmp_path):
+    learner = make_learner(tmp_path)
+    before = weights(learner)
+    record = learner.measure(rows(8))
+    after = weights(learner)
+    assert all(torch.equal(before[k], after[k]) for k in before)
+    assert learner.version == 0 and learner.updates == 0 and not learner.cfg.health.exists()
+    assert not learner.cfg.adapters.exists() or not any(learner.cfg.adapters.iterdir())
+    trained = make_learner(tmp_path / "other").update(rows(8))
+    assert set(record) == set(trained) - {"tripwires"}
+    assert record["decisions"] == 8 and record["entropy"] > 0 and record["kl_to_base"] == pytest.approx(0, abs=1e-6)
+    assert record["tokens_p50"] is not None and record["calls_per_decision"] is not None
+
+
+def test_stats_only_writes_one_record_per_full_batch_and_a_baseline_the_tripwires_accept(tmp_path):
+    learner = make_learner(tmp_path)  # decisions_per_update is 4
+    before = weights(learner)
+    summary = L.stats_only(learner, v0_rows_file(tmp_path, 14))
+    assert summary == {"records": 3, "decisions": 12, "dropped": 2}  # the short last batch is dropped
+    records = [json.loads(line) for line in (learner.cfg.root / "baseline-records.jsonl").read_text().splitlines()]
+    assert len(records) == 3 and all(r["decisions"] == 4 for r in records)
+    baseline = json.loads((learner.cfg.root / "baseline.json").read_text())
+    assert baseline == L.baseline_from(records)
+    assert {"tokens_p50", "calls_per_decision", "exact_share", "distinct_fraction", "entropy"} <= set(baseline)
+    assert all(torch.equal(before[k], weights(learner)[k]) for k in before) and learner.version == 0
+    assert L.evaluate_tripwires(records, baseline)["trips"] == []  # judged against itself nothing trips
+
+
+def test_stats_only_refuses_a_file_under_one_batch(tmp_path):
+    learner = make_learner(tmp_path)
+    with pytest.raises(SystemExit, match="at least one batch of 4"):
+        L.stats_only(learner, v0_rows_file(tmp_path, 3))
+    assert not (learner.cfg.root / "baseline.json").exists()

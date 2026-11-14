@@ -38,6 +38,13 @@ def panel_specs(cfg: RunConfig, panel: PanelConfig, environ: Mapping[str, str] |
     """The games of `panel`: its spec file's, or the calibration's."""
     if panel.kind == "teacher_calibration":
         return calibration_specs(cfg, panel, environ)
+    if panel.kind in ("heldout", "frontier"):
+        from agentenv_zeroad.train import panels
+
+        if panel.kind == "heldout":
+            return panels.heldout_specs(cfg, panel)
+        environ = os.environ if environ is None else environ
+        return panels.frontier_specs(cfg, panel, panel.base_url or environ.get(LITELLM_URL_ENV) or UNSET_URL)
     assert panel.specs is not None
     return load_specs(panel.specs)
 

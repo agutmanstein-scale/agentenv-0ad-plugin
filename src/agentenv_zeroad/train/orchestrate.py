@@ -55,13 +55,17 @@ What it does, each on its own interval:
 - Restarts. Everything that must not start over is saved in ROOT/orchestrator after the step that changes it: the
   tripwatch (`tripwatch.json`), credit (`credit.json`), the game stream's random state (`factory.json`), and the
   panels, queues, games in flight and counts (`state.json`, with `keep.json`'s hourly adapters). A restarted process
-  loads them, moves the game folders the old one left half done to ROOT/voided and replays those games.
+  loads them, moves the game folders the old one left half done to ROOT/voided and replays those games, and the
+  panel games a stop cancelled (`stopped` or `dropped` in the panel's games.jsonl). A panel's games.jsonl is its
+  record: a game that finished there is never played again, even by a run that starts the panel afresh in a root
+  another run used (the SFT epoch panels, then the rest), and a queued game of a panel this run does not have is
+  dropped.
 - Stopping. On completion, budget, a second trip or SIGTERM (and on an unexpected error: `run` always ends in `finish`):
   no new games; a finished run drains the games in flight (up to `drain_timeout_s`) while the other reasons cancel them
-  (recorded as `stopped`, not voided or replayed); the learner is told to stop (unless `--play-only`) and given
-  `learner_grace_s` to read it; the panels and queues left over are written down; the final upload runs (retried); and
-  with `shutdown = true` the box powers off, unless the upload failed and an S3 prefix is configured, when it stays up
-  so the results are not lost with the disk.
+  (recorded as `stopped`, not voided; a restart replays the panel ones); the learner is told to stop (unless
+  `--play-only`) and given `learner_grace_s` to read it; the panels and queues left over are written down; the final
+  upload runs (retried); and with `shutdown = true` the box powers off, unless the upload failed and an S3 prefix is
+  configured, when it stays up so the results are not lost with the disk.
 
 The orchestrator's own files are in ROOT/orchestrator (clock.json, keep.json, status.json, final.json, config.toml ...).
 """
@@ -78,11 +82,10 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Container, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -91,16 +94,17 @@ import httpx
 
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, StrategistModel
 from agentenv_zeroad.spend import SpendCapReached, append_ledger, results_spend
-from agentenv_zeroad.train import budget
+from agentenv_zeroad.train import budget, poweroff
 from agentenv_zeroad.train.calibration import LITELLM_URL_ENV, panel_specs
 from agentenv_zeroad.train.config import PanelConfig, RunConfig, check_run, load_config
 from agentenv_zeroad.train.control import Action, ControlWriter, TripWatch
+from agentenv_zeroad.train.distill import DEFAULT_WEIGHTS, LOSING_OPPONENTS, BriefSupply, briefs_of
 from agentenv_zeroad.train.game import ModelFactory, build_model
 from agentenv_zeroad.train.loopstats import LoopMonitor
 from agentenv_zeroad.train.mix import GameFactory, repin
 from agentenv_zeroad.train.runner import GameOutcome
 from agentenv_zeroad.train.serving import Adapters, Fleet, Instance
-from agentenv_zeroad.train.spec import GameSpec
+from agentenv_zeroad.train.spec import GameSpec, load_specs
 from agentenv_zeroad.train.sync import Syncer
 
 if TYPE_CHECKING:
@@ -142,6 +146,28 @@ def is_server_error(error: BaseException) -> bool:
     if isinstance(error, httpx.HTTPStatusError):
         return error.response.status_code >= 500 or error.response.status_code == 404
     return False
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    """The readable lines of a JSON-lines file (none if it is missing)."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return []
+    lines = []
+    for raw in text.splitlines():
+        with contextlib.suppress(ValueError):
+            if isinstance(line := json.loads(raw), dict):
+                lines.append(line)
+    return lines
+
+
+def _base_and_attempt(game_id: str, bases: Container[str]) -> tuple[str | None, int]:
+    """Which of `bases` a game id is an attempt of (`BASE` or `BASE-rN`), and N."""
+    if game_id in bases:
+        return game_id, 0
+    m = re.fullmatch(r"(.+)-r(\d+)", game_id)
+    return (m.group(1), int(m.group(2))) if m and m.group(1) in bases else (None, 0)
 
 
 @dataclass
@@ -275,6 +301,7 @@ class Orchestrator:
         self.monitor = LoopMonitor()
         self.loop_stats: dict[str, Any] = {}
         self.last_spend: budget.Spend | None = None
+        self.supply = BriefSupply(cfg.brief_target, DEFAULT_WEIGHTS, cfg.brief_per_game) if cfg.brief_target else None
         self._restore()
 
     # ---- the loop ------------------------------------------------------------------------------------------------
@@ -315,6 +342,8 @@ class Orchestrator:
             await self._step("budget", lambda: self.check_budget(now))
         if self._due("loop", now, LOOP_STATS_S):
             await self._step("loop", lambda: self.record_loop(now))
+        if self.cfg.stop_when_done and self._due("done", now, self.cfg.poll_s):
+            await self._step("done", self.check_done)
         if self._due("housekeeping", now, HOUSEKEEPING_S):
             await self._step("housekeeping", lambda: self.housekeeping(now))
         if self.counts["started"] and self._due("sync", now, self.cfg.sync_interval_s):
@@ -404,6 +433,20 @@ class Orchestrator:
         if state:
             self._restore_state(state)
         self._set_aside_unfinished()
+        self._restore_supply()
+
+    def _restore_supply(self) -> None:
+        """A restarted baseline run recounts the briefs its finished games hold."""
+        games = self.root / "games"
+        if self.supply is None or not games.is_dir():
+            return
+        for path in sorted(games.glob("*/results.json")):
+            with contextlib.suppress(OSError, ValueError):
+                self._observe_supply(path.parent.name, json.loads(path.read_text()))
+
+    def _observe_supply(self, game_id: str, results: dict[str, Any]) -> None:
+        if self.supply is not None:
+            self.supply.add(game_id, briefs_of(results, game_id, None, LOSING_OPPONENTS))
 
     def _restore_state(self, state: dict[str, Any]) -> None:
         self.counts = Counter(state.get("counts", {}))
@@ -426,6 +469,66 @@ class Orchestrator:
                 continue
             (self.panel_queue if pending.kind == "panel" else self.requeue).appendleft(pending)
             self.counts["interrupted"] += 1
+        self._reconcile_panels()
+
+    def _panel_record(
+        self, name: str, version: int, specs: Sequence[GameSpec]
+    ) -> tuple[dict[str, GameSpec], set[str], dict[str, int], set[str]]:
+        """A panel's specs by base id, those that finished in its games.jsonl (not voided, results read), the highest
+        attempt of each, and those a stop cancelled or never started: last line `stopped` or `dropped`, or none."""
+        by_base = {f"{name}-v{version}-{s.game_id}": s for s in specs}
+        done: set[str] = set()
+        top: dict[str, int] = {}
+        last: dict[str, str] = {}
+        for line in _jsonl(self.root / "panels" / name / "games.jsonl"):
+            base, attempt = _base_and_attempt(str(line.get("game_id", "")), by_base)
+            if base is None:
+                continue
+            top[base] = max(top.get(base, 0), attempt)
+            last[base] = str(line.get("status"))
+            if last[base] == "finished" and "void" not in line and "error" not in line:
+                done.add(base)
+        open_ = {b for b in by_base if b not in done and last.get(b, "dropped") in ("stopped", "dropped")}
+        return by_base, done, top, open_
+
+    def _recorded_specs(self, name: str, run: PanelRun) -> list[GameSpec] | None:
+        folder = self.root / "panels" / name
+        try:
+            recorded = folder / "specs.jsonl"
+            return load_specs(recorded) if recorded.is_file() else panel_specs(self.cfg, run.config)
+        except (OSError, ValueError) as e:
+            log.error("panel %s: its specs are unreadable (%s); its stopped games are not replayed", name, e)
+            return None
+
+    def _reconcile_panels(self) -> None:
+        """Square the restored panels with their records. A queued game of a panel this run does not have, or one
+        that already finished, is dropped from the queue; a game a stop cancelled (`stopped`, kept in no queue) or a
+        dropped one no queue holds is queued again as a new attempt; and a panel's games left are the ones queued."""
+        configured = {p.name for p in self.cfg.panels}
+        foreign = sum(p.panel not in configured for p in self.panel_queue)
+        if foreign:
+            log.warning("dropping %d queued games of panels this run does not have", foreign)
+            self.panel_queue = deque(p for p in self.panel_queue if p.panel in configured)
+        for name, run in self.panels.items():
+            specs = self._recorded_specs(name, run)
+            if specs is None:
+                continue
+            by_base, done, top, open_ = self._panel_record(name, run.version, specs)
+            before = len(self.panel_queue)
+            self.panel_queue = deque(p for p in self.panel_queue if p.panel != name or p.base_id not in done)
+            self.counts["panel_already_finished"] += before - len(self.panel_queue)
+            queued = {p.base_id for p in self.panel_queue if p.panel == name}
+            replays = [Pending(by_base[b], "panel", b, name, run.version, top.get(b, 0) + 1) for b in by_base
+                       if b in open_ and b not in queued and b in top]  # fmt: skip
+            self.panel_queue.extendleft(reversed(replays))
+            self.counts["panel_replayed_after_stop"] += len(replays)
+            if replays:
+                log.info("panel %s: replaying %d games a stop cancelled", name, len(replays))
+            run.games, run.finished = len(by_base), max(run.finished, len(done))  # games: 0 if its adapter was gone
+            run.remaining = len(queued) + len(replays)
+            if run.remaining == 0:
+                self.adapters.release(run.version)
+                self._write_panel_summary(run)
 
     def _set_aside_unfinished(self) -> None:
         """A game folder with no results.json was cut off by a stop or a crash: it goes to ROOT/voided."""
@@ -523,7 +626,11 @@ class Orchestrator:
         """Start games until `concurrency` are in flight, panel games first, then replays, then new training games. A
         box short of disk starts none."""
         while self.stop_reason is None and not self.disk_paused and len(self.in_flight) < self.cfg.concurrency:
-            if not (self._start_pending(self.panel_queue) or self._start_pending(self.requeue) or self._start_new()):
+            if not (
+                self._start_pending(self.panel_queue)
+                or self._start_pending(self.requeue)
+                or (not self.cfg.panels_only and self._start_new())
+            ):
                 return
 
     def _start_new(self) -> bool:
@@ -633,6 +740,7 @@ class Orchestrator:
                 self._panel_done(game, finished=False)
             else:
                 if game.kind == "train":
+                    self._observe_supply(game.spec.game_id, results)
                     rows, error = await self._credit_game(game, results)
                 self.counts[f"{game.kind}_finished"] += 1
                 self.counts["missed_calls"] += game.failed_calls
@@ -760,6 +868,22 @@ class Orchestrator:
             self.request_stop("duration")
         return spent
 
+    def panels_finished(self) -> bool:
+        """Whether every configured panel has started and played its last game (none queued, none in flight)."""
+        if any(p.name not in self.panels or self.panels[p.name].remaining > 0 for p in self.cfg.panels):
+            return False
+        return not any(q.kind == "panel" for q in self.panel_queue)
+
+    def check_done(self) -> None:
+        """`stop_when_done`: the run ends, reason "complete", once its panels are played and (for a baseline run that
+        feeds distillation) the briefs the games hold would fill `brief_target`."""
+        if not self.panels_finished():
+            return
+        if self.supply is not None:
+            if self.supply.capacity()["selectable"] < self.cfg.brief_target:
+                return
+        self.request_stop("complete")
+
     def _copy_box_files(self) -> None:
         """The box's ledger and box-time files live outside ROOT; a copy goes where the sync takes it."""
         for source in (self.cfg.ledger_path, self.cfg.boxtime_path):
@@ -788,6 +912,7 @@ class Orchestrator:
                 "instances": [{"url": i.url, "up": i.up, "adapters": sorted(i.loaded)} for i in self.fleet.instances],
                 "panels": {n: {"version": p.version, "remaining": p.remaining} for n, p in self.panels.items()},
                 "hard_states": self.hard.status(int(self.clock.hours(now))) if self.hard is not None else None,
+                "briefs": self.supply.capacity() if self.supply is not None else None,
                 "alarms": dict(self.alarms),
                 "paused_for_disk": self.disk_paused,
                 "sync": {"last_ok": self.syncer.last_ok, "failures": self.syncer.failures},
@@ -888,21 +1013,28 @@ class Orchestrator:
                 continue
             calibration = panel.kind == "teacher_calibration"
             version = 0 if calibration else panel.version if panel.version is not None else self.current
+            specs = panel_specs(self.cfg, panel)
+            by_base, done, top, open_ = self._panel_record(panel.name, version, specs)
+            todo = [b for b in by_base if b in open_]  # a game this root's record has finished is not played again
+            if not todo:
+                self.panels[panel.name] = PanelRun(panel, version, 0, len(specs), finished=len(done))
+                self._write_panel_summary(self.panels[panel.name])
+                self.save_state()
+                continue
             if version and version not in self.adapters.on_disk():
                 log.error("panel %s: adapter v%d is not on disk; skipping it", panel.name, version)
                 self.panels[panel.name] = PanelRun(panel, version, 0, 0)
                 self.save_state()
                 continue
-            specs = panel_specs(self.cfg, panel)
-            if calibration:
+            if panel.kind != "specs":
                 self._write_panel_specs(panel, specs)
             self.adapters.pin(version)
-            self.panels[panel.name] = PanelRun(panel, version, len(specs), len(specs))
-            for spec in specs:
-                base_id = f"{panel.name}-v{version}-{spec.game_id}"
-                self.panel_queue.append(Pending(spec, "panel", base_id, panel.name, version))
+            self.panels[panel.name] = PanelRun(panel, version, len(todo), len(specs), finished=len(done))
+            for base_id in todo:
+                attempt = top[base_id] + 1 if base_id in top else 0
+                self.panel_queue.append(Pending(by_base[base_id], "panel", base_id, panel.name, version, attempt))
             self.save_state()
-            log.info("panel %s: %d games on v%d", panel.name, len(specs), version)
+            log.info("panel %s: %d of its %d games on v%d", panel.name, len(todo), len(specs), version)
 
     def _write_panel_specs(self, panel: PanelConfig, specs: Sequence[GameSpec]) -> None:
         """A generated panel's specs, kept beside its games: what was played stays on record."""
@@ -1099,7 +1231,7 @@ def write_rows(inbox: Path, game_id: str, rows: Sequence[dict[str, Any]]) -> Pat
 
 
 def _power_off() -> None:
-    subprocess.run(["shutdown", "-h", "now"], check=False)
+    poweroff.power_off()
 
 
 # ---- the command line --------------------------------------------------------------------------------------------
