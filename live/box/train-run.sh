@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# train-run.sh CONFIG [--init DIR] [--anchor DIR|base] [--baseline FILE] [--play-only] | [--sft EPOCHS [--lr LR]] | [--probe ROWS] | [--stats-only ROWS]: the zeroad-train unit's process (train.sh starts it).
+# train-run.sh CONFIG [--init DIR] [--anchor DIR|base] [--baseline FILE] [--drift trip|alarm] [--play-only] | [--sft EPOCHS [--lr LR]] | [--probe ROWS] | [--stats-only ROWS]: the zeroad-train unit's process (train.sh starts it).
 # Starts the learner in the trainer image on the training GPUs (torchrun, one process per GPU, its --root the run's
 # folder, which the config names and which must be under $STATE/train: that folder is also what the vLLM containers
 # mount at /train to hot-load adapters from), then runs the orchestrator with vLLM's key from its root-only file, in
@@ -13,7 +13,7 @@
 # reads the LiteLLM key from SSM into its environment only (never printed, written or put on a command line).
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
-CONFIG=${1:?usage: train-run.sh CONFIG [--init DIR] [--anchor DIR] [--baseline FILE] [--play-only]}; shift
+CONFIG=${1:?usage: train-run.sh CONFIG [--init DIR] [--anchor DIR] [--baseline FILE] [--drift trip|alarm] [--play-only]}; shift
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 TRAIN=$STATE/train
 UV_BIN=$(command -v uv || true)  # on the box it is /usr/local/bin; elsewhere (a dry run, the tests' stubs) it goes first
@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
     --lr) SFT_LR=${2:?--lr needs a number}; [[ $SFT_LR =~ ^[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?$ ]] || die "--lr needs a number"; shift 2 ;;
     --probe) PROBE=${2:?--probe needs the sampled rows file}; [[ $PROBE =~ ^[A-Za-z0-9._/-]+$ ]] || die "bad --probe path"; shift 2 ;;
     --stats-only) STATS=${2:?--stats-only needs the v0 rows file}; [[ $STATS =~ ^[A-Za-z0-9._/-]+$ ]] || die "bad --stats-only path"; shift 2 ;;
+    --drift) [[ ${2:-} =~ ^(trip|alarm)$ ]] || die "--drift needs trip or alarm"; LEARNER+=("$1" "$2"); shift 2 ;;
     --init|--anchor|--baseline) LEARNER+=("$1" "$2"); shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac

@@ -76,7 +76,8 @@ result into the record as "tripwires": {"trips": [...], "alarms": [...]}. Withou
 none run (hold share, invented tool names, rejected share against its 3% floor, clipped share, gradient norm). A trip
 means roll back, an alarm means look; the learner only reports, the orchestrator acts. A rollback empties the window, so
 the updates it undid cannot trip the restored weights, and a restart refills it from health.jsonl after the last
-rollback.
+rollback. `--drift alarm` reports the banded checks as alarms instead of trips, so behaviour may move away from v0's
+bands without a rollback.
 
 Control. A command is a JSON object in a file in ROOT/control; the file's name only orders commands, oldest name first,
 so use a sortable one such as 000017-rollback.json. Write it as a hidden or .tmp name and rename it into place: the
@@ -1270,6 +1271,7 @@ class Learner:
 DEFAULTS: dict[str, Any] = {
     "window": 10,
     "min_records": 5,
+    "drift": "trip",
     "band_sd": 4.0,
     "band_floor": {"length": 5.0, "calls": 0.1, "exact_share": 0.02, "distinct_fraction": 0.02, "entropy": 0.05},
     "banded": {
@@ -1304,12 +1306,15 @@ def evaluate_tripwires(
               rejected_share only the mean is read
     config    overrides for DEFAULTS
 
-    Trips: window mean outside the band for length (tokens_p50), calls (calls_per_decision), exact_share,
-    distinct_fraction or entropy; hold share above 0.8; invented tool names above 0.5%; rejected share above
+    Trips: hold share above 0.8; invented tool names above 0.5%; rejected share above
     max(2 x baseline, 3%); this update's clipped share above clipped_trip; the newest grad norm above 5x the window's
-    median. Alarms: hold share above 0.6; KL to base or TIS truncation above their limits.
+    median. Alarms: hold share above 0.6; KL to base or TIS truncation above their limits. The banded checks (window
+    mean outside the band for length (tokens_p50), calls (calls_per_decision), exact_share, distinct_fraction or
+    entropy) are trips, or alarms with drift = "alarm".
     """
     cfg = {**DEFAULTS, **(config or {})}
+    if cfg["drift"] not in ("trip", "alarm"):
+        raise ValueError(f"drift must be 'trip' or 'alarm', not {cfg['drift']!r}")
     recent = list(window)[-cfg["window"] :]
     trips: list[dict[str, Any]] = []
     alarms: list[dict[str, Any]] = []
@@ -1323,6 +1328,7 @@ def evaluate_tripwires(
     def flag(into: list, name: str, metric: str, value: float, limit: Any, message: str) -> None:
         into.append({"name": name, "metric": metric, "value": value, "limit": limit, "message": message})
 
+    drift_into = trips if cfg["drift"] == "trip" else alarms
     for name, metric in cfg["banded"].items():
         value, ref = mean(metric), baseline.get(metric)
         if value is None or ref is None:
@@ -1330,7 +1336,7 @@ def evaluate_tripwires(
         spread = max(cfg["band_sd"] * ref["sd"], cfg["band_floor"].get(name, 0.0))
         low, high = ref["mean"] - spread, ref["mean"] + spread
         if not low <= value <= high:
-            flag(trips, name, metric, value, [low, high], f"{metric} {value:.4g} outside {low:.4g}..{high:.4g}")
+            flag(drift_into, name, metric, value, [low, high], f"{metric} {value:.4g} outside {low:.4g}..{high:.4g}")
 
     hold = mean("hold_share")
     if hold is not None and hold > cfg["hold_trip"]:
@@ -1584,6 +1590,12 @@ def parse() -> argparse.Namespace:
     p.add_argument("--aux-alpha0", type=float, default=0.2, help="RL: weight of the CE on sft rows; 0 drops those rows")
     p.add_argument("--aux-decay", type=float, default=0.995, help="RL: alpha_t = alpha0 * decay ** update")
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument(
+        "--drift",
+        choices=("trip", "alarm"),
+        default="trip",
+        help="RL: drift outside the baseline's bands trips (rollback) or, with `alarm`, is only reported",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
@@ -1627,7 +1639,14 @@ def main() -> None:
     model = build_model(cfg, device)
     comm.sync_params([p for p in model.parameters() if p.requires_grad])
     tokenizer = AutoTokenizer.from_pretrained(cfg.base)
-    learner = Learner(cfg, model, lambda ids: tokenizer.decode(ids, skip_special_tokens=False), comm, baseline=baseline)
+    learner = Learner(
+        cfg,
+        model,
+        lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
+        comm,
+        baseline=baseline,
+        tripwires={"drift": args.drift},
+    )
     if args.stats_only:
         log.info("stats-only: %s", stats_only(learner, Path(args.stats_only)))
         comm.close()

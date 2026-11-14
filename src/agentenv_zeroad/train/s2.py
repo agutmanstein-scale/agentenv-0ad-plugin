@@ -37,6 +37,8 @@ sequence.toml's [sequence] table holds a person's calls on a run, read again on 
 steps whose recorded failure was looked at and accepted, so the sequence goes on past them (their gates stay on record,
 the status becomes `accepted`; a step that has not failed is never skipped), and `stop_after` names a step after which
 the sequence stops, uploads and powers off as at any other stop (only the steps up to it count in the expected hours).
+`rerun` lists steps to run again although gates.json records them (whatever their status; the old entry is kept under
+`earlier`); once rerun, a step follows the normal rules again, and accept_failed never skips a step listed in `rerun`.
 """
 
 from __future__ import annotations
@@ -103,6 +105,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "minute": 10.0,
         "baseline_config": "",  # a play-only v0 run on E2's kind of games whose health records band E2's tripwires
         "lr": 0.0,  # the learner's learning rate for E2; 0 keeps the learner's default
+        "drift": "trip",  # the learner's --drift for E2: trip, or alarm to report the banded tripwires, no rollback
     },
     "baselines": {
         "config": "baselines.toml",
@@ -197,6 +200,7 @@ class Settings:
     tables: Mapping[str, Mapping[str, Any]]
     accept_failed: tuple[str, ...] = ()
     stop_after: str = ""
+    rerun: tuple[str, ...] = ()
 
     def __getitem__(self, step: str) -> Mapping[str, Any]:
         return self.tables[step]
@@ -231,10 +235,12 @@ def load_settings(path: Path) -> Settings:
     if set(s3) - {"uri"}:
         raise ValueError(f"unknown [s3] keys: {', '.join(sorted(set(s3) - {'uri'}))}")
     calls = dict(raw.get("sequence", {}))
-    if set(calls) - {"accept_failed", "stop_after"}:
-        raise ValueError(f"unknown [sequence] keys: {', '.join(sorted(set(calls) - {'accept_failed', 'stop_after'}))}")
+    allowed_calls = {"accept_failed", "stop_after", "rerun"}
+    if set(calls) - allowed_calls:
+        raise ValueError(f"unknown [sequence] keys: {', '.join(sorted(set(calls) - allowed_calls))}")
     accept, stop_after = tuple(calls.get("accept_failed", ())), str(calls.get("stop_after", ""))
-    for name in (*accept, *([stop_after] if stop_after else [])):
+    rerun = tuple(calls.get("rerun", ()))
+    for name in (*accept, *rerun, *([stop_after] if stop_after else [])):
         if name not in STEPS:
             raise ValueError(f"[sequence] names no step {name!r}; the steps are {', '.join(STEPS)}")
     tables = {}
@@ -246,7 +252,9 @@ def load_settings(path: Path) -> Settings:
         tables[step] = {**defaults, **given}
         if float(tables[step]["cap_hours"]) <= 0:
             raise ValueError(f"[{step}] cap_hours must be positive")
-    return Settings(Path(raw.get("root", DEFAULT_ROOT)), s3.get("uri"), tables, accept, stop_after)
+    if tables["e2"]["drift"] not in ("trip", "alarm"):
+        raise ValueError(f"[e2] drift must be 'trip' or 'alarm', not {tables['e2']['drift']!r}")
+    return Settings(Path(raw.get("root", DEFAULT_ROOT)), s3.get("uri"), tables, accept, stop_after, rerun)
 
 
 def render_sft_panels(template: str, versions: Mapping[int, int], games: int) -> str:
@@ -430,13 +438,20 @@ class Record:
             entry.update(status="accepted", accepted=self.now())
         self.save(step)
 
-    def begin(self, step: str) -> None:
+    def begin(self, step: str, rerun: bool = False) -> None:
+        """Start a step's entry. Its earlier runs stay on record: a rerun adds the entry it replaces, a retry keeps the
+        list the entry already had."""
+        old = self.data["steps"].get(step, {})
+        earlier = list(old.get("earlier", []))
+        if rerun and old:
+            earlier.append({k: v for k, v in old.items() if k != "earlier"})
         self.data["steps"][step] = {
             "status": "running",
             "started": self.now(),
             "ended": None,
             "gates": [],
             "detail": {},
+            **({"earlier": earlier} if earlier else {}),
         }
         self.save(step)
 
@@ -535,15 +550,24 @@ class Ctx:
         return self.configs.load(step, **kw)
 
 
+def rerun_due(settings: Settings, step: str, entry: Mapping[str, Any] | None) -> bool:
+    """Whether [sequence] rerun makes `step` run again: it is listed, has an entry, and that is not yet a rerun."""
+    return step in settings.rerun and bool(entry) and not (entry or {}).get("earlier")
+
+
 def resumed_steps(settings: Settings, s2: Path) -> set[str]:
     """The steps a --resume of the sequence in `s2` passes over: those that passed, those accepted by hand, and the
-    failed ones its [sequence] accept_failed now accepts."""
+    failed ones its [sequence] accept_failed now accepts. A step [sequence] rerun lists is not passed over until it has
+    been rerun, and accept_failed never passes it over."""
     steps = (read_json(s2 / "gates.json") or {}).get("steps", {})
     return {
         name
         for name, entry in steps.items()
-        if entry.get("status") in ("passed", "accepted")
-        or (entry.get("status") == "failed" and name in settings.accept_failed)
+        if not rerun_due(settings, name, entry)
+        and (
+            entry.get("status") in ("passed", "accepted")
+            or (entry.get("status") == "failed" and name in settings.accept_failed and name not in settings.rerun)
+        )
     }
 
 
@@ -672,6 +696,8 @@ def step_e2(ctx: Ctx) -> Outcome:
     flags = e2_baseline_flags(ctx) if s["baseline_config"] else baseline_flags(ctx)
     if float(s["lr"]) > 0:
         flags = [*flags, "--lr", f"{float(s['lr']):g}"]
+    if s["drift"] != "trip":
+        flags = [*flags, "--drift", str(s["drift"])]
     ctx.train_run(ctx.configs.file("e2"), flags, label="control run")
     minute = float(s["minute"])
     policy = armies(cfg.root / "games", minute, trained_only=True, last=int(s["window_games"]))
@@ -1073,17 +1099,26 @@ def planned_usd(settings: Settings, step: str) -> float:
 
 def sequence(ctx: Ctx) -> tuple[str, str | None]:
     """Run the steps; returns (verdict, reason). A step that passed in an earlier life of this record is skipped, as is
-    one whose failure [sequence] accept_failed accepts; the sequence stops after [sequence] stop_after."""
+    one whose failure [sequence] accept_failed accepts (not while [sequence] rerun lists it); a step rerun lists runs
+    again once, whatever its record says; the sequence stops after [sequence] stop_after."""
     for step in STEPS:
-        if ctx.record.passed(step):
+        reason = None
+        if rerun_due(ctx.settings, step, ctx.record.data["steps"].get(step)):
+            ctx.say(f"{step}: recorded {ctx.record.status(step)}, run again ([sequence] rerun)")
+            reason = attempt(ctx, step, rerun=True)
+        elif ctx.record.passed(step):
             ctx.say(f"{step}: already passed, skipped")
-        elif step in ctx.settings.accept_failed and ctx.record.status(step) in ("failed", "accepted"):
+        elif (
+            step in ctx.settings.accept_failed
+            and step not in ctx.settings.rerun
+            and ctx.record.status(step) in ("failed", "accepted")
+        ):
             ctx.record.accept(step)
             ctx.say(f"{step}: its failure is accepted by hand ([sequence] accept_failed), skipped")
         else:
             reason = attempt(ctx, step)
-            if reason:
-                return "stopped", reason
+        if reason:
+            return "stopped", reason
         if step == ctx.settings.stop_after:
             reason = f"{step}: the sequence stops after it ([sequence] stop_after)"
             ctx.say(reason)
@@ -1091,11 +1126,11 @@ def sequence(ctx: Ctx) -> tuple[str, str | None]:
     return "complete", None
 
 
-def attempt(ctx: Ctx, step: str) -> str | None:
+def attempt(ctx: Ctx, step: str, rerun: bool = False) -> str | None:
     """Run one step under its cap and record it; returns why the sequence must stop, or None if it passed."""
     hours = step_hours(ctx.settings, step)
     refused = ctx.budget_ok(hours, planned_usd(ctx.settings, step))
-    ctx.record.begin(step)
+    ctx.record.begin(step, rerun)
     if refused:
         reason = f"{step}: the budget guard refuses it: {refused}"
         ctx.record.end(step, Outcome(reason=reason))

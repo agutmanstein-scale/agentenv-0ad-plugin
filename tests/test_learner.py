@@ -594,6 +594,21 @@ def test_a_window_mean_more_than_four_sd_from_the_baseline_trips_that_band(metri
     assert names(L.evaluate_tripwires([healthy(**{metric: bad})] * 10, BASELINE), "trips") == [name]
 
 
+def test_with_drift_alarm_a_band_is_an_alarm_while_a_breakage_check_still_trips():
+    drifted = healthy(tokens_p50=50.0, hold_share=0.9)
+    result = L.evaluate_tripwires([drifted] * 10, BASELINE, {"drift": "alarm"})
+    assert names(result, "trips") == ["hold_share"]
+    assert names(result, "alarms") == ["length"]
+    only_drift = L.evaluate_tripwires([healthy(tokens_p50=50.0)] * 10, BASELINE, {"drift": "alarm"})
+    assert names(only_drift, "trips") == [] and names(only_drift, "alarms") == ["length"]
+    assert names(L.evaluate_tripwires([healthy(tokens_p50=50.0)] * 10, BASELINE), "trips") == ["length"]
+
+
+def test_an_unknown_drift_value_is_refused_even_before_min_records():
+    with pytest.raises(ValueError, match="drift"):
+        L.evaluate_tripwires([], BASELINE, {"drift": "maybe"})
+
+
 @pytest.mark.parametrize("flags", [[], ["--known-tools", ""], ["--known-tools", ","]])
 def test_the_cli_refuses_to_start_without_known_tool_names(monkeypatch, flags):
     monkeypatch.setattr(sys, "argv", ["learner.py", "--base", "b", "--root", "r", *flags])

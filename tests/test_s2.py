@@ -575,6 +575,70 @@ def test_a_failure_accepted_by_hand_stays_on_record_and_the_sequence_goes_on_pas
     assert S.sequence(resumed(ctx, accept_failed=("e2",))) == ("complete", None) and order == []
 
 
+def accepted_e2(tmp_path, monkeypatch, order):
+    """A sequence whose E2 failed and was accepted by hand, the way E2 is recorded after the 9 Nov attempts."""
+    step_stubs(monkeypatch, {"e2": False}, order)
+    ctx, _ = make_ctx(tmp_path, FakeRunner())
+    assert S.sequence(ctx)[0] == "stopped"
+    assert S.sequence(resumed(ctx, accept_failed=("e2",))) == ("complete", None)
+    order.clear()
+    return ctx
+
+
+def test_a_step_listed_in_rerun_runs_again_once_and_keeps_its_old_entry(tmp_path, monkeypatch):
+    order: list[str] = []
+    ctx = accepted_e2(tmp_path, monkeypatch, order)
+    step_stubs(monkeypatch, {}, order)
+    calls = {"accept_failed": ("e2",), "rerun": ("e2",)}
+    assert S.sequence(resumed(ctx, **calls)) == ("complete", None) and order == ["e2"]
+    entry = json.loads((ctx.s2 / "gates.json").read_text())["steps"]["e2"]
+    assert entry["status"] == "passed" and [e["status"] for e in entry["earlier"]] == ["accepted"]
+    assert "earlier" not in entry["earlier"][0] and "e2: recorded accepted, run again" in (
+        (ctx.s2 / "progress.log").read_text()
+    )
+    order.clear()
+    assert S.sequence(resumed(ctx, **calls)) == ("complete", None) and order == []  # passed: not a third time
+
+
+def test_a_failed_rerun_is_attempted_again_on_a_resume_though_accept_failed_lists_it(tmp_path, monkeypatch):
+    order: list[str] = []
+    ctx = accepted_e2(tmp_path, monkeypatch, order)
+    calls = {"accept_failed": ("e2",), "rerun": ("e2",)}
+    assert S.sequence(resumed(ctx, **calls))[0] == "stopped" and order == ["e2"]
+    assert S.sequence(resumed(ctx, **calls))[0] == "stopped" and order == ["e2", "e2"]
+    entry = json.loads((ctx.s2 / "gates.json").read_text())["steps"]["e2"]
+    assert entry["status"] == "failed" and [e["status"] for e in entry["earlier"]] == ["accepted"]  # one, not two
+    step_stubs(monkeypatch, {}, order)
+    assert S.sequence(resumed(ctx, **calls)) == ("complete", None)
+
+
+def test_a_step_in_rerun_without_an_entry_just_runs(tmp_path, monkeypatch):
+    order: list[str] = []
+    step_stubs(monkeypatch, {}, order)
+    ctx, _ = make_ctx(tmp_path, FakeRunner(), calls='rerun = ["sft"]')
+    assert S.sequence(ctx) == ("complete", None) and order.count("sft") == 1
+    assert "earlier" not in json.loads((ctx.s2 / "gates.json").read_text())["steps"]["sft"]
+
+
+def test_a_resume_expects_the_hours_of_a_pending_rerun_but_not_of_one_already_rerun(tmp_path):
+    cdir = make_config_dir(tmp_path / "c", 'accept_failed = ["e2"]\nrerun = ["e2"]\nstop_after = "sft_panels"')
+    settings = S.load_settings(cdir / "sequence.toml")
+    s2 = tmp_path / "s2"
+    s2.mkdir()
+    steps = {k: {"status": "passed"} for k in ("e1", "baselines", "calibration", "tripwire", "labels", "sft")}
+    steps["e2"] = {"status": "accepted"}
+    (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
+    assert "e2" not in S.resumed_steps(settings, s2)
+    pending = float(settings["e2"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
+    assert S.check_dir(cdir, 600, s2)["expected_hours"] == pytest.approx(pending)
+    steps["e2"] = {"status": "accepted", "earlier": [{"status": "accepted"}]}
+    (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
+    assert "e2" in S.resumed_steps(settings, s2)  # the rerun is on record
+    steps["e2"]["status"] = "failed"
+    (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
+    assert "e2" not in S.resumed_steps(settings, s2)  # a failed rerun is not accepted by accept_failed
+
+
 def test_accepting_a_steps_failure_never_skips_the_step_before_it_has_failed(tmp_path, monkeypatch):
     order: list[str] = []
     step_stubs(monkeypatch, {"e2": False}, order)
@@ -625,6 +689,7 @@ def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
     ("calls", "message"),
     [('stop_after = "run2"', "names no step 'run2'"),
      ('accept_failed = ["e3"]', "names no step 'e3'"),
+     ('rerun = ["e9"]', "names no step 'e9'"),
      ('skip = ["e2"]', "unknown \\[sequence\\] keys: skip")],
 )  # fmt: skip
 def test_a_sequence_call_that_names_no_step_or_has_an_unknown_key_is_refused(tmp_path, calls, message):
@@ -777,6 +842,21 @@ def test_e2_and_run_one_refuse_to_start_without_a_tripwire_baseline_of_enough_re
     with pytest.raises(S.StepFailed, match="exists with 9 of 10 records"):
         run_step(ctx, "run1")
     assert runner.calls == []  # nothing was started
+
+
+def test_e2_passes_the_learner_a_drift_of_alarm_only_when_asked_and_refuses_other_values(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    runner.effects = e2_world(ctx, policy_army=9, control_army=3)
+    install_e2_baseline(ctx)
+    ctx.settings.tables["e2"]["drift"] = "alarm"
+    assert run_step(ctx, "e2").passed
+    assert runner.calls[0][-4:] == ["--lr", "3e-05", "--drift", "alarm"]
+    cdir = make_config_dir(tmp_path / "bad")
+    path = cdir / "sequence.toml"
+    path.write_text(re.sub(r"^\[e2\].*$", lambda m: m.group(0) + '\ndrift = "maybe"', path.read_text(), flags=re.M))
+    with pytest.raises(ValueError, match=r"\[e2\] drift"):
+        S.load_settings(path)
 
 
 def test_e2_passes_when_the_trained_policy_out_armies_the_frozen_arm_and_fails_on_a_flat_curve_or_a_trip(tmp_path):

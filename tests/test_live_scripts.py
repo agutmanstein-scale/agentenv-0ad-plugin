@@ -2266,6 +2266,16 @@ def test_the_learner_only_modes_start_the_learner_in_sft_or_probe_mode_and_no_or
         line for line in plain.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
     ]
     assert "--sft" not in learner and "--probe" not in learner  # an RL run is unchanged
+    drift = run_box(
+        stubs, "train-run.sh", str(S2_DIR / "run1.toml"), "--init", "/x/train/s2/sft/epochs/epoch2", "--drift", "alarm",
+        DRY_RUN="1",
+    )  # fmt: skip
+    [learner] = [
+        line for line in drift.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--drift alarm" in learner and "--drift" not in plain.stdout
+    refused = run_box(stubs, "train-run.sh", str(S2_DIR / "run1.toml"), "--drift", "maybe", DRY_RUN="1")
+    assert refused.returncode != 0 and "--drift needs trip or alarm" in refused.stderr + refused.stdout
 
 
 def run_learner_only(stubs, *args, writes: bool, ps: str = ""):

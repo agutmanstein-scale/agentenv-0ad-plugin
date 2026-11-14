@@ -42,7 +42,10 @@ Going on past a failed step is a person's call, never the sequencer's, and it is
 `[sequence]` table, which every `--resume` reads again. `accept_failed = ["e2"]` skips a step whose recorded failure was
 accepted (its gates stay in `gates.json`, its status becomes `accepted`; a step that never failed still runs), and
 `stop_after = "sft_panels"` stops the sequence after that step, with the usual report, upload and power-off. Only the
-steps up to `stop_after` count in the expected hours that `start` checks. 9 Nov: E2 failed twice (on the second attempt
+steps up to `stop_after` count in the expected hours that `start` checks. `rerun = ["e2"]` runs a step again although
+`gates.json` records it (its old entry is kept under `earlier`); once rerun, the step follows the usual rules again, and
+`accept_failed` does not skip it while it is listed. `[e2] drift = "alarm"` starts E2's learner with `--drift alarm`, so
+behaviour moving outside v0's bands is an alarm to look at, not a trip that rolls back. 9 Nov: E2 failed twice (on the second attempt
 its trained policy's median army was 4 against the control's 2, p 0.36, with three trips; against 442 games of v0 on
 E2's kind of games both attempts were only marginally better, p 0.08 and 0.06), so E2 was accepted and the sequence
 runs the distillation steps only; Run 1 is decided on the SFT panels' results.
