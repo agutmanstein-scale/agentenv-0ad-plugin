@@ -108,8 +108,13 @@ class GameConfig:
     maps: tuple[str, ...] = ("mainland",)
     seed_low: int = 1
     seed_high: int = 1_000_000
+    seed_group: int = (
+        1  # training games dealt from one start: the same opponent, civs, slot, map and seeds, this many times
+    )
 
     def __post_init__(self) -> None:
+        if self.seed_group < 1:
+            raise ValueError("games.seed_group is a whole number of games, 1 or more")
         if self.seed_low >= self.seed_high:
             raise ValueError("games.seed_low must be below games.seed_high")
         if not 0 <= self.no_cap_share < 1:

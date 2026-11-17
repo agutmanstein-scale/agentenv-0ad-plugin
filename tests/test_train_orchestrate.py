@@ -1632,6 +1632,71 @@ def test_the_status_carries_the_sync_outcome_and_the_open_alarms(tmp_path, monke
     assert status["sync"] == {"last_ok": None, "failures": 0} and status["alarms"] == {"disk": "full"}
 
 
+def start_of(spec: GameSpec) -> tuple:
+    policy = next(s for s in spec.seats if s.trainable)
+    other = next(s for s in spec.seats if not s.trainable)
+    return (
+        spec.seats.index(policy), policy.civ, other.kind, other.civ, other.difficulty, other.behaviour, spec.map,
+        spec.seed, spec.ai_seed, spec.time_cap_minutes,
+    )  # fmt: skip
+
+
+def test_seed_groups_deal_each_start_k_times_with_only_the_id_and_the_live_pin_changing(tmp_path):
+    factory = GameFactory(config(tmp_path, games={"seed_group": 4, "maps": ["mainland", "islands"]}))
+    specs = [factory.next(v, HOSTS[v % 2]) for v in range(40)]
+    for first in range(0, 40, 4):
+        group = specs[first : first + 4]
+        assert len({start_of(s) for s in group}) == 1 and len({s.game_id for s in group}) == 4
+        assert [policy_version(s) for s in group] == list(range(first, first + 4))
+    assert len({start_of(s) for s in specs}) == 10
+    alone = GameFactory(config(tmp_path, games={"seed_group": 1}))
+    assert len({start_of(alone.next(1, HOSTS[0])) for _ in range(10)}) == 10
+
+
+def test_a_seed_group_in_progress_survives_a_restart(tmp_path):
+    cfg = config(tmp_path, games={"seed_group": 4})
+    a = GameFactory(cfg)
+    for _ in range(6):
+        a.next(1, HOSTS[0])
+    b = GameFactory(cfg)
+    b.load_state_dict(json.loads(json.dumps(a.state_dict())))
+    assert [a.next(2, HOSTS[1]) for _ in range(6)] == [b.next(2, HOSTS[1]) for _ in range(6)]
+    with pytest.raises(ValueError, match="seed_group"):
+        config(tmp_path, games={"seed_group": 0})
+
+
+class WarmCredit(FakeCredit):
+    def __init__(self, warm_start=("/games",)):
+        super().__init__()
+        self.critic = SimpleNamespace(
+            cfg=SimpleNamespace(warm_start=tuple(warm_start), warm_min_games=7),
+            load_state_dict=lambda state: None,
+            state_dict=lambda: {"observed": 80},
+        )
+        self.warmed: list[tuple] = []
+
+    def warm_start(self, paths, min_games):
+        self.warmed.append((tuple(paths), min_games))
+
+    def state_dict(self):
+        return {}
+
+
+async def test_a_fresh_run_warm_starts_its_critic_before_any_game_and_a_restored_one_does_not(tmp_path, monkeypatch):
+    t = make(tmp_path / "fresh", monkeypatch, credit=WarmCredit())
+    await t.orch._warm_start_critic()
+    assert t.credit.warmed == [(("/games",), 7)] and (t.root / "orchestrator" / "critic.json").exists()
+    saved = tmp_path / "restored" / "run" / "orchestrator"
+    saved.mkdir(parents=True)
+    (saved / "critic.json").write_text('{"observed": 1}')
+    again = make(tmp_path / "restored", monkeypatch, credit=WarmCredit())
+    await again.orch._warm_start_critic()
+    assert again.credit.warmed == []
+    plain = make(tmp_path / "plain", monkeypatch, credit=WarmCredit(warm_start=()))
+    await plain.orch._warm_start_critic()
+    assert plain.credit.warmed == []
+
+
 def test_the_game_stream_carries_its_state_across_a_restart(tmp_path):
     a = GameFactory(config(tmp_path))
     for _ in range(7):
