@@ -4,7 +4,7 @@
 run_id = "s2-e2-baseline"
 root = "/var/lib/zeroad-live/train/s2/e2-baseline"
 duration_hours = 0.75        # ~360 games at E2's ~490 an hour: ~3,600 decisions, 10 needed records are 2,560
-budget_usd = 600            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+budget_usd = 650            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false            # the sequence powers the box off itself, once, after the final upload
 engines = 24

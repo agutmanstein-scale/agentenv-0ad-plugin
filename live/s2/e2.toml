@@ -4,10 +4,12 @@
 # Second attempt (9 Nov): its own root and prefix, so the first attempt's files (s2-e2) stay as they were.
 # Third attempt (14 Nov): drift outside v0's bands only alarms ([e2] drift in sequence.toml), and 3 h, so about 20
 # updates run at the full lr after the learner's 10-update warmup (the second attempt had 2 before its first rollback).
-run_id = "s2-e2c"
-root = "/var/lib/zeroad-live/train/s2/e2c"
+# Fourth attempt (17 Nov): per-turn GAE credit (lambda 0.8) on a critic warm-started from the earlier games, otherwise E2c;
+# games are dealt in same-start groups of 4 for measurement only. Its warm start refuses to run on fewer than 1,800 games.
+run_id = "s2-e2d"
+root = "/var/lib/zeroad-live/train/s2/e2d"
 duration_hours = 3
-budget_usd = 600            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+budget_usd = 650            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false            # the sequence powers the box off itself, once, after the final upload
 engines = 24
@@ -27,6 +29,7 @@ no_cap_share = 0.0
 interface = "v2"
 score_rule = "net_worth"
 maps = ["mainland"]
+seed_group = 4               # each start (opponent, civs, slot, map, seeds) is dealt 4 times in a row
 
 # None of these appears in a training game; the panels draw from them. No held-out map yet: one that passes the bot
 # smoke test goes in `maps`; until then the panels take the training map with held-out seeds and civ pairs.
@@ -37,6 +40,16 @@ seed_ranges = [[900000, 900500]]
 
 [credit]
 positive_control = true      # the reward is the army at minute 10
+gae_lambda = 0.8             # per-turn credit: GAE over the critic's values; the critic below must be in use or a game falls back
+
+[credit.critic]
+warm_start = [
+    "/var/lib/zeroad-live/train/s2/e2c",
+    "/var/lib/zeroad-live/train/s2/e2-baseline",
+    "/var/lib/zeroad-live/train/s2/e2/panels",
+    "/var/lib/zeroad-live/train/s2/e2b/panels",
+]
+warm_min_games = 1800
 
 [[panels]]
 name = "control-v0"
@@ -49,4 +62,4 @@ time_cap_minutes = 12
 opponents = { "petra-1" = 0.5, "petra-2" = 0.5 }
 
 [s3]
-uri = "s3://BUCKET/zeroad-train/run/s2-e2c"
+uri = "s3://BUCKET/zeroad-train/run/s2-e2d"

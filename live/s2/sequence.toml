@@ -13,9 +13,9 @@ root = "/var/lib/zeroad-live/train/s2"
 uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
 
 [sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
-rerun = ["e2"]             # 14 Nov: E2 again with drift as alarms ([e2] drift), since distillation did not beat v0;
+rerun = ["e2"]             # 17 Nov: E2 again as E2d, with per-turn GAE credit (e2.toml) and grad-norm spikes as alarms;
                            # its recorded failure stays in gates.json under `earlier`
-stop_after = "e2"          # 14 Nov: E2 only; what follows is decided on its result
+stop_after = "e2"          # 17 Nov: E2 only; what follows is decided on its result
 
 [e1]                       # GPU gates
 config = "e1.toml"
@@ -35,10 +35,11 @@ min_records = 10           # the baseline file must come from at least this many
 
 [e2]                       # positive control; runs after the baselines so it can be given the baseline
 config = "e2.toml"
-cap_hours = 3.6            # e2.toml's 3 h + drains and uploads; 14 Nov: its baseline (baseline-e2.json) is on disk and reused
-expected_hours = 3.3
+cap_hours = 3.8            # e2.toml's 3 h + the critic's warm start + drains and uploads; its baseline (baseline-e2.json) is on disk and reused
+expected_hours = 3.4       # 17 Nov: +0.1 h for the warm start (about 2,000 results files read, then one fit)
 drift = "alarm"            # 14 Nov: the second attempt was rolled back, then stopped, for drifting (calls per decision 2.35,
                            # then 2.42, against v0's band of 2.03..2.32) while its army rose; breakage still trips
+grad_norm = "alarm"        # 17 Nov: E2c's only rollback was a grad-norm spike of 0.30 (5x the median, under the 1.0 clip)
 baseline_config = "e2-baseline.toml"   # 9 Nov: band E2's tripwires on its own kind of games (see that file)
 lr = 3e-5                  # 9 Nov: at the default 1e-5 the policy moved little (KL to base at most 0.0008, the alarm 0.10)
 control_panel = "control-v0"   # the frozen-v0 arm, a panel in e2.toml

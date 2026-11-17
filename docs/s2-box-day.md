@@ -45,7 +45,8 @@ accepted (its gates stay in `gates.json`, its status becomes `accepted`; a step 
 steps up to `stop_after` count in the expected hours that `start` checks. `rerun = ["e2"]` runs a step again although
 `gates.json` records it (its old entry is kept under `earlier`); once rerun, the step follows the usual rules again, and
 `accept_failed` does not skip it while it is listed. `[e2] drift = "alarm"` starts E2's learner with `--drift alarm`, so
-behaviour moving outside v0's bands is an alarm to look at, not a trip that rolls back. 9 Nov: E2 failed twice (on the second attempt
+behaviour moving outside v0's bands is an alarm to look at, not a trip that rolls back, and `[e2] grad_norm = "alarm"` does the
+same for a gradient-norm spike (`--grad-norm alarm`). 9 Nov: E2 failed twice (on the second attempt
 its trained policy's median army was 4 against the control's 2, p 0.36, with three trips; against 442 games of v0 on
 E2's kind of games both attempts were only marginally better, p 0.08 and 0.06), so E2 was accepted and the sequence
 runs the distillation steps only; Run 1 is decided on the SFT panels' results.
@@ -90,7 +91,7 @@ panels), credited with Run 1's `[credit]` settings and no critic.
 1. `cp live/s2.env.example live/s2.env` (git-ignored) and fill in the AWS profile, account, subnets, security group,
    instance profile (needs SSM), bucket and owner tag, and the LiteLLM URL, as for `live/train.env`. The rest is set:
    `g6e.12xlarge` then `g6e.24xlarge` at $10.49 and $15.07 an hour, `LIVE_REQUIRE_RATE=1`, stop-not-terminate,
-   `LIVE_MAX_HOURS=22`, `LIVE_BUDGET_USD=600`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
+   `LIVE_MAX_HOURS=22`, `LIVE_BUDGET_USD=650`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
    every `live/s2/*.toml` to 15.07 first (`s2.sh start` refuses a mismatch) and expect about a third more box cost.
 2. Copy `live/s2` somewhere to edit, or edit it in place: nothing in it is a secret. Check the three frontier model names
    in `baselines.toml` and `run1.toml` (`anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5`, `openai/gpt-6-astra`)
@@ -198,7 +199,7 @@ still up after `s2.sh stop`. Remove the LiteLLM key from SSM when no more runs n
 
 About $343 if every step takes its expected time, at the planning prices. On the first box day (6 Nov) frontier games cost
 about $2.5-3.5 each and an Opus label about $0.036, so the frontier spend is nearer $275 than $130 and the day about
-$490 at the on-demand box rate; `LIVE_BUDGET_USD=600`. The design's S2 + S3 line was about $290
+$490 at the on-demand box rate; `LIVE_BUDGET_USD=650`. The design's S2 + S3 line was about $290
 ($157 + $131). This sequence costs more because it adds the E2 positive control's two hours (the design counted E2 inside
 the 6.5 h), the SFT panels (two epochs of 192 games, then the chosen epoch's other 192: 0.7 h, $7 more than the 1.4 h
 that two epochs alone took), the tripwire baseline (0.3 h), the 6 extra calibration games and the bootstrap hour. The
@@ -209,7 +210,7 @@ steps ran long is stopped by that check (with the guard's words in `gates.json`)
 The check before Run 1 is the tight one. It adds what the box and the ledger have spent (10.0 h of box and the bootstrap
 at $10.49 is $105, plus about $104 of frontier spend: the calibration, the frontier panel and the labels) to Run 1's
 11 h cap ($115) and its $30 of spend caps: about $354 at the expected pace. At $350 the sequence would stop at Run 1's
-start with "the budget guard refuses it", so the budget is $600 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
+start with "the budget guard refuses it", so the budget is $650 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
 which `s2.sh start` requires to be at or under it): room for steps that run long, and still a stop for a runaway box.
 
 ## Uncertain until the first run

@@ -395,14 +395,14 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 
 
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tmp_path):
-    S.check_dir(LIVE_S2, 600)  # as shipped, with this run's [sequence] calls
-    numbers = S.check_dir(make_config_dir(tmp_path), 600)  # the whole plan
+    S.check_dir(LIVE_S2, 650)  # as shipped, with this run's [sequence] calls
+    numbers = S.check_dir(make_config_dir(tmp_path), 650)  # the whole plan
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
     assert 22 <= numbers["expected_hours"] <= 23 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
-    assert cost < 600
+    assert cost < 650
 
 
 @pytest.mark.parametrize(
@@ -410,7 +410,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tm
     [("e2.toml", "positive_control = true", "positive_control = false", "positive_control must be true"),
      ("run1.toml", "shutdown = false", "shutdown = true", "shutdown must be false"),
      ("run1.toml", "box_usd_per_hour = 10.49", "box_usd_per_hour = 15.07", "different box rates"),
-     ("e1.toml", "budget_usd = 600", "budget_usd = 650", "above the stage budget"),
+     ("e1.toml", "budget_usd = 650", "budget_usd = 700", "above the stage budget"),
      ("run1.toml", "duration_hours = 10", "duration_hours = 12", "past its cap_hours"),
      ("baselines.toml", 'uri = "s3://BUCKET/zeroad-train/run/s2-baselines"', "", "s3.uri is required"),
      ("sft-panels.toml", 's2/sft"', 's2/other"', "share one root"),
@@ -425,7 +425,7 @@ def test_a_config_directory_that_would_break_the_sequence_is_refused(tmp_path, f
     assert old in path.read_text(), old
     path.write_text(path.read_text().replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 600)
+        S.check_dir(cdir, 650)
 
 
 def test_every_step_is_recorded_with_its_start_and_end_and_the_next_starts_only_if_the_gate_passed(
@@ -512,7 +512,7 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (6.0, 110.0),
         (0.1, 0),
         (0.5, 0),
-        (3.6, 0),
+        (3.8, 0),
         (1.0, 132.0),
         (2.0, 0),
         (4.0, 0),
@@ -630,7 +630,7 @@ def test_a_resume_expects_the_hours_of_a_pending_rerun_but_not_of_one_already_re
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" not in S.resumed_steps(settings, s2)
     pending = float(settings["e2"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
-    assert S.check_dir(cdir, 600, s2)["expected_hours"] == pytest.approx(pending)
+    assert S.check_dir(cdir, 650, s2)["expected_hours"] == pytest.approx(pending)
     steps["e2"] = {"status": "accepted", "earlier": [{"status": "accepted"}]}
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" in S.resumed_steps(settings, s2)  # the rerun is on record
@@ -661,9 +661,9 @@ def test_stop_after_ends_the_sequence_after_that_step_on_every_resume_until_it_i
 
 
 def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(tmp_path):
-    whole = S.check_dir(make_config_dir(tmp_path / "a"), 600)
+    whole = S.check_dir(make_config_dir(tmp_path / "a"), 650)
     cdir = make_config_dir(tmp_path / "b", 'stop_after = "sft_panels"')
-    part, settings = S.check_dir(cdir, 600), S.load_settings(cdir / "sequence.toml")
+    part, settings = S.check_dir(cdir, 650), S.load_settings(cdir / "sequence.toml")
     assert part["expected_hours"] == pytest.approx(whole["expected_hours"] - float(settings["run1"]["expected_hours"]))
     assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
 
@@ -678,11 +678,11 @@ def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
     (s2 / "gates.json").write_text(
         json.dumps({"verdict": "stopped", "steps": {k: {"status": v} for k, v in status.items()}})
     )
-    left = S.check_dir(cdir, 600, s2)["expected_hours"]
+    left = S.check_dir(cdir, 650, s2)["expected_hours"]
     assert left == pytest.approx(
         float(settings["sft"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
     )
-    assert S.check_dir(cdir, 600, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 600)["expected_hours"]
+    assert S.check_dir(cdir, 650, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 650)["expected_hours"]
 
 
 @pytest.mark.parametrize(
@@ -851,12 +851,30 @@ def test_e2_passes_the_learner_a_drift_of_alarm_only_when_asked_and_refuses_othe
         runner.effects = e2_world(ctx, policy_army=9, control_army=3)
         install_e2_baseline(ctx)
         ctx.settings.tables["e2"]["drift"] = drift
+        ctx.settings.tables["e2"]["grad_norm"] = "trip"
         assert run_step(ctx, "e2").passed
         assert runner.calls[0][-len(tail) :] == tail and runner.calls[0].count("--drift") == (drift == "alarm")
     cdir = make_config_dir(tmp_path / "bad")
     path = cdir / "sequence.toml"
     path.write_text(re.sub(r"^drift = .*$", 'drift = "maybe"', path.read_text(), count=1, flags=re.M))
     with pytest.raises(ValueError, match=r"\[e2\] drift"):
+        S.load_settings(path)
+
+
+def test_e2_passes_the_learner_a_grad_norm_of_alarm_only_when_asked_and_refuses_other_values(tmp_path):
+    for grad_norm, flag in (("alarm", ["--grad-norm", "alarm"]), ("trip", [])):
+        runner = FakeRunner()
+        ctx, _ = make_ctx(tmp_path / grad_norm, runner)
+        runner.effects = e2_world(ctx, policy_army=9, control_army=3)
+        install_e2_baseline(ctx)
+        ctx.settings.tables["e2"]["grad_norm"] = grad_norm
+        assert run_step(ctx, "e2").passed
+        assert runner.calls[0][-len(flag) :] == flag if flag else "--grad-norm" not in runner.calls[0]
+        assert runner.calls[0].count("--grad-norm") == (grad_norm == "alarm")
+    cdir = make_config_dir(tmp_path / "bad")
+    path = cdir / "sequence.toml"
+    path.write_text(re.sub(r"^grad_norm = .*$", 'grad_norm = "maybe"', path.read_text(), count=1, flags=re.M))
+    with pytest.raises(ValueError, match=r"\[e2\] grad_norm"):
         S.load_settings(path)
 
 
@@ -876,7 +894,9 @@ def test_e2_passes_when_the_trained_policy_out_armies_the_frozen_arm_and_fails_o
         "3e-05",
         "--drift",
         "alarm",
-    ]  # an RL run: a learner banded on E2's own games, at E2's learning rate, its drift only alarmed
+        "--grad-norm",
+        "alarm",
+    ]  # an RL run: a learner banded on E2's own games, at E2's learning rate, its drift and grad norm only alarmed
     assert json.loads((ctx.s2 / "baseline-e2.json").read_text())["distinct_fraction"]["mean"] == 0.36
     flat = FakeRunner()
     ctx, _ = make_ctx(tmp_path / "flat", flat)
@@ -949,7 +969,7 @@ def test_e2_without_enough_v0_decisions_on_its_games_stops_before_training(tmp_p
     [
         (('seed = 2', 'seed = 2\n\n[[panels]]\nname = "x"\nkind = "heldout"\nat_hours = 0\nversion = 0\ngames = 4'),
          "no panels"),
-        (("s2/e2-baseline", "s2/e2c"), "must not be E2's own"),
+        (("s2/e2-baseline", "s2/e2d"), "must not be E2's own"),
     ],
 )  # fmt: skip
 def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_refused(tmp_path, edit, message):
@@ -958,7 +978,7 @@ def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_ref
     assert edit[0] in path.read_text()
     path.write_text(path.read_text().replace(edit[0], edit[1]))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 600)
+        S.check_dir(cdir, 650)
 
 
 def test_e2_counts_only_trained_games_for_the_policy_and_only_v0s_for_the_control(tmp_path):
