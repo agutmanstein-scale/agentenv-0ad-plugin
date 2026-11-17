@@ -302,6 +302,7 @@ class Orchestrator:
         self.loop_stats: dict[str, Any] = {}
         self.last_spend: budget.Spend | None = None
         self.supply = BriefSupply(cfg.brief_target, DEFAULT_WEIGHTS, cfg.brief_per_game) if cfg.brief_target else None
+        self._critic_restored = False
         self._restore()
 
     # ---- the loop ------------------------------------------------------------------------------------------------
@@ -309,6 +310,7 @@ class Orchestrator:
         """Run until a stop reason, then stop cleanly (always: an error in the loop is a stop reason too); returns the
         reason."""
         self.odir.mkdir(parents=True, exist_ok=True)
+        await self._warm_start_critic()
         self.monitor.start()
         try:
             await self._step("serving", self.refresh_serving)
@@ -427,6 +429,7 @@ class Orchestrator:
         if critic and hasattr(holder, "load_state_dict"):
             try:
                 holder.load_state_dict(critic)
+                self._critic_restored = True
             except (ValueError, KeyError, TypeError) as e:
                 log.error("critic state not restored (%s)", e)
         state = self._read("state.json")
@@ -434,6 +437,17 @@ class Orchestrator:
             self._restore_state(state)
         self._set_aside_unfinished()
         self._restore_supply()
+
+    async def _warm_start_critic(self) -> None:
+        """A fresh run whose critic names games to start from builds it from them before any game is played."""
+        config = getattr(getattr(self.credit, "critic", None), "cfg", None)
+        paths = getattr(config, "warm_start", ())
+        if self._critic_restored or not paths or not hasattr(self.credit, "warm_start"):
+            return
+        log.info("warm-starting the critic from %s", ", ".join(paths))
+        async with self._credit_lock:
+            await asyncio.to_thread(self.credit.warm_start, paths, config.warm_min_games)
+        await self.save_critic()
 
     def _restore_supply(self) -> None:
         """A restarted baseline run recounts the briefs its finished games hold."""

@@ -337,6 +337,68 @@ def test_a_critic_supplies_the_baseline_at_each_decision_and_sees_every_game_aft
     assert critic.seen == [("1", 1.0, 0.0)]
 
 
+class ValueCritic(FixedCritic):
+    def __init__(self, values=None):
+        super().__init__()
+        self.table, self.asked, self.cuts = values, [], []
+
+    def values(self, results, slot, times, fallback):
+        self.asked.append(list(times))
+        return None if self.table is None else list(self.table)
+
+    def observe(self, results, slot, reward, baseline, until_ms=None):
+        super().observe(results, slot, reward, baseline)
+        self.cuts.append(until_ms)
+
+
+THREE = {"1": [turn(0), turn(60_000), turn(120_000)]}
+
+
+def gae(lam, values, *, critic=None):
+    c = Credit(CreditConfig(gae_lambda=lam, decisions=(3, 3)), critic=critic or ValueCritic(values))
+    picked = c._decisions(game("a", ended_by="conquest", turns=THREE), "1", 1.0)
+    return c, [a for _, a, _ in picked]
+
+
+def test_gae_gives_each_turn_the_discounted_sum_of_its_value_steps_ending_at_the_reward():
+    c, advantages = gae(0.5, [0.1, 0.3, 0.6])
+    assert advantages == pytest.approx([0.2 + 0.5 * (0.3 + 0.5 * 0.4), 0.3 + 0.5 * 0.4, 0.4])
+    assert c.counts["gae_games"] == 1 and not c.counts["gae_fallback_games"]
+
+
+def test_gae_with_lambda_one_is_the_reward_less_the_value_and_lambda_zero_is_one_step_td():
+    assert gae(1.0, [0.1, 0.3, 0.6])[1] == pytest.approx([0.9, 0.7, 0.4])
+    assert gae(0.0, [0.1, 0.3, 0.6])[1] == pytest.approx([0.2, 0.3, 0.4])
+
+
+def test_gae_falls_back_to_the_reward_less_the_baseline_without_an_active_critic_and_counts_it():
+    c, advantages = gae(0.8, None)
+    assert advantages == pytest.approx([0.75] * 3) and c.counts["gae_fallback_games"] == 1
+    plain = Credit(CreditConfig(gae_lambda=0.8, decisions=(3, 3)))
+    assert [a for _, a, _ in plain._decisions(game("b", ended_by="conquest", turns=THREE), "1", 1.0)] == [1.0] * 3
+    assert plain.counts["gae_fallback_games"] == 1 and not plain.counts["gae_games"]
+
+
+def test_gae_credit_is_unchanged_when_lambda_is_not_set():
+    critic = ValueCritic([0.1, 0.3, 0.6])
+    c = Credit(CreditConfig(decisions=(3, 3)), critic=critic)
+    assert [a for _, a, _ in c._decisions(game("a", ended_by="conquest", turns=THREE), "1", 1.0)] == [0.75] * 3
+    assert critic.asked == [] and not c.counts["gae_games"]
+
+
+def test_positive_control_with_gae_trains_and_stores_only_decisions_before_the_control_minute():
+    critic = ValueCritic([0.0] * 24)
+    c = Credit(CreditConfig(gae_lambda=0.8, positive_control=True, decisions=(12, 12)), critic=critic)
+    g = game("p", rows=timeline(army=(8, 4)))
+    picked = c._decisions(g, "1", 1.0)
+    assert len(picked) == 12 and all(t["began_ms"] < 600_000 for t, _, _ in picked)
+    assert len(critic.asked[0]) == 24 and max(critic.asked[0]) < 600_000  # 25 s turns before minute 10
+    c.rows(g)
+    assert critic.cuts == [600_000]
+    without = Credit(CreditConfig(positive_control=True, decisions=(12, 12)))
+    assert max(t["began_ms"] for t, _, _ in without._decisions(g, "1", 1.0)) > 600_000  # as before
+
+
 def test_a_game_that_fails_a_check_gives_no_rows_and_is_counted_unless_errors_are_to_raise():
     c = Credit()
     bad = game("bad", net_worth=(5000.0, 3000.0), outcomes=("lost", "won"))

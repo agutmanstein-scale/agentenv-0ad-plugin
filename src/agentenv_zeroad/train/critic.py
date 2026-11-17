@@ -16,6 +16,15 @@ the running mean. It replaces the baseline only if its squared error there beats
 from the old value to the new over `blend_s` seconds, so the advantages do not jump. Rows are weighted toward recent
 games (a half-life in games): the policy being scored keeps changing.
 
+Credit's per-turn GAE asks for the critic's value at every turn of a game at once (`values`, the same blend as
+`baseline`). `observe` can keep only the turns that began before a cut (`until_ms`), which positive control uses: what
+happens after the control minute cannot change its reward, so those rows would only be noise.
+
+A warm start (`warm_start`, fed by Credit.warm_start) builds the first critic from earlier games before the run's own
+games exist: all of them are observed in order and fit at once with the same cross-validation, and the fit is active
+immediately if its CV loss beats the per-opponent-mean baseline's, else the critic stays inactive and the usual
+prequential cycle goes on from there. The event records the out-of-fold R^2 by 2-minute bin.
+
 The data and the bookkeeping are JSON (`state_dict`), and so are the fitted models, as base64 pickles: the games are
 trimmed to the newest `max_games`, so a fit made before a trim cannot be rebuilt from what is left, and a restart must
 resume with the very models that were scoring decisions. The state file is the learner's own; do not load one you did
@@ -30,7 +39,7 @@ import math
 import pickle
 import time
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -103,6 +112,8 @@ class CriticConfig:
     half_life_games: float = 400.0  # a game this many games old counts half
     blend_s: float = 900.0
     max_games: int = 2000
+    warm_start: tuple[str, ...] = ()  # directories whose results.json files build the critic before the run's games
+    warm_min_games: int = 1000  # fewer usable games than this and the run does not start
     max_iter: int = 100
     max_depth: int = 4
     learning_rate: float = 0.1
@@ -153,23 +164,45 @@ class GBCritic:
     # ---- what credit calls ------------------------------------------------------------------------------------
     def baseline(self, results: Mapping[str, Any], slot: str, began_ms: float, fallback: float) -> float:
         """The baseline at a decision: the running mean until a critic is in use, then the critic, blended in."""
+        values = self.values(results, slot, [began_ms], fallback)
+        return fallback if values is None else values[0]
+
+    def values(
+        self, results: Mapping[str, Any], slot: str, times: Sequence[float], fallback: float
+    ) -> list[float] | None:
+        """The baseline at each of `times` in one prediction, None when no critic is in use or the game has no
+        timeline."""
         if self.active is None or not results.get("timeline"):
-            return fallback
-        x = np.array([features(results, slot, began_ms)])
-        value = float(self.active.model.predict(x)[0])
+            return None
+        if not times:
+            return []
+        x = np.array([features(results, slot, t) for t in times])
+        value = self.active.model.predict(x)
         w = self._weight()
         if w >= 1.0:
             self.previous = None
-            return value
-        old = float(self.previous.model.predict(x)[0]) if self.previous is not None else fallback
-        return w * value + (1 - w) * old
+            return value.tolist()
+        old = self.previous.model.predict(x) if self.previous is not None else fallback
+        return (w * value + (1 - w) * old).tolist()
 
-    def observe(self, results: Mapping[str, Any], slot: str, reward: float, baseline: float) -> None:
-        """One finished seat-game: judge the pending candidate on it, store it, refit when it is time."""
-        turns = [t for t in results["seats"][slot].get("turns") or [] if t.get("began_ms") is not None]
+    def game_rows(self, results: Mapping[str, Any], slot: str, until_ms: float | None = None) -> np.ndarray | None:
+        """The feature rows of a seat's decisions (those before `until_ms`, if given), None when it has none."""
+        turns = [
+            t
+            for t in results["seats"][slot].get("turns") or []
+            if t.get("began_ms") is not None and (until_ms is None or t["began_ms"] < until_ms)
+        ]
         if not turns or not results.get("timeline"):
+            return None
+        return np.array([features(results, slot, t["began_ms"]) for t in turns])
+
+    def observe(
+        self, results: Mapping[str, Any], slot: str, reward: float, baseline: float, until_ms: float | None = None
+    ) -> None:
+        """One finished seat-game: judge the pending candidate on it, store it, refit when it is time."""
+        x = self.game_rows(results, slot, until_ms)
+        if x is None:
             return
-        x = np.array([features(results, slot, t["began_ms"]) for t in turns])
         if self.candidate is not None:
             self._judge(x, reward, baseline)
         if self._weight() >= 1.0:
@@ -215,21 +248,64 @@ class GBCritic:
         age = np.concatenate([np.full(len(g.x), upto - g.seq) for g in games])
         return x, y, 0.5 ** (age / self.cfg.half_life_games), base, group
 
-    def _fit_candidate(self) -> None:
-        upto = self.observed
+    def _screen(self, upto: int) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Cross-validate on the games up to `upto`: the CV loss, the baseline's, and the rows' y, out-of-fold
+        prediction and minute (None with fewer than two games)."""
         x, y, w, base, group = self._data(upto)
         folds = min(self.cfg.cv_folds, len(set(group.tolist())))
         if folds < 2:
-            return
+            return None
         oof = np.empty(len(y))
         for train, test in GroupKFold(n_splits=folds).split(x, y, group):
             oof[test] = self._model().fit(x[train], y[train], sample_weight=w[train]).predict(x[test])
-        cv, mean = float(np.mean((y - oof) ** 2)), float(np.mean((y - base) ** 2))
+        return float(np.mean((y - oof) ** 2)), float(np.mean((y - base) ** 2)), y, oof, x[:, 0]
+
+    def warm_start(self, games: Sequence[tuple[np.ndarray, float, float]]) -> None:
+        """Observe `games` (feature rows, reward, per-opponent mean reward), oldest first, and fit on all of them; the
+        fit is active at once if it beats the mean, else the critic waits for its first candidate as usual."""
+        for x, reward, baseline in games:
+            self.observed += 1
+            self.games.append(GameRows(self.observed, reward, baseline, x))
+        screen = self._screen(self.observed)
+        if screen is None:
+            return
+        cv, mean, y, oof, minute = screen
+        bins = {}
+        for lo in range(0, 10, 2):
+            m = (minute >= lo) & (minute < lo + 2)
+            if m.any() and np.var(y[m]) > 0:
+                bins[f"{lo}-{lo + 2}"] = 1 - float(np.mean((y[m] - oof[m]) ** 2) / np.var(y[m]))
+        if cv < mean:
+            self.active = self._fit(self.observed)
+        self.cooldown_until = self.observed + self.cfg.eval_games
+        self._log(
+            {
+                "event": "warm_start",
+                "active": self.active is not None,
+                "games": len(games),
+                "rows": len(y),
+                "cv_loss": cv,
+                "baseline_loss": mean,
+                "oof_r2_by_2min": bins,
+            }
+        )
+        del self.games[: -self.cfg.max_games]
+
+    def _fit(self, upto: int) -> Fit:
+        x, y, w, _, _ = self._data(upto)
+        return Fit(self._model().fit(x, y, sample_weight=w), upto)
+
+    def _fit_candidate(self) -> None:
+        upto = self.observed
+        screen = self._screen(upto)
+        if screen is None:
+            return
+        cv, mean = screen[0], screen[1]
         if cv >= mean:
             self.cooldown_until = upto + self.cfg.eval_games
             self._log({"event": "screened_out", "cv_loss": cv, "baseline_loss": mean})
             return
-        self.candidate = Fit(self._model().fit(x, y, sample_weight=w), upto)
+        self.candidate = self._fit(upto)
         self.window = self._empty_window()
         self._log({"event": "candidate", "cv_loss": cv, "baseline_loss": mean})
 

@@ -13,7 +13,8 @@ expected to be:
       other way, yields no rows.
   b   the baseline, a running mean of R per (opponent id, slot): an EMA over the last 64 games. With a critic
       (train/critic.py) that has earned its place, b is the critic's value at the decision's state.
-  A   R - b, for each trained decision. Then centred within (opponent, 5-minute game-time bin) strata over a buffer of
+  A   R - b, for each trained decision; with `gae_lambda` set and a critic in use, the generalised advantage of the
+      decision instead (below). Then centred within (opponent, 5-minute game-time bin) strata over a buffer of
       the last 4,096 decisions, divided by an EMA SD (of the mean square) over the last 4,096 decisions and clipped to
       +-5. A stratum is only centred once decisions from `min_stratum_games` games are in it: with one game's
       decisions all sharing one A, centring would zero them, and the first games of a run would teach nothing.
@@ -35,12 +36,26 @@ with the winner, which is counted instead).
 Positive-control mode replaces R with the seat's standing army at game minute 10, z-scored per opponent: a signal the
 policy can raise with the tools it has, to prove the whole path from game to update learns before any real run.
 
+GAE (`gae_lambda`, default off): R - b gives every decision of a game the same A, which cannot tell the turn that
+trained an army from the turns around it. With a critic V in use, a seat's grid is all its turns that have a start
+time, sorted by time (in positive control, only those before the control minute), V_T is R, and with no intermediate
+reward delta_t = V_{t+1} - V_t and A_t = sum_k lambda^k delta_{t+k}. lambda 1 is R - V_t (unbiased); lambda 0 is
+one-step TD. A chosen turn takes the A at its own place on the grid. Without an active critic (or a timeline) the game
+falls back to R - b and is counted (`gae_fallback_games`; `gae_games` otherwise). Everything after A is unchanged. In
+positive control with GAE, a decision that began at or after the control minute cannot change R, so the trained
+decisions are drawn only from before it, and the critic stores only those turns' rows. `warm_start` builds the critic
+from earlier games before any game is played: each is a finished 1v1 game read from a results.json, its R the army at
+the control minute z-scored per opponent over the whole set (credit's own z-score memory is left alone), or the normal
+reward outside positive control.
+
 The learner seats are named by the caller or marked `"trainable": true` in the game spec's seat entries (the platform's
 `SeatSpec.trainable`, which the mix sets on the policy seat).
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import math
 import random
@@ -48,9 +63,13 @@ import statistics
 from collections import Counter, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
 
 from agentenv_zeroad.train import results as rs
+
+if TYPE_CHECKING:
+    import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +87,17 @@ class Critic(Protocol):
 
     def baseline(self, results: Mapping[str, Any], slot: str, began_ms: float, fallback: float) -> float: ...
 
-    def observe(self, results: Mapping[str, Any], slot: str, reward: float, baseline: float) -> None: ...
+    def values(
+        self, results: Mapping[str, Any], slot: str, times: Sequence[float], fallback: float
+    ) -> list[float] | None: ...
+
+    def observe(
+        self, results: Mapping[str, Any], slot: str, reward: float, baseline: float, until_ms: float | None = None
+    ) -> None: ...
+
+    def game_rows(self, results: Mapping[str, Any], slot: str, until_ms: float | None) -> np.ndarray | None: ...
+
+    def warm_start(self, games: Sequence[tuple[np.ndarray, float, float]]) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -86,6 +115,7 @@ class CreditConfig:
     on_error: str = "skip"  # "skip" a game that fails a check (counted, logged), or "raise" its CreditError
     drift_updates: int = 3
     decisions_per_update: int = 256
+    gae_lambda: float | None = None  # None: A = R - b; else the per-turn GAE lambda (needs a critic in use)
     positive_control: bool = False
     control_minute: float = 10.0
     control_games: int = 256  # the z-score's memory per opponent
@@ -194,10 +224,7 @@ class Credit:
 
     def _control_reward(self, results: Mapping[str, Any], slot: str) -> float:
         """Standing army at game minute 10, z-scored against the same opponent's earlier games."""
-        row = rs.timeline_first_at_or_after(results, self.cfg.control_minute * 60_000)
-        if row is None:
-            raise CreditError("positive control needs the game's timeline")
-        value = float(((row.get("players") or {}).get(slot) or {}).get("army") or 0)
+        value = self._army_at_control(results, slot)
         seen = self.control.setdefault(rs.player_id(results, rs.other_slot(results, slot) or ""), deque())
         z = 0.0
         if len(seen) >= 2 and statistics.pstdev(seen) > 1e-9:
@@ -206,6 +233,12 @@ class Credit:
         while len(seen) > self.cfg.control_games:
             seen.popleft()
         return z
+
+    def _army_at_control(self, results: Mapping[str, Any], slot: str) -> float:
+        row = rs.timeline_first_at_or_after(results, self.cfg.control_minute * 60_000)
+        if row is None:
+            raise CreditError("positive control needs the game's timeline")
+        return float(((row.get("players") or {}).get(slot) or {}).get("army") or 0)
 
     # ---- the seat's decisions ---------------------------------------------------------------------------------
     def _key(self, results: Mapping[str, Any], slot: str) -> str:
@@ -216,33 +249,71 @@ class Credit:
     ) -> list[tuple[Mapping[str, Any], float, str]]:
         """The trained turns of a seat with their raw advantage and stratum."""
         turns = []
+        cut = self._cut_ms()
         for turn in rs.decision_turns(results, slot):
             if len(turn["logprobs"]) != len(turn["token_ids"]):
                 self.counts["skipped:logprobs_length"] += 1
                 log.warning("game %s seat %s: a turn's log-probs and tokens differ in length", _game_id(results), slot)
                 continue
-            turns.append(turn)
+            if cut is None or turn["began_ms"] < cut:
+                turns.append(turn)
         game = _game_id(results)
         rng = random.Random(f"{self.cfg.seed}:{game}:{slot}")
         count = rng.randint(*self.cfg.decisions)
         chosen = _stratified(turns, count, self.cfg.bin_s * 1000, rng)
         opp = rs.player_id(results, rs.other_slot(results, slot) or "")
         mean = self.baselines.get(self._key(results, slot), [0.0, 0])[0]
+        gae = self._gae(results, slot, reward, mean) if self.cfg.gae_lambda is not None and chosen else {}
         out = []
         for turn in chosen:
-            b = mean
-            if self.critic is not None:
-                b = self.critic.baseline(results, slot, turn["began_ms"], mean)
+            if id(turn) in gae:
+                a = gae[id(turn)]
+            else:
+                b = mean
+                if self.critic is not None:
+                    b = self.critic.baseline(results, slot, turn["began_ms"], mean)
+                a = reward - b
             stratum = f"{opp}|{int(turn['began_ms'] // (self.cfg.bin_s * 1000))}"
-            out.append((turn, reward - b, stratum))
+            out.append((turn, a, stratum))
         return out
+
+    def _cut_ms(self) -> float | None:
+        """Where a seat's decisions stop counting: the control minute, in positive control with GAE."""
+        if self.cfg.gae_lambda is None or not self.cfg.positive_control:
+            return None
+        return self.cfg.control_minute * 60_000
+
+    def _gae(self, results: Mapping[str, Any], slot: str, reward: float, mean: float) -> dict[int, float]:
+        """The GAE advantage of every turn on the seat's grid, by the turn's identity ({} when the game falls back)."""
+        cut = self._cut_ms()
+        grid = sorted(
+            (
+                t
+                for t in results["seats"][slot].get("turns") or []
+                if t.get("began_ms") is not None and (cut is None or t["began_ms"] < cut)
+            ),
+            key=lambda t: t["began_ms"],
+        )
+        values = None
+        if self.critic is not None and grid:
+            values = self.critic.values(results, slot, [t["began_ms"] for t in grid], mean)
+        if values is None:
+            self.counts["gae_fallback_games"] += 1
+            return {}
+        self.counts["gae_games"] += 1
+        assert self.cfg.gae_lambda is not None
+        return {id(t): a for t, a in zip(grid, gae_advantages(values, reward, self.cfg.gae_lambda), strict=True)}
 
     def _learn(self, results: Mapping[str, Any], slot: str, reward: float) -> None:
         """Fold the game into the baselines (after its own decisions were scored, so a game never baselines itself)."""
         key = self._key(results, slot)
         mean, n = self.baselines.get(key, [0.0, 0])
         if self.critic is not None:
-            self.critic.observe(results, slot, reward, mean)
+            cut = self._cut_ms()
+            if cut is None:
+                self.critic.observe(results, slot, reward, mean)
+            else:
+                self.critic.observe(results, slot, reward, mean, until_ms=cut)
         alpha = max(1 / (n + 1), 2 / (self.cfg.baseline_games + 1))
         self.baselines[key] = [mean + alpha * (reward - mean), min(n + 1, 10 * self.cfg.baseline_games)]
 
@@ -314,6 +385,61 @@ class Credit:
             "is_hold": rs.is_hold(turn),
         }
 
+    # ---- the critic's warm start ------------------------------------------------------------------------------
+    def warm_start(self, paths: Sequence[str | Path], min_games: int) -> None:
+        """Build the critic from the finished 1v1 games under `paths` (every results.json, oldest file first) before
+        any game is played. Exits with a message when fewer than `min_games` of them are usable."""
+        critic = self.critic
+        if critic is None:
+            raise SystemExit("the critic warm start needs a [credit.critic] table")
+        files = []
+        for path in paths:
+            for found in Path(path).rglob("results.json"):
+                with contextlib.suppress(OSError):
+                    files.append((found.stat().st_mtime, found))
+        saved, cut = Counter(self.counts), self._cut_ms()
+        games = [g for _, f in sorted(files) if (g := self._warm_game(f, critic, cut)) is not None]
+        self.counts = saved
+        if len(games) < min_games:
+            raise SystemExit(
+                f"critic warm start: {len(games)} usable games under {', '.join(map(str, paths))}, "
+                f"need at least {min_games}"
+            )
+        by_opponent: dict[str, list[float]] = defaultdict(list)
+        for _, opponent, value in games:
+            by_opponent[opponent].append(value)
+        if self.cfg.positive_control:
+            pools = {o: (statistics.fmean(v), statistics.pstdev(v)) for o, v in by_opponent.items()}
+            games = [(x, o, (v - pools[o][0]) / pools[o][1] if pools[o][1] > 1e-9 else 0.0) for x, o, v in games]
+        mean = {o: statistics.fmean(v for _, p, v in games if p == o) for o in by_opponent}
+        critic.warm_start([(x, v, mean[o]) for x, o, v in games])
+
+    def _warm_game(self, path: Path, critic: Critic, cut: float | None) -> tuple[np.ndarray, str, float] | None:
+        """(feature rows, opponent id, army at the control minute or R) of one finished game, None when unusable."""
+        try:
+            results = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+        if results.get("status") != "finished" or len(results.get("seats") or {}) != 2 or not results.get("timeline"):
+            return None
+        slot = rs.policy_slot(results, None)
+        opp = rs.other_slot(results, slot) if slot is not None else None
+        if slot is None or opp is None:
+            return None
+        x = critic.game_rows(results, slot, cut)
+        if x is None:
+            return None
+        try:
+            if self.cfg.positive_control:
+                value = self._army_at_control(results, slot)
+            elif results.get("ended_by") in ("conquest", *rs.CAP_ENDS):
+                value = self._reward(results, slot)[0]
+            else:
+                return None
+        except CreditError:
+            return None
+        return x, rs.player_id(results, opp), value
+
     # ---- drift alarm, diagnostics, state ----------------------------------------------------------------------
     def _tick(
         self, results: Mapping[str, Any], picked: Mapping[str, list[tuple[Mapping[str, Any], float, str]]]
@@ -374,6 +500,17 @@ class Credit:
         self.window = [(g, float(a)) for g, a in state["window"]]
         self.batch = dict(state["batch"])
         self.drift_streak = state["drift_streak"]
+
+
+def gae_advantages(values: Sequence[float], terminal: float, lam: float) -> list[float]:
+    """A_t = sum_k lam^k (V_{t+k+1} - V_{t+k}) over values V_0..V_{n-1} followed by the terminal value."""
+    chain = [*values, terminal]
+    out = [0.0] * len(values)
+    run = 0.0
+    for i in range(len(values) - 1, -1, -1):
+        run = (chain[i + 1] - chain[i]) + lam * run
+        out[i] = run
+    return out
 
 
 def _sign(x: float) -> float:
