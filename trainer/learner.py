@@ -77,7 +77,7 @@ none run (hold share, invented tool names, rejected share against its 3% floor, 
 means roll back, an alarm means look; the learner only reports, the orchestrator acts. A rollback empties the window, so
 the updates it undid cannot trip the restored weights, and a restart refills it from health.jsonl after the last
 rollback. `--drift alarm` reports the banded checks as alarms instead of trips, so behaviour may move away from v0's
-bands without a rollback.
+bands without a rollback, and `--grad-norm alarm` does the same for a gradient-norm spike.
 
 Control. A command is a JSON object in a file in ROOT/control; the file's name only orders commands, oldest name first,
 so use a sortable one such as 000017-rollback.json. Write it as a hidden or .tmp name and rename it into place: the
@@ -1272,6 +1272,7 @@ DEFAULTS: dict[str, Any] = {
     "window": 10,
     "min_records": 5,
     "drift": "trip",
+    "grad_norm": "trip",
     "band_sd": 4.0,
     "band_floor": {"length": 5.0, "calls": 0.1, "exact_share": 0.02, "distinct_fraction": 0.02, "entropy": 0.05},
     "banded": {
@@ -1308,13 +1309,14 @@ def evaluate_tripwires(
 
     Trips: hold share above 0.8; invented tool names above 0.5%; rejected share above
     max(2 x baseline, 3%); this update's clipped share above clipped_trip; the newest grad norm above 5x the window's
-    median. Alarms: hold share above 0.6; KL to base or TIS truncation above their limits. The banded checks (window
-    mean outside the band for length (tokens_p50), calls (calls_per_decision), exact_share, distinct_fraction or
-    entropy) are trips, or alarms with drift = "alarm".
+    median (an alarm with grad_norm = "alarm"). Alarms: hold share above 0.6; KL to base or TIS truncation above their
+    limits. The banded checks (window mean outside the band for length (tokens_p50), calls (calls_per_decision),
+    exact_share, distinct_fraction or entropy) are trips, or alarms with drift = "alarm".
     """
     cfg = {**DEFAULTS, **(config or {})}
-    if cfg["drift"] not in ("trip", "alarm"):
-        raise ValueError(f"drift must be 'trip' or 'alarm', not {cfg['drift']!r}")
+    for switch in ("drift", "grad_norm"):
+        if cfg[switch] not in ("trip", "alarm"):
+            raise ValueError(f"{switch} must be 'trip' or 'alarm', not {cfg[switch]!r}")
     recent = list(window)[-cfg["window"] :]
     trips: list[dict[str, Any]] = []
     alarms: list[dict[str, Any]] = []
@@ -1384,7 +1386,7 @@ def evaluate_tripwires(
     norms = [r["grad_norm"] for r in recent if r.get("grad_norm") is not None]
     if len(norms) >= 2 and norms[-1] > cfg["grad_norm_factor"] * statistics.median(norms):
         flag(
-            trips,
+            trips if cfg["grad_norm"] == "trip" else alarms,
             "grad_norm",
             "grad_norm",
             norms[-1],
@@ -1596,6 +1598,12 @@ def parse() -> argparse.Namespace:
         default="trip",
         help="RL: drift outside the baseline's bands trips (rollback) or, with `alarm`, is only reported",
     )
+    p.add_argument(
+        "--grad-norm",
+        choices=("trip", "alarm"),
+        default="trip",
+        help="RL: a gradient-norm spike trips (rollback) or, with `alarm`, is only reported",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
@@ -1645,7 +1653,7 @@ def main() -> None:
         lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
         comm,
         baseline=baseline,
-        tripwires={"drift": args.drift},
+        tripwires={"drift": args.drift, "grad_norm": args.grad_norm},
     )
     if args.stats_only:
         log.info("stats-only: %s", stats_only(learner, Path(args.stats_only)))

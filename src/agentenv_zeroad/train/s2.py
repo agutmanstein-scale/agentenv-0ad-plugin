@@ -106,6 +106,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "baseline_config": "",  # a play-only v0 run on E2's kind of games whose health records band E2's tripwires
         "lr": 0.0,  # the learner's learning rate for E2; 0 keeps the learner's default
         "drift": "trip",  # the learner's --drift for E2: trip, or alarm to report the banded tripwires, no rollback
+        "grad_norm": "trip",  # the learner's --grad-norm for E2: trip, or alarm to report a gradient-norm spike
     },
     "baselines": {
         "config": "baselines.toml",
@@ -252,8 +253,9 @@ def load_settings(path: Path) -> Settings:
         tables[step] = {**defaults, **given}
         if float(tables[step]["cap_hours"]) <= 0:
             raise ValueError(f"[{step}] cap_hours must be positive")
-    if tables["e2"]["drift"] not in ("trip", "alarm"):
-        raise ValueError(f"[e2] drift must be 'trip' or 'alarm', not {tables['e2']['drift']!r}")
+    for switch in ("drift", "grad_norm"):
+        if tables["e2"][switch] not in ("trip", "alarm"):
+            raise ValueError(f"[e2] {switch} must be 'trip' or 'alarm', not {tables['e2'][switch]!r}")
     return Settings(Path(raw.get("root", DEFAULT_ROOT)), s3.get("uri"), tables, accept, stop_after, rerun)
 
 
@@ -698,6 +700,8 @@ def step_e2(ctx: Ctx) -> Outcome:
         flags = [*flags, "--lr", f"{float(s['lr']):g}"]
     if s["drift"] != "trip":
         flags = [*flags, "--drift", str(s["drift"])]
+    if s["grad_norm"] != "trip":
+        flags = [*flags, "--grad-norm", str(s["grad_norm"])]
     ctx.train_run(ctx.configs.file("e2"), flags, label="control run")
     minute = float(s["minute"])
     policy = armies(cfg.root / "games", minute, trained_only=True, last=int(s["window_games"]))

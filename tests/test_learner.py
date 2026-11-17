@@ -604,6 +604,15 @@ def test_with_drift_alarm_a_band_is_an_alarm_while_a_breakage_check_still_trips(
     assert names(L.evaluate_tripwires([healthy(tokens_p50=50.0)] * 10, BASELINE), "trips") == ["length"]
 
 
+def test_a_grad_norm_spike_trips_by_default_and_is_only_an_alarm_with_grad_norm_alarm():
+    window = [healthy()] * 9 + [healthy(grad_norm=9.0)]
+    assert names(L.evaluate_tripwires(window, BASELINE), "trips") == ["grad_norm"]
+    alarmed = L.evaluate_tripwires(window, BASELINE, {"grad_norm": "alarm"})
+    assert names(alarmed, "trips") == [] and names(alarmed, "alarms") == ["grad_norm"]
+    with pytest.raises(ValueError, match="grad_norm"):
+        L.evaluate_tripwires([], BASELINE, {"grad_norm": "maybe"})
+
+
 def test_an_unknown_drift_value_is_refused_even_before_min_records():
     with pytest.raises(ValueError, match="drift"):
         L.evaluate_tripwires([], BASELINE, {"drift": "maybe"})
