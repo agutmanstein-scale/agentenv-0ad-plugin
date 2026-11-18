@@ -22,6 +22,8 @@ config and nothing else. The configs are in `live/s2/`, one per step, with `sequ
 | calibration | `stats.pick_teacher` over the calibration panel: the best win rate against Petra-3, ties broken by Petra-4 | a teacher played Petra-3 | minutes | |
 | tripwire | v0's tripwire baseline, without training. `train/baseline.py` credits the ordinary (non-panel) baseline games through the same `Credit` Run 1 uses and keeps v0's decision rows; `learner.py --stats-only` (`train-run.sh --stats-only`, the learner alone on GPUs 2 and 3, the base model) writes one health record per 256 decisions with the same row statistics, entropy and KL fields an update logs, and changes no weights; `baseline_from` of the records is `s2/baseline.json` | at least 10 records (2,560 decisions of v0) and the file written | 0.3 h | 0.5 h |
 | e2 | The positive control: an RL run with `credit.positive_control` (the reward is the army at minute 10, z-scored per opponent), 12-minute games against Petra-1 and Petra-2, 2 hours, started with `--baseline s2/baseline-e2.json` and `--lr 3e-5`. That baseline is v0's own on E2's kind of games: first a 0.75 h play-only v0 run (`e2-baseline.toml`), its decisions credited with E2's credit and measured by the stats-only learner (9 Nov: on the baselines' band, v0 itself tripped the distinct-completion check at E2's first records). The second attempt runs in `s2/e2b`; the first one's files stay in `s2/e2`. A frozen-v0 arm (60 games, the `control-v0` panel, same kind of games) plays beside it. Its adapters stay in `s2/e2` and are never loaded into anything later | at least 5 updates; the policy's last 40 games' median army at minute 10 beats the control's (Mann-Whitney, one-sided, p under 0.01, at least 30 games in each arm) and is at least 6; no tripwire trip (with the banded checks on); the run ended by its duration | 3.3 h | 3.8 h |
+| e3_check | E3's check, play-only v0 (`e3-check.toml`): `petra3-cap` (60 games against Petra-3 at the 12-minute cap) and `pair-a` and `pair-b` (60 games each against Petra-2 on the same starts); then the learner bench twice on the rows E2d consumed (`train-run.sh --bench`), once with E2's flags and `--full-prox`, once with E3's | the paired test of `pair-a` against `pair-b` does not reject (p at least 0.05); every panel at least 90% finished. Reported, not gated: the cap-win share and median margin against Petra-3, both benches' seconds per row and their ratio | 1.0 h | 1.5 h |
+| e3 | RL on the game outcome with same-start leave-one-out credit (`e3.toml`), 3 hours of training, then the end panels `end-v0` and `end-final`, 240 games each against Petra-2 on identical starts | at least 5 updates; the final adapter beats v0 on the paired end margin (Wilcoxon signed-rank, one-sided p under 0.05); the training reward's slope on the policy version has a 95% interval (resampling starts) above 0; no tripwire trip; the run ended "complete". Reported: the cap-win shares and their difference | 4.4 h | 5.0 h |
 | labels | `distill.py` under `with-model.sh`: the teacher relabels 3,000 briefs with the policy's exact prompt, reference tables and tools; a second teacher labels 200 for the noise check; SpendGuard caps $60 and $8 | at least 2,400 labels written | 0.4 h | 1.0 h |
 | sft | `learner.py --sft`, 2 epochs, lr 1e-4, a checkpoint per epoch | both epochs published, `sft-done.json` written | 0.8 h | 1.25 h |
 | sft_panels | Each epoch's adapter plays the first 192 games of the held-out panel; `stats.select_sft_checkpoint` picks one by held-out win rate with the entropy floor 0.7 and at least 20 games. The chosen epoch then plays the other 192 configs of the held-out panel (the `sft-rest` panel, `start = 192`), so it has the same 384 configs v0 has | every panel at least 90% finished, the epoch panels and the rest | 2.1 h | 3.0 h |
@@ -50,6 +52,44 @@ same for a gradient-norm spike (`--grad-norm alarm`). 9 Nov: E2 failed twice (on
 its trained policy's median army was 4 against the control's 2, p 0.36, with three trips; against 442 games of v0 on
 E2's kind of games both attempts were only marginally better, p 0.08 and 0.06), so E2 was accepted and the sequence
 runs the distillation steps only; Run 1 is decided on the SFT panels' results.
+
+### E3 and its check
+
+Why E3 is not another E2 is in `docs/s2-e2-results.md`. Two steps follow E2 in `sequence.toml`. The shipped `[sequence]`
+table accepts E2's recorded failure (`accept_failed = ["e2"]`, so E2 does not run again) and has `stop_after = "e3_check"`.
+
+**The check** (`e3_check`, 1.0 h) plays no training game. It plays v0 only: a 60-game Petra-3 panel, and `pair-a` and
+`pair-b`, v0 twice on the same 60 starts (the first 60 of E3's end panels: same seed, held-out positions, civs and sides).
+The end test of E3 is a paired test, so it has to be quiet when nothing differs: `gates.null_pair_gate` runs it on
+`pair-a` against `pair-b` and passes when it does not reject. Then the learner is benched twice on the rows E2d's learner
+consumed, each bench in a root of its own (`s2/e3-check-bench-e2`, `-e3`): `train-run.sh CONFIG --bench ROWS --bench-updates 3`
+with E2's flags and `--full-prox`, then with E3's flags. Each writes `bench.json` with its seconds per row; the step reports
+both and their ratio.
+
+**The run** (`e3`, 4.4 h) trains for `train_hours = 3.0` on the mix Petra-1 10%, Petra-2 70%, Petra-3 20%, 12-minute games,
+each start dealt 4 times in a row. Credit gives each game R less the mean R of its start's other games
+(`baseline = "start_loo"`, R as in `credit.py`, `margin_scale` 3400) and holds a start's games until all four are in; a
+start still short after 32 more games is flushed on what it has (counted). The learner is given `--whole-groups`,
+`--decisions-per-update 512`, `--anchor-beta0 0`, `--warmup-updates 2`, `--kl-check-fraction 0.25` and `--probe-rows 64`, and
+E2's `--lr 3e-5`, drift and grad-norm alarms and tripwire baseline.
+
+At `train_hours` the orchestrator stops dealing training games and tells the learner to stop. The learner leaves after the
+update in progress, so by the time it has read the stop it has published its last adapter. Only then do the two end panels
+start: `end-v0` and `end-final` (the newest adapter, once every vLLM instance serves it). They are the same 240 held-out
+configs, one game per start in each, so the margins pair; no training game is dealt and no adapter is published after
+they start, and the run ends ("complete") when both are played. A start that appears in only one panel (a game that did
+not finish) is dropped from the pairs.
+
+The gates are `gates.paired_margin_gate` (final minus v0 on the net-worth margin at the end of the game, one-sided
+Wilcoxon signed-rank, p under 0.05) and `gates.in_run_slope_gate` (the training games' R regressed on the policy version, in
+game-number order, the 95% interval from a bootstrap that resamples starts; the lower bound must be above 0). The cap-win
+shares (games ending ahead) and their difference, with a bootstrap interval over pairs, are reported and not gated.
+
+**To resume.** The check first: `live/s2.sh ID start live/s2 --yes` with `stop_after = "e3_check"`. When it has passed,
+change `stop_after` to `"e3"` in `live/s2/sequence.toml` and start again with `--resume`: the passed steps are skipped and E2
+stays accepted. An E3 that was cut off and resumed keeps its run clock, replays its unfinished panel games from the panels'
+`games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $700 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
+`LIVE_MAX_HOURS` in `s2.env.example` is 31 for the whole sequence; set the box's own `live/s2.env` to match before starting.
 
 ### Why the tripwire baseline sits between the baselines and E2
 
@@ -91,7 +131,7 @@ panels), credited with Run 1's `[credit]` settings and no critic.
 1. `cp live/s2.env.example live/s2.env` (git-ignored) and fill in the AWS profile, account, subnets, security group,
    instance profile (needs SSM), bucket and owner tag, and the LiteLLM URL, as for `live/train.env`. The rest is set:
    `g6e.12xlarge` then `g6e.24xlarge` at $10.49 and $15.07 an hour, `LIVE_REQUIRE_RATE=1`, stop-not-terminate,
-   `LIVE_MAX_HOURS=22`, `LIVE_BUDGET_USD=650`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
+   `LIVE_MAX_HOURS=31`, `LIVE_BUDGET_USD=700`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
    every `live/s2/*.toml` to 15.07 first (`s2.sh start` refuses a mismatch) and expect about a third more box cost.
 2. Copy `live/s2` somewhere to edit, or edit it in place: nothing in it is a secret. Check the three frontier model names
    in `baselines.toml` and `run1.toml` (`anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5`, `openai/gpt-6-astra`)
@@ -199,7 +239,7 @@ still up after `s2.sh stop`. Remove the LiteLLM key from SSM when no more runs n
 
 About $343 if every step takes its expected time, at the planning prices. On the first box day (6 Nov) frontier games cost
 about $2.5-3.5 each and an Opus label about $0.036, so the frontier spend is nearer $275 than $130 and the day about
-$490 at the on-demand box rate; `LIVE_BUDGET_USD=650`. The design's S2 + S3 line was about $290
+$490 at the on-demand box rate; `LIVE_BUDGET_USD=700`. The design's S2 + S3 line was about $290
 ($157 + $131). This sequence costs more because it adds the E2 positive control's two hours (the design counted E2 inside
 the 6.5 h), the SFT panels (two epochs of 192 games, then the chosen epoch's other 192: 0.7 h, $7 more than the 1.4 h
 that two epochs alone took), the tripwire baseline (0.3 h), the 6 extra calibration games and the bootstrap hour. The
@@ -210,7 +250,7 @@ steps ran long is stopped by that check (with the guard's words in `gates.json`)
 The check before Run 1 is the tight one. It adds what the box and the ledger have spent (10.0 h of box and the bootstrap
 at $10.49 is $105, plus about $104 of frontier spend: the calibration, the frontier panel and the labels) to Run 1's
 11 h cap ($115) and its $30 of spend caps: about $354 at the expected pace. At $350 the sequence would stop at Run 1's
-start with "the budget guard refuses it", so the budget is $650 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
+start with "the budget guard refuses it", so the budget is $700 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
 which `s2.sh start` requires to be at or under it): room for steps that run long, and still a stop for a runaway box.
 
 ## Uncertain until the first run
