@@ -491,8 +491,8 @@ def _check_e3(configs: ConfigDir, settings: Settings) -> None:
 
 def _check_e4(configs: ConfigDir, settings: Settings) -> None:
     """What E4 and its check rely on: the four panels exist and all pair (the check's two with E4's two, on identical
-    starts), E4 trains from the check's adapter on a cap weight under 1 with same-start credit and a margin scale the
-    step renders, and the check plays no training game."""
+    starts), E4 starts from the base model or E3's adapter and end-start plays that model, it trains on a cap weight
+    under 1 with same-start credit and a margin scale the step renders, and the check plays no training game."""
     e4, check = configs.load("e4"), configs.load("e4_check")
     for cfg, names in ((e4, E4_END_PANELS), (check, E4_CHECK_PANELS)):
         missing = set(names) - {p.name for p in cfg.panels}
@@ -507,16 +507,16 @@ def _check_e4(configs: ConfigDir, settings: Settings) -> None:
     if panel[E4_CHECK_PANELS[0]].version != 0 or panel[E4_CHECK_PANELS[1]].version != E4_INIT_VERSION:
         raise ValueError(f"e4_check: long-base plays v0 and long-e3 plays v{E4_INIT_VERSION}, E3's adapter")
     end = {p.name: p for p in e4.panels}
-    if end[E4_END_PANELS[0]].version != E4_INIT_VERSION or end[E4_END_PANELS[1]].version is not None:
-        raise ValueError(f"e4: end-start plays v{E4_INIT_VERSION}, the init adapter, and end-final the final adapter")
+    if e4.init_version not in (0, E4_INIT_VERSION):
+        raise ValueError(f"e4: init_version is 0 (the base model) or {E4_INIT_VERSION} (E3's adapter)")
+    if end[E4_END_PANELS[0]].version != e4.init_version or end[E4_END_PANELS[1]].version is not None:
+        raise ValueError(
+            f"e4: end-start plays v{e4.init_version}, the model E4 starts from, and end-final the final adapter"
+        )
     if e4.train_hours is None or any(p.at_hours < e4.train_hours for p in e4.panels if p.name in E4_END_PANELS):
         raise ValueError("e4: train_hours must be set and no end panel may start before it")
     if not check.panels_only or not check.stop_when_done:
         raise ValueError("e4_check: the check plays panels only and ends when they are done")
-    if e4.init_version != E4_INIT_VERSION:
-        raise ValueError(
-            f"e4: init_version must be {E4_INIT_VERSION}: the adapter the learner and the games start from"
-        )
     credit = e4.credit
     if credit.get("positive_control") or credit.get("baseline") != "start_loo":
         raise ValueError("e4: [credit] must train on the outcome (no positive_control) with baseline = start_loo")
@@ -1125,18 +1125,20 @@ def render_e4(ctx: Ctx, scale: float) -> Path:
 
 
 def e4_flags(ctx: Ctx) -> list[str]:
-    """E3's learner flags, started from the init adapter published as version 1 in E4's root. No --anchor: with
-    anchor_beta0 0 the learner does not load an anchor, whatever it names."""
-    s, root = ctx.settings["e4"], ctx.cfg("e4").root
+    """E3's learner flags; with init_version 1, started from E3's adapter published as version 1 in E4's root, and with
+    init_version 0 from the base model. No --anchor: with anchor_beta0 0 the learner does not load an anchor."""
+    s, cfg = ctx.settings["e4"], ctx.cfg("e4")
     base = e2_baseline_flags(ctx, "e4") if s["baseline_config"] else baseline_flags(ctx)
-    init = ["--init", str(root / "adapters" / f"v{E4_INIT_VERSION}"), "--start-version", str(E4_INIT_VERSION)]
+    version = cfg.init_version
+    init = ["--init", str(cfg.root / "adapters" / f"v{version}"), "--start-version", str(version)] if version else []
     return [*base, *learner_flags(s), *e3_learner_flags(s), *init]
 
 
 def step_e4(ctx: Ctx) -> Outcome:
     s, cfg = ctx.settings["e4"], ctx.cfg("e4")
     scale, weight = e4_margin_scale(ctx), float(cfg.credit["cap_weight"])
-    seed_adapter(e3_adapter(ctx)[1], cfg.root, E4_INIT_VERSION)
+    if cfg.init_version:
+        seed_adapter(e3_adapter(ctx)[1], cfg.root, cfg.init_version)
     rendered = render_e4(ctx, scale)
     ctx.train_run(rendered, e4_flags(ctx), label="rl run")
     final, start = (panel_games(cfg.root / "panels" / name, scale, weight) for name in reversed(E4_END_PANELS))

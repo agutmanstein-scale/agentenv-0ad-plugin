@@ -1960,7 +1960,7 @@ def passed_check(ctx, scale=4321.0):
     ctx.record.data["steps"]["e4_check"] = {"status": "passed", "detail": {"margin_scale": scale}}
 
 
-def test_e4_renders_the_checks_margin_scale_and_starts_the_learner_from_the_copied_init_adapter(tmp_path):
+def test_e4_renders_the_checks_margin_scale_and_starts_the_learner_from_the_base_model(tmp_path):
     runner = FakeRunner()
     ctx, _ = make_ctx(tmp_path, runner)
     e3_leaves_its_final_adapter(ctx)
@@ -1974,9 +1974,28 @@ def test_e4_renders_the_checks_margin_scale_and_starts_the_learner_from_the_copi
     assert cfg.credit["margin_scale"] == 4321.0 and cfg.credit["cap_weight"] == 0.5 and cfg.root == ctx.cfg("e4").root
     assert "margin_scale = 4321.0 " in rendered.read_text() and "e4_check" in rendered.read_text()
     assert "margin_scale = 5000.0" in ctx.configs.file("e4").read_text()  # the template is not touched
+    assert not (ctx.cfg("e4").root / "adapters" / "v1").exists()  # nothing of E3's is copied
+    assert len(runner.calls) == 1 and runner.calls[0][2] == str(rendered)
+    assert runner.calls[0][3:] == ["--baseline", str(ctx.s2 / "baseline-e2.json"), *E4_FLAGS_TAIL]
+    assert cfg.init_version == 0
+
+
+def test_e4_with_init_version_1_starts_the_learner_from_the_copied_e3_adapter(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    path = ctx.configs.file("e4")
+    text = path.read_text()
+    text = text.replace("init_version = 0 ", "init_version = 1 ", 1)
+    text = text.replace("version = 0                  # base Qwen", "version = 1                  # E3's", 1)
+    path.write_text(text)
+    e3_leaves_its_final_adapter(ctx)
+    passed_check(ctx)
+    install_e2_baseline(ctx)
+    runner.effects = e4_world(ctx)
+    out = run_step(ctx, "e4")
+    assert out.passed, out.why()
     init = ctx.cfg("e4").root / "adapters" / "v1"
     assert (init / "adapter_model.safetensors").read_bytes() == b"weights"  # published before the run starts
-    assert len(runner.calls) == 1 and runner.calls[0][2] == str(rendered)
     assert runner.calls[0][3:] == [
         "--baseline",
         str(ctx.s2 / "baseline-e2.json"),
@@ -1986,7 +2005,7 @@ def test_e4_renders_the_checks_margin_scale_and_starts_the_learner_from_the_copi
         "--start-version",
         "1",
     ]
-    assert "--anchor" not in runner.calls[0] and cfg.init_version == 1
+    assert "--anchor" not in runner.calls[0]
 
 
 def test_e4s_end_panels_are_the_checks_starts_and_its_gate_is_the_paired_r_of_final_over_start(tmp_path):
@@ -2053,9 +2072,9 @@ def test_the_shipped_e4_panels_pair_with_the_checks_on_identical_starts_and_cove
     }
     assert {s.time_cap_minutes for s in base} == {30}
     assert (check.seed, e4.seed, check.budget_usd, e4.budget_usd) == (4, 4, 850, 850)
-    assert (e4.train_hours, e4.init_version, e4.games.seed_group, e4.games.time_cap_minutes) == (3.5, 1, 4, 30)
+    assert (e4.train_hours, e4.init_version, e4.games.seed_group, e4.games.time_cap_minutes) == (3.5, 0, 4, 30)
     assert e4.credit["cap_weight"] == 0.5 and e4.credit["group_size"] == 4
-    assert [(p.name, p.version, p.at_hours) for p in e4.panels] == [("end-start", 1, 3.5), ("end-final", None, 3.5)]
+    assert [(p.name, p.version, p.at_hours) for p in e4.panels] == [("end-start", 0, 3.5), ("end-final", None, 3.5)]
 
 
 def test_the_shipped_sequence_runs_the_e4_check_then_e4_and_reruns_neither_e2_nor_e3(tmp_path, monkeypatch):
@@ -2086,7 +2105,7 @@ LONG_E3 = '\nopponents = { "petra-2" = 0.6, "petra-3" = 0.4 }\n\n[[panels]]\nnam
 @pytest.mark.parametrize(
     ("file", "old", "new", "message"),
     [("e4.toml", "cap_weight = 0.5", "cap_weight = 1.0", "cap_weight must be above 0 and under 1"),
-     ("e4.toml", "init_version = 1\n", "", "init_version must be 1"),
+     ("e4.toml", "init_version = 0 ", "init_version = 2 ", "init_version is 0"),
      ("e4.toml", "group_size = 4", "group_size = 2", "group_size must be games.seed_group"),
      ("e4.toml", "decisions_per_update = 512", "decisions_per_update = 256", "must match"),
      ("e4.toml", 'baseline = "start_loo"', 'baseline = "ema"', "baseline = start_loo"),
@@ -2094,12 +2113,12 @@ LONG_E3 = '\nopponents = { "petra-2" = 0.6, "petra-3" = 0.4 }\n\n[[panels]]\nnam
      ("e4.toml", "margin_scale = 5000.0", "", "needs a margin_scale line"),
      ("e4.toml", 'name = "end-final"\nkind = "heldout"\nat_hours = 3.5\ngames = 100',
       'name = "end-final"\nkind = "heldout"\nat_hours = 3.5\ngames = 90', "do not play identical starts"),
-     ("e4.toml", "version = 1                  # E3's", "version = 2                  # E3's", "end-start plays v1"),
+     ("e4.toml", "version = 0                  # base", "version = 1                  # base", "end-start plays v0"),
      ("e4.toml", "seed = 4  ", "seed = 5  ", "do not play identical starts"),
      ("e4-check.toml", "panels_only = true\n", "", "panels only"),
      ("e4-check.toml", "version = 1  ", "version = 0  ", "long-e3 plays v1"),
      ("e4-check.toml", "time_cap_minutes = 30" + LONG_E3, "time_cap_minutes = 12" + LONG_E3, "identical starts"),
-     ("e4.toml", 's2/e4"\n', 's2/e4-check"\n', "roots of their own"),
+     ("e4.toml", 's2/e4b"\n', 's2/e4-check"\n', "roots of their own"),
      ("sequence.toml", 'drift = "alarm"            # as E3', 'drift = "no"', r"\[e4\] drift")],
 )  # fmt: skip
 def test_a_config_directory_whose_e4_would_not_be_a_paired_run_from_e3_is_refused(tmp_path, file, old, new, message):

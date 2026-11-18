@@ -25,7 +25,7 @@ config and nothing else. The configs are in `live/s2/`, one per step, with `sequ
 | e3_check | E3's check, play-only v0 (`e3-check.toml`): `petra3-cap` (60 games against Petra-3 at the 12-minute cap) and `pair-a` and `pair-b` (60 games each against Petra-2 on the same starts); then the learner bench twice on the rows E2d consumed (`train-run.sh --bench`), once with E2's flags and `--full-prox`, once with E3's | the paired test of `pair-a` against `pair-b` does not reject (p at least 0.05); every panel at least 90% finished. Reported, not gated: the cap-win share and median margin against Petra-3, both benches' seconds per row and their ratio | 1.0 h | 1.5 h |
 | e3 | RL on the game outcome with same-start leave-one-out credit (`e3.toml`), 3 hours of training, then the end panels `end-v0` and `end-final`, 240 games each against Petra-2 on identical starts | at least 5 updates; the final adapter beats v0 on the paired end margin (Wilcoxon signed-rank, one-sided p under 0.05); the training reward's slope on the policy version has a 95% interval (resampling starts) above 0; no tripwire trip; the run ended "complete". Reported: the cap-win shares and their difference | 4.4 h | 5.0 h |
 | e4_check | E4's check, play-only (`e4-check.toml`): `long-base` (v0) and `long-e3` (E3's final adapter), 100 games each of 30 minutes against Petra-2 (60%) and Petra-3 (40%) on identical starts. E3's adapter is copied into this step's own root as version 1 | every panel at least 90% finished; at least 30 of `long-base`'s games ended at a cap (the sample the margin scale is measured on). Reported, not gated: each panel per opponent (conquest won and lost shares, ahead-at-cap share, median cap margin, median wall seconds), the paired comparison of `long-e3` against `long-base`, and `margin_scale` | 2.0 h | 3.0 h |
-| e4 | RL from E3's final adapter (`e4.toml`) on 30-minute games against Petra-2 and -3, reward with `cap_weight` 0.5 and the check's `margin_scale`, 3.5 hours of training, then the end panels `end-start` (the init adapter) and `end-final`, 100 games each on the check's starts | at least 5 updates; `end-final` beats `end-start` on the paired per-start R (Wilcoxon signed-rank, one-sided p under 0.05); no tripwire trip; the run ended "complete". Reported: the in-run slope, each panel per opponent, `end-final` against the check's `long-base`, the margin pairs | 6.0 h | 7.5 h |
+| e4 | RL from the base model (`e4.toml`, `init_version = 0`; 1 starts from E3's final adapter) on 30-minute games against Petra-2 and -3, reward with `cap_weight` 0.5 and the check's `margin_scale`, 3.5 hours of training, then the end panels `end-start` (the model it started from) and `end-final`, 100 games each on the check's starts | at least 5 updates; `end-final` beats `end-start` on the paired per-start R (Wilcoxon signed-rank, one-sided p under 0.05); no tripwire trip; the run ended "complete". Reported: the in-run slope, each panel per opponent, `end-final` against the check's `long-base`, the margin pairs | 6.0 h | 7.5 h |
 | labels | `distill.py` under `with-model.sh`: the teacher relabels 3,000 briefs with the policy's exact prompt, reference tables and tools; a second teacher labels 200 for the noise check; SpendGuard caps $60 and $8 | at least 2,400 labels written | 0.4 h | 1.0 h |
 | sft | `learner.py --sft`, 2 epochs, lr 1e-4, a checkpoint per epoch | both epochs published, `sft-done.json` written | 0.8 h | 1.25 h |
 | sft_panels | Each epoch's adapter plays the first 192 games of the held-out panel; `stats.select_sft_checkpoint` picks one by held-out win rate with the entropy floor 0.7 and at least 20 games. The chosen epoch then plays the other 192 configs of the held-out panel (the `sft-rest` panel, `start = 192`), so it has the same 384 configs v0 has | every panel at least 90% finished, the epoch panels and the rest | 2.1 h | 3.0 h |
@@ -110,17 +110,21 @@ share of each panel and 30 or more cap-ended games in `long-base`. The step also
 pooled within-opponent standard deviation of `long-base`'s final net-worth margins over its cap-ended games, clamped to
 2,000 to 20,000.
 
-**The run** (`e4`, 6.0 h) starts from E3's adapter. The step copies it into E4's root as `adapters/v1`, renders `e4.toml`
-into `s2/generated/e4.toml` with `margin_scale` set to the check's, and starts the learner with `--init ROOT/adapters/v1
---start-version 1` and E3's other flags (`--anchor-beta0 0`, so no anchor is loaded and no `--anchor` is passed). The
-learner counts on from version 1: its first update publishes v2 and never overwrites v1. `init_version = 1` in `e4.toml`
-tells the orchestrator that version 0 is the base model and must not play this run: it stops if `adapters/v1` is missing,
-and deals no training game and starts no panel that follows the current version until every vLLM instance serves v1.
+**The run** (`e4`, 6.0 h) starts from the base model (18 Nov). The check showed E3's adapter losing more 30-minute
+games than base: 52 of 100 by conquest against base's 34, and 13 wins (conquests plus leads at the cap) against 26. The
+first E4, from E3's adapter in root `e4`, was stopped 12 minutes in and E4 runs again in the fresh root `e4b`. The step
+renders `e4.toml` into `s2/generated/e4.toml` with `margin_scale` set to the check's and starts the learner with E3's flags
+(`--anchor-beta0 0`, so no anchor is loaded and no `--anchor` is passed) and no `--init`.
+
+With `init_version = 1` instead, it starts from E3's adapter: the step copies it into E4's root as `adapters/v1` and passes
+`--init ROOT/adapters/v1 --start-version 1`, so the learner's first update publishes v2 and never overwrites v1, and the
+orchestrator stops if `adapters/v1` is missing and deals no training game and starts no panel that follows the current
+version until every vLLM instance serves v1 (version 0, the base model, would otherwise play first).
 
 Reward: a conquest is +1 or -1; a game that reaches the cap is `cap_weight` (0.5) times `0.5 sign(m) + 0.5 tanh(m / s)`, so
 any lead at the cap is worth at most half a conquest. Credit is as in E3 (start leave-one-out, groups of 4, 512 decisions per
 update). At `train_hours` 3.5 the learner stops and the end panels start, 100 games each on the check's starts: `end-start`
-(version 1) and `end-final` (the newest adapter), so all four panels of the two steps pair by start.
+(`init_version`: version 0, the base model) and `end-final` (the newest adapter), so all four panels of the two steps pair by start.
 
 The gates are `gates.paired_reward_gate` (`end-final` minus `end-start` on each game's R, one-sided Wilcoxon signed-rank, p
 under 0.05), at least 5 learner updates, no tripwire trip and a normal end. Reported and not gated: the in-run reward slope,

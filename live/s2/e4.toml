@@ -1,17 +1,18 @@
-# E4: E3's final adapter trained on, in 30-minute games where Petra's attacks land (E3's 12-minute games all ended at the
-# cap), against Petra-2 and -3, on a reward where a conquest outweighs any lead at the cap: R = +-1 for a conquest, and at
-# the cap cap_weight (0.5) * (0.5 sign(m) + 0.5 tanh(m / s)). s is not set here: step_e4 renders this file into
+# E4: RL from base Qwen on 30-minute games where Petra's attacks land (E3's 12-minute games all ended at the cap), against
+# Petra-2 and -3, on a reward where a conquest outweighs any lead at the cap: R = +-1 for a conquest, and at the cap
+# cap_weight (0.5) * (0.5 sign(m) + 0.5 tanh(m / s)). s is not set here: step_e4 renders this file into
 # ROOT/s2/generated/e4.toml with the margin scale e4_check measured on v0's 30-minute games.
-# The run starts from E3's adapter (`--init`, copied into this root as version 1 by the step; init_version tells the
-# orchestrator that no game is dealt and no panel started until every vLLM serves it, so v0, the base model, never plays).
+# 18 Nov: it starts from the base model (init_version 0), not E3's adapter: in e4_check's 30-minute games E3's adapter
+# lost 52 of 100 by conquest against base's 34, and won 13 against 26. init_version 1 would start it from E3's adapter,
+# copied into this root as version 1. The first E4 (root e4) was stopped 12 minutes in for this; this root is fresh.
 # Credit is as in E3 (each start dealt 4 times, the start's other games the baseline, whole groups per update). It trains for
-# 3.5 h and then stops. `end-start` (v1, the init adapter) and `end-final` (the adapter current then) play the same 100
+# 3.5 h and then stops. `end-start` (v0, the base model) and `end-final` (the adapter current then) play the same 100
 # starts as e4-check.toml's panels, game by game, so all four pair. Its adapters stay in this root.
-run_id = "s2-e4"
-root = "/var/lib/zeroad-live/train/s2/e4"
+run_id = "s2-e4b"
+root = "/var/lib/zeroad-live/train/s2/e4b"
 duration_hours = 6.2        # train_hours + the two end panels (200 games of 30 minutes, about 2 h) + drains and uploads, under cap_hours 7.5
 train_hours = 3.5
-init_version = 1
+init_version = 0            # the base model; 1 starts from E3's adapter (see above)
 budget_usd = 850            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false            # the sequence powers the box off itself, once, after the final upload
@@ -55,7 +56,7 @@ decisions_per_update = 512   # the learner's batch (--decisions-per-update in se
 name = "end-start"
 kind = "heldout"
 at_hours = 3.5
-version = 1                  # E3's final adapter, the one the run starts from (ROOT/adapters/v1)
+version = 0                  # base Qwen, the model the run starts from
 games = 100
 positions = "held_out"
 time_cap_minutes = 30
@@ -71,4 +72,4 @@ time_cap_minutes = 30
 opponents = { "petra-2" = 0.6, "petra-3" = 0.4 }
 
 [s3]
-uri = "s3://BUCKET/zeroad-train/run/s2-e4"
+uri = "s3://BUCKET/zeroad-train/run/s2-e4b"
