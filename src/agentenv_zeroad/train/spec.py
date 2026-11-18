@@ -42,7 +42,7 @@ SEAT_KEYS = {
 }  # fmt: skip
 GAME_KEYS = {
     "game_id", "seats", "map", "seed", "ai_seed", "size", "biome", "placement", "time_cap_minutes", "latency_ms",
-    "score_rule", "ceasefire_minutes", "experimental_starting_resources",
+    "score_rule", "ceasefire_minutes", "experimental_starting_resources", "group",
 }  # fmt: skip
 
 
@@ -128,6 +128,7 @@ class GameSpec:
     score_rule: grading.ScoreRule | None = None  # None: the rule the LLM seats' prompt names
     ceasefire_minutes: int = 0
     experimental_starting_resources: int | None = None
+    group: str | None = None  # the start a training game was dealt from (mix.py): games of a group differ only in play
 
     def __post_init__(self) -> None:
         if not self.game_id or "/" in self.game_id or self.game_id.startswith("."):
@@ -167,7 +168,7 @@ class GameSpec:
         )
 
     def to_json(self) -> dict[str, Any]:
-        out = {k: v for k, v in self.__dict__.items() if k != "seats"}
+        out = {k: v for k, v in self.__dict__.items() if k != "seats" and (k != "group" or v is not None)}
         return {**out, "seats": [s.to_json() for s in self.seats]}
 
     @classmethod

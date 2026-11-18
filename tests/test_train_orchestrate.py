@@ -1704,3 +1704,139 @@ def test_the_game_stream_carries_its_state_across_a_restart(tmp_path):
     b = GameFactory(config(tmp_path))
     b.load_state_dict(json.loads(json.dumps(a.state_dict())))
     assert [a.next(2, HOSTS[1]) for _ in range(5)] == [b.next(2, HOSTS[1]) for _ in range(5)]
+
+
+# ---- same-start groups and the end of training ---------------------------------------------------------------------
+def test_each_start_has_one_group_id_that_the_spec_carries_and_a_restart_keeps(tmp_path):
+    cfg = config(tmp_path, games={"seed_group": 4})
+    factory = GameFactory(cfg)
+    specs = [factory.next(1, HOSTS[0]) for _ in range(10)]
+    groups = [s.group for s in specs]
+    assert groups[:4] == [groups[0]] * 4 and groups[4:8] == [groups[4]] * 4 and len(set(groups)) == 3
+    assert groups[0] == "r1-s000000" and groups[4] == "r1-s000004"
+    assert GameSpec.from_json(json.loads(json.dumps(specs[0].to_json()))) == specs[0]
+    resumed = GameFactory(cfg)
+    resumed.load_state_dict(json.loads(json.dumps(factory.state_dict())))
+    assert resumed.next(1, HOSTS[0]).group == groups[8]  # the group in progress goes on under its own id
+    assert "group" not in GameSpec("x", (SeatSpec(kind="bot", civ="rome"), SeatSpec(kind="bot", civ="pers"))).to_json()
+
+
+class GroupCredit(FakeCredit):
+    """A credit that holds a game's rows and hands both games' rows back with the next game."""
+
+    def rows(self, results: dict) -> list[dict]:
+        game_id = results["spec"]["game_id"]
+        self.games.append(game_id)
+        held = [{"game_id": f"{game_id}:1", "version": 1, "advantage": 0.5}]
+        if len(self.games) % 2:
+            self.held = held
+            return []
+        return [*self.held, *held]
+
+
+async def test_the_rows_of_a_group_flushed_by_one_game_are_written_per_game_under_the_games_own_names(
+    tmp_path, monkeypatch
+):
+    t = make(tmp_path, monkeypatch, concurrency=1, credit=GroupCredit())
+    await t.orch.refresh_serving()
+    await drive(t.orch, lambda: t.orch.counts["train_finished"] == 2)
+    files = sorted(p.name for p in (t.root / "inbox").iterdir())
+    assert files == ["r1-g000000.jsonl", "r1-g000001.jsonl"] and t.orch.counts["rows"] == 2
+
+
+END = {"name": "end-final", "kind": "heldout", "at_hours": 1, "games": 3, "opponents": {"petra-2": 1.0}}
+
+
+async def test_no_training_game_is_dealt_after_train_hours_and_the_learner_is_told_to_stop(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=2, train_hours=1, duration_hours=3, panels=[END])
+    publish(t.root, 1)
+    await t.orch.refresh_serving()
+    await drive(t.orch, lambda: t.orch.counts["train_finished"] >= 2)
+    before = len(t.play.specs)
+    t.clock.t += 3600
+    await t.orch.tick()
+    assert t.orch.training_over and commands(t.root) == [{"op": "stop"}]
+    for _ in range(5):
+        t.clock.t += 1
+        await t.orch.tick()
+        await asyncio.sleep(0.01)
+    assert t.orch.counts["started"] == before and t.orch.panels == {}  # no training game, and the panel waits
+    t.orch.requeue.append(_pending_train(t))
+    t.orch.fill()
+    assert t.orch.counts["started"] == before  # a void training game is not replayed either
+
+
+def _pending_train(t) -> orchestrate.Pending:
+    spec = t.play.specs[0]
+    return orchestrate.Pending(spec, "train", spec.game_id)
+
+
+async def test_the_end_panel_starts_on_the_final_adapter_once_the_learner_has_read_its_stop_and_left(
+    tmp_path, monkeypatch
+):
+    t = make(tmp_path, monkeypatch, concurrency=2, train_hours=1, duration_hours=3, panels=[END])
+    publish(t.root, 1)
+    await t.orch.refresh_serving()
+    t.clock.t += 3600
+    await t.orch.tick()
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels == {}  # the stop is unread: the learner may still publish
+    publish(t.root, 2)  # the update in progress ends with its adapter
+    (stop,) = (t.root / "control").glob("*.json")
+    (t.root / "control" / "done").mkdir()
+    stop.rename(t.root / "control" / "done" / stop.name)
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels == {}  # the learner is gone but v2 is not served yet
+    await t.orch.refresh_serving()
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels["end-final"].version == 2 and t.orch.current == 2
+    assert 2 in t.orch.adapters.pins
+
+
+async def test_a_run_whose_training_is_over_does_not_stall_on_rows_nobody_reads(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, train_hours=1, duration_hours=3, panels=[END])
+    t.clock.t += 3600
+    await t.orch.tick()
+    fill_inbox(t.root, 400)
+    t.clock.t += 3600
+    t.orch.check_learner(t.clock())
+    t.clock.t += 3600
+    t.orch.check_learner(t.clock())
+    assert t.orch.stop_reason is None and not t.orch.alarms
+
+
+async def test_training_over_survives_a_restart(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, train_hours=1, duration_hours=3, panels=[END])
+    t.clock.t += 3600
+    await t.orch.tick()
+    assert reborn(t).training_over
+
+
+@pytest.mark.parametrize("train_hours", [0, -1, 11])
+def test_train_hours_is_inside_the_run(tmp_path, train_hours):
+    with pytest.raises(ValueError, match="train_hours"):
+        config(tmp_path, train_hours=train_hours)
+
+
+def test_end_panels_that_differ_only_by_version_play_identical_starts_game_by_game(tmp_path):
+    from dataclasses import replace
+
+    from agentenv_zeroad.train.calibration import panel_specs
+
+    held = {"civ_pairs": [["rome", "pers"], ["athen", "cart"]], "seed_ranges": [[900000, 900500]]}
+    ends = [
+        {"name": n, "kind": "heldout", "at_hours": 3, "games": 240, "opponents": {"petra-2": 1.0},
+         "positions": "held_out", "time_cap_minutes": 12, **v}
+        for n, v in (("end-v0", {"version": 0}), ("end-final", {}))
+    ]  # fmt: skip
+    cfg = config(tmp_path, seed=1, held_out=held, panels=ends, train_hours=3)
+    v0, final = (panel_specs(cfg, p) for p in cfg.panels)
+    assert len(v0) == len(final) == 240 and cfg.panels[1].version is None
+    for a, b in zip(v0, final, strict=True):
+        assert a.game_id.removeprefix("end-v0-") == b.game_id.removeprefix("end-final-")
+        assert replace(a, game_id="x") == replace(b, game_id="x")
+        assert a.time_cap_minutes == 12 and a.seed in range(900000, 900500)
+    assert len({s.seed for s in v0}) > 200

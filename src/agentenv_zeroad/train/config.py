@@ -37,6 +37,9 @@ Panels need no spec file when they are generated (`train/panels.py`): `kind = "h
 panel-only run sets `panels_only` (no training games), `stop_when_done` (end with reason "complete" once every panel
 is played) and `brief_target` (and until the games hold the briefs for that many distillation labels, taking
 `brief_per_game` at most from one game).
+`train_hours` ends the training part of a run: from then no training game is dealt, the learner is stopped (it leaves
+after the update in progress, so the last adapter is published by then), and a panel whose `at_hours` is at or after
+`train_hours` waits for that and then plays on the final adapter: end-of-run panels of a trained policy.
 
 `python -m agentenv_zeroad.train.config CONFIG` checks a config (`check_run`: the panel spec files load, and one
 training game can be made from the mix) and prints `TRAIN_RUN_ID=`, `TRAIN_ROOT=`, `TRAIN_DURATION_HOURS=`,
@@ -355,8 +358,13 @@ class RunConfig:
     stop_when_done: bool = False  # end with reason "complete" once every panel has finished and brief_target is met
     brief_target: int = 0  # stop_when_done also waits until this many distillation briefs could be labelled (0: none)
     brief_per_game: int = 8  # distill.select's cap per game, which the supply is counted under
+    train_hours: float | None = (
+        None  # training ends here: no training game is dealt, the learner is stopped (None: never)
+    )
 
     def __post_init__(self) -> None:
+        if self.train_hours is not None and not 0 < self.train_hours <= self.duration_hours:
+            raise ValueError("train_hours is above 0 and at most duration_hours")
         if not self.run_id or "/" in self.run_id:
             raise ValueError(f"run_id must be a plain name, not {self.run_id!r}")
         if self.budget_usd <= 0 or self.box_usd_per_hour <= 0 or self.duration_hours <= 0:

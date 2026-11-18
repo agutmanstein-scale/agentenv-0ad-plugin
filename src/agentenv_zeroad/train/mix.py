@@ -19,7 +19,8 @@
   only by what the players do): the same opponent and Petra behaviour, civ pair, policy slot, map, seeds and cap, with
   only the game id and the live versions and urls of the policy seat (and a base-model opponent) current. A group
   uses one draw of the opponent and uncapped bags, and a restart continues the group in progress. Panels are not
-  grouped;
+  grouped. Each start carries a group id (`spec.group`, named for the first game of the group) that credit's
+  same-start baseline and the learner's whole-group batches key on;
 
 `repin` points an existing spec at another version or server, which is how a game voided by a vLLM outage is replayed
 with the same map, civs, opponent and seeds. `GameFactory.state_dict()` / `load_state_dict()` carry the random state,
@@ -85,6 +86,7 @@ class GameFactory:
             time_cap_minutes=None if start["uncapped"] else g.time_cap_minutes,
             latency_ms=g.latency_ms,
             score_rule=g.score_rule,
+            group=start.get("group"),
         )
 
     def _next_start(self) -> dict[str, Any]:
@@ -105,6 +107,7 @@ class GameFactory:
             "seed": self._seed(),
             "ai_seed": self._seed(),
             "uncapped": self._draw_uncapped(),
+            "group": f"{self.cfg.run_id}-s{self.index:06d}",
         }
         self._group = {"left": g.seed_group - 1, "start": start}
         return start

@@ -52,6 +52,11 @@ What it does, each on its own interval:
   panel has no spec file: `calibration.py` makes its games (frontier teachers against Petra-3 and Petra-4 at the
   policy's lockstep latency, recorded in ROOT/panels/NAME/specs.jsonl); no adapter is involved, so it runs on the base
   model's instance slot and under the frontier spend caps like any frontier seat.
+- Training end (`train_hours`). At that run hour no training game is dealt (nor a void one replayed) and the
+  learner is told to stop. A panel whose `at_hours` is at or after it starts only once the learner has read the stop (so
+  it has published its last adapter, none follows) and the newest adapter is the one being served: a panel with no
+  `version` then plays that final adapter, and the run's `stop_when_done` ends it when the panels are played. The
+  learner's stall alarm is off from then on: rows no one reads are not a stall.
 - Restarts. Everything that must not start over is saved in ROOT/orchestrator after the step that changes it: the
   tripwatch (`tripwatch.json`), credit (`credit.json`), the game stream's random state (`factory.json`), and the
   panels, queues, games in flight and counts (`state.json`, with `keep.json`'s hourly adapters). A restarted process
@@ -289,6 +294,7 @@ class Orchestrator:
         self.counts: Counter[str] = Counter()
         self.alarms: dict[str, str] = {}
         self.stop_reason: str | None = None
+        self.training_over = False
         self.disk_paused = False
         self._wake = asyncio.Event()
         self._credit_lock = asyncio.Lock()
@@ -334,6 +340,8 @@ class Orchestrator:
         """One pass of everything that is due; the tests drive this directly. Each step is guarded: one that raises is
         logged and counted, and the others still run."""
         now = self.now()
+        if self.cfg.train_hours is not None and not self.training_over:
+            await self._step("train_end", lambda: self.end_training_if_due(now))
         if self._due("panels", now, self.cfg.poll_s):
             await self._step("panels", self.start_due_panels)
         if self._due("serving", now, self.cfg.poll_s):
@@ -465,6 +473,7 @@ class Orchestrator:
     def _restore_state(self, state: dict[str, Any]) -> None:
         self.counts = Counter(state.get("counts", {}))
         self.counts["restarts"] += 1
+        self.training_over = bool(state.get("training_over", False))
         configs = {p.name: p for p in self.cfg.panels}
         for name, saved in state.get("panels", {}).items():
             if name in configs:
@@ -571,6 +580,7 @@ class Orchestrator:
                 "panel_queue": [p.to_json() for p in self.panel_queue],
                 "requeue": [p.to_json() for p in self.requeue],
                 "in_flight": in_flight,
+                "training_over": self.training_over,
             },
         )
 
@@ -639,13 +649,38 @@ class Orchestrator:
     def fill(self) -> None:
         """Start games until `concurrency` are in flight, panel games first, then replays, then new training games. A
         box short of disk starts none."""
+        training = not self.cfg.panels_only and not self.training_closed()
         while self.stop_reason is None and not self.disk_paused and len(self.in_flight) < self.cfg.concurrency:
             if not (
                 self._start_pending(self.panel_queue)
-                or self._start_pending(self.requeue)
-                or (not self.cfg.panels_only and self._start_new())
+                or (training and self._start_pending(self.requeue))
+                or (training and self._start_new())
             ):
                 return
+
+    def training_closed(self) -> bool:
+        """Whether `train_hours` has passed: no training game may be dealt from now on."""
+        if self.cfg.train_hours is None:
+            return False
+        return self.training_over or self.clock.hours(self.now()) >= self.cfg.train_hours
+
+    def end_training_if_due(self, now: float) -> None:
+        """At `train_hours`, once: tell the learner to stop (it leaves after the update in progress)."""
+        if self.clock.hours(now) < (self.cfg.train_hours or 0):
+            return
+        self.training_over = True
+        if self.learner:
+            self.control.send({"op": "stop"})
+        log.info("training ends at %.2f h: no more training games, the learner is stopping", self.clock.hours(now))
+        self.save_state()
+
+    def final_adapter_ready(self) -> bool:
+        """Whether the learner has finished (it read its stop, so nothing more is published) and the newest adapter on
+        disk is the one the instances serve."""
+        if not self.training_over or (self.learner and self.control.pending()):
+            return False
+        on_disk = self.adapters.on_disk()
+        return self.current == (on_disk[-1] if on_disk else 0)
 
     def _start_new(self) -> bool:
         inst = self._pick(self.current)
@@ -788,7 +823,11 @@ class Orchestrator:
 
     def _credit(self, game_id: str, results: dict[str, Any]) -> int:
         rows = self.credit.rows(results)
-        write_rows(self.root / "inbox", game_id, rows)
+        by_game: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:  # a same-start group's rows come back together, the games' rows named for their own game
+            by_game.setdefault(str(row["game_id"]).rsplit(":", 1)[0], []).append(row)
+        for owner, owned in by_game.items():
+            write_rows(self.root / "inbox", owner, owned)
         self.counts["rows"] += len(rows)
         self.save_credit()
         return len(rows)
@@ -976,7 +1015,7 @@ class Orchestrator:
         """Alarm and stop when the learner has made no progress (no health record, no adapter) for
         `learner_stall_minutes` while `stall_rows` rows wait in the inbox: it is down or wedged, and the games being
         played train nothing."""
-        if not self.learner:
+        if not self.learner or self.training_over:
             return
         health = self.root / "health.jsonl"
         on_disk = self.adapters.on_disk()
@@ -1024,6 +1063,9 @@ class Orchestrator:
         hours = self.clock.hours(self.now())
         for panel in self.cfg.panels:
             if panel.name in self.panels or hours < panel.at_hours:
+                continue
+            after_training = self.cfg.train_hours is not None and panel.at_hours >= self.cfg.train_hours
+            if after_training and not self.final_adapter_ready():
                 continue
             calibration = panel.kind == "teacher_calibration"
             version = 0 if calibration else panel.version if panel.version is not None else self.current

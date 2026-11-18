@@ -10,7 +10,7 @@ import pytest
 from agentenv_zeroad.train.credit import Credit, CreditConfig, CreditError
 from tests.train_fakes import results, timeline, turn, turns_every
 
-ROW_FIELDS = {"game_id", "version", "prompt_token_ids", "token_ids", "logprobs", "advantage", "is_hold"}
+ROW_FIELDS = {"game_id", "group", "version", "prompt_token_ids", "token_ids", "logprobs", "advantage", "is_hold"}
 
 
 def game(game_id="g", seed=0, **kwargs):
@@ -406,3 +406,101 @@ def test_a_game_that_fails_a_check_gives_no_rows_and_is_counted_unless_errors_ar
     assert c.counts["credit_errors"] == 1 and "disagrees" in c.diagnostics()["errors"][0]
     with pytest.raises(CreditError):
         Credit(CreditConfig(on_error="raise")).rows(bad, learners=["1"])
+
+
+# --- same-start leave-one-out ---
+
+LOO = {"baseline": "start_loo", "decisions": (2, 2), "min_stratum_games": 99}
+TWO = {"1": [turn(0), turn(900_000)]}
+
+
+def grouped(game_id, group, margin=2000.0):
+    """A cap game won (or, for a negative margin, lost) by that net-worth margin, dealt from start `group`."""
+    mine, theirs = (3000.0 + margin, 3000.0) if margin > 0 else (3000.0, 3000.0 - margin)
+    outcomes = ("won", "lost") if margin > 0 else ("lost", "won")
+    g = game(game_id, net_worth=(mine, theirs), outcomes=outcomes, turns=TWO)
+    g["spec"]["group"] = group
+    return g
+
+
+def rewards_of(margins):
+    c = Credit()
+    return [c._reward(grouped(f"r{i}", "x", m), "1")[0] for i, m in enumerate(margins)]
+
+
+def by_game(rows):
+    out = {}
+    for r in rows:
+        out.setdefault(r["game_id"].split(":")[0], []).append(r)
+    return out
+
+
+def test_a_start_is_held_until_all_its_games_are_credited_and_then_every_game_gets_r_less_the_others_mean():
+    c = Credit(CreditConfig(group_size=3, **LOO))
+    assert c.rows(grouped("a", "s1", 4000.0)) == [] and c.rows(grouped("b", "s1", 1000.0)) == []
+    assert c.diagnostics()["held_groups"] == 1 and c.diagnostics()["held_games"] == 2
+    rows = by_game(c.rows(grouped("c", "s1", -2000.0)))
+    assert set(rows) == {"a", "b", "c"} and not c.held
+    ra, rb, rc = rewards_of([4000.0, 1000.0, -2000.0])
+    expected = {"a": ra - (rb + rc) / 2, "b": rb - (ra + rc) / 2, "c": rc - (ra + rb) / 2}
+    advantages = {g: {r["advantage"] for r in rs} for g, rs in rows.items()}
+    assert all(len(v) == 1 for v in advantages.values())  # every decision of a game shares its A
+    scale = expected["a"] / next(iter(advantages["a"]))
+    for g in "abc":
+        assert next(iter(advantages[g])) * scale == pytest.approx(expected[g])
+    assert sum(expected.values()) == pytest.approx(0.0)
+    assert c.counts["loo_groups"] == 1 and c.counts["loo_games"] == 3 and not c.counts["loo_ema_fallback_games"]
+
+
+def test_every_row_names_its_group_and_a_game_without_one_is_grouped_by_its_start():
+    c = Credit(CreditConfig(group_size=2, **LOO))
+    c.rows(grouped("a", "s7", 1000.0))
+    assert {r["group"] for r in c.rows(grouped("b", "s7", 3000.0))} == {"s7"}
+    first, second = Credit().rows(game("p")), Credit().rows(game("q"))
+    assert {r["group"] for r in first} == {r["group"] for r in second} and first[0]["group"].startswith("start:")
+
+
+def test_the_ema_baselines_learn_from_a_held_game_at_once():
+    c = Credit(CreditConfig(group_size=2, **LOO))
+    c.rows(grouped("a", "s1", 4000.0))
+    assert c.baselines["petra-2|1"][1] == 1 and c.baselines["petra-2|1"][0] > 0
+
+
+def test_an_incomplete_start_is_flushed_after_the_timeout_on_the_ema_baseline_when_it_is_alone():
+    c = Credit(CreditConfig(group_size=2, group_timeout_games=2, **LOO))
+    assert c.rows(grouped("a", "lonely", 4000.0)) == [] and c.rows(grouped("b", "s2", 1000.0)) == []
+    rows = by_game(c.rows(grouped("c", "s3", 1000.0)))
+    assert set(rows) == {"a"} and c.counts["loo_timeout_groups"] == 1 and c.counts["loo_ema_fallback_games"] == 1
+    assert all(r["advantage"] > 0 for r in rows["a"])  # R less the EMA mean it saw (0 on the first game), not zero
+    assert sorted(c.held) == ["s2", "s3"]
+
+
+def test_a_timed_out_start_with_two_members_is_leave_one_out_over_those_present():
+    c = Credit(CreditConfig(group_size=4, group_timeout_games=3, **LOO))
+    c.rows(grouped("a", "s1", 4000.0))
+    c.rows(grouped("b", "s1", -1000.0))
+    c.rows(grouped("c", "s2", 1000.0))
+    rows = by_game(c.rows(grouped("d", "s3", 1000.0)))
+    assert set(rows) == {"a", "b"} and c.counts["loo_timeout_groups"] == 1 and c.counts["loo_games"] == 2
+    assert next(r["advantage"] for r in rows["a"]) > 0 > next(r["advantage"] for r in rows["b"])
+
+
+def test_a_start_of_one_game_takes_the_ema_baseline_straight_away():
+    c = Credit(CreditConfig(group_size=1, **LOO))
+    assert len(c.rows(grouped("a", "s1", 1000.0))) == 2
+    assert c.counts["loo_ema_fallback_games"] == 1 and not c.held
+
+
+def test_held_starts_survive_a_restart():
+    a = Credit(CreditConfig(group_size=2, **LOO))
+    a.rows(grouped("a", "s1", 4000.0))
+    b = Credit(CreditConfig(group_size=2, **LOO))
+    b.load_state_dict(json.loads(json.dumps(a.state_dict())))
+    assert b.state_dict() == a.state_dict() and b.diagnostics()["held_games"] == 1
+    assert set(by_game(b.rows(grouped("b", "s1", 1000.0)))) == {"a", "b"}
+
+
+@pytest.mark.parametrize("bad", [{"baseline": "mean"}, {"group_size": 0}, {"group_timeout_games": 0}])
+def test_a_config_that_names_no_baseline_or_an_empty_group_is_refused(bad):
+    with pytest.raises(ValueError, match="credit"):
+        CreditConfig(**bad)
