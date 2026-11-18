@@ -139,6 +139,12 @@ one health-shaped record per batch to ROOT/baseline-records.jsonl and then basel
 checkpoint); a short last batch is dropped, so every record is comparable with a training batch. Run it on the base
 model, without --init.
 
+--start-version N (with --init): the init adapter is version N, already published at ROOT/adapters/v{N} (by the
+sequencer, which copies it there) so the games play it from the start; the learner counts on from N, so its first
+update publishes v{N+1} and never overwrites v{N}. Without it the learner counts from 0, and an init adapter is
+version 0 to the learner while the orchestrator's version 0 is the base model: the games before the first update
+would be played by the base model.
+
 Bench mode (--bench ROWS_DIR [--bench-updates U], default 5), for timing the learner's flags on recorded rows. Reads
 the decision rows in the *.jsonl files of ROWS_DIR (the inbox format; versions are ignored, every batch is stamped with
 the learner's current version so none is stale and the TIS weight treats them as off-policy), runs U real updates with
@@ -241,6 +247,7 @@ class LearnerConfig:
         False  # batch whole start groups (the rows' `group`), freshest first, and keep them in one minibatch
     )
     bench: bool = False  # bench mode: updates publish, checkpoint and log nothing
+    start_version: int = 0  # --init's version number: published already, so the first update is start_version + 1
 
     @property
     def inbox(self) -> Path:
@@ -829,7 +836,7 @@ class Learner:
             [p for _, p in self.params], lr=cfg.lr, betas=cfg.betas, eps=cfg.eps, weight_decay=cfg.weight_decay
         )
         self.lr = cfg.lr
-        self.version = 0
+        self.version = cfg.start_version
         self.updates = 0
         self.aux_updates = 0  # updates that trained on sft-flagged rows: what the aux weight decays over
         self.sft_progress: tuple[int, int] = (1, 0)  # SFT: (epoch, rows of it trained), saved in each checkpoint
@@ -1871,6 +1878,13 @@ def parse() -> argparse.Namespace:
     )
     p.add_argument("--init", default="", help="a PEFT adapter to start from (ignored when the root has checkpoints)")
     p.add_argument(
+        "--start-version",
+        type=int,
+        default=0,
+        help="the version number of the --init adapter, already published at ROOT/adapters/v{N} for the games to play "
+        "(the first update then publishes N + 1); 0: the init adapter has no version of its own",
+    )
+    p.add_argument(
         "--known-tools", default="", help="comma-separated tool names; any other name a policy emits is invented"
     )
     p.add_argument("--baseline", default="", help="the base model's tripwire baseline (JSON from baseline_from)")
@@ -1960,6 +1974,8 @@ def main() -> None:
         sys.exit("--bench times RL updates: not with --sft")
     if not 0 < args.kl_check_fraction <= 1:
         sys.exit("--kl-check-fraction must be in (0, 1]")
+    if args.start_version < 0 or (args.start_version and not args.init):
+        sys.exit("--start-version is a version number of the --init adapter: not negative, and with --init")
     baseline = json.loads(Path(args.baseline).read_text()) if args.baseline else None
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}" if torch.cuda.is_available() else "cpu")
@@ -1974,7 +1990,7 @@ def main() -> None:
         anchor_beta0=args.anchor_beta0, anchor_decay=args.anchor_decay, aux_alpha0=args.aux_alpha0,
         aux_decay=args.aux_decay, warmup_updates=args.warmup_updates, decisions_per_update=args.decisions_per_update,
         full_prox=args.full_prox, kl_check_fraction=args.kl_check_fraction, probe_rows=args.probe_rows,
-        whole_groups=args.whole_groups, bench=bool(args.bench),
+        whole_groups=args.whole_groups, bench=bool(args.bench), start_version=args.start_version,
     )  # fmt: skip
     log.info("init: %s; anchor: %s", cfg.init or "none", cfg.anchor or "base model")
     model = build_model(cfg, device)

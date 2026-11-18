@@ -41,6 +41,11 @@ is played) and `brief_target` (and until the games hold the briefs for that many
 after the update in progress, so the last adapter is published by then), and a panel whose `at_hours` is at or after
 `train_hours` waits for that and then plays on the final adapter: end-of-run panels of a trained policy.
 
+`init_version = N` is for a run that starts from an adapter (the learner's `--init`, with `--start-version N`): the
+adapter is at ROOT/adapters/vN before the run starts, the orchestrator stops the run if it is not, and deals no
+training game and starts no panel that follows the current version until every vLLM serves vN, so version 0 (the base
+model) never plays for a run that starts from a trained policy.
+
 `python -m agentenv_zeroad.train.config CONFIG` checks a config (`check_run`: the panel spec files load, and one
 training game can be made from the mix) and prints `TRAIN_RUN_ID=`, `TRAIN_ROOT=`, `TRAIN_DURATION_HOURS=`,
 `TRAIN_BOX_USD_PER_HOUR=` and `TRAIN_FRONTIER=` (1 when a panel has a seat on a frontier model) for the box's shell
@@ -361,10 +366,13 @@ class RunConfig:
     train_hours: float | None = (
         None  # training ends here: no training game is dealt, the learner is stopped (None: never)
     )
+    init_version: int = 0  # the adapter the run starts from, already at ROOT/adapters/v{N}: no game before it is served
 
     def __post_init__(self) -> None:
         if self.train_hours is not None and not 0 < self.train_hours <= self.duration_hours:
             raise ValueError("train_hours is above 0 and at most duration_hours")
+        if self.init_version < 0:
+            raise ValueError("init_version is not negative")
         if not self.run_id or "/" in self.run_id:
             raise ValueError(f"run_id must be a plain name, not {self.run_id!r}")
         if self.budget_usd <= 0 or self.box_usd_per_hour <= 0 or self.duration_hours <= 0:

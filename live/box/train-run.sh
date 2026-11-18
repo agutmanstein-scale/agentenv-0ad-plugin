@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# train-run.sh CONFIG [--init DIR] [--anchor DIR|base] [--baseline FILE] [--drift trip|alarm] [--grad-norm trip|alarm] [--anchor-beta0 X] [--warmup-updates N] [--decisions-per-update N] [--full-prox] [--kl-check-fraction F] [--probe-rows N] [--whole-groups] [--play-only] | [--sft EPOCHS [--lr LR]] | [--probe ROWS] | [--stats-only ROWS] | [--bench DIR [--bench-updates U]]: the zeroad-train unit's process (train.sh starts it).
+# train-run.sh CONFIG [--init DIR [--start-version N]] [--anchor DIR|base] [--baseline FILE] [--drift trip|alarm] [--grad-norm trip|alarm] [--anchor-beta0 X] [--warmup-updates N] [--decisions-per-update N] [--full-prox] [--kl-check-fraction F] [--probe-rows N] [--whole-groups] [--play-only] | [--sft EPOCHS [--lr LR]] | [--probe ROWS] | [--stats-only ROWS] | [--bench DIR [--bench-updates U]]: the zeroad-train unit's process (train.sh starts it).
 # Starts the learner in the trainer image on the training GPUs (torchrun, one process per GPU, its --root the run's
 # folder, which the config names and which must be under $STATE/train: that folder is also what the vLLM containers
 # mount at /train to hot-load adapters from), then runs the orchestrator with vLLM's key from its root-only file, in
@@ -12,7 +12,7 @@
 # baseline) and waits for baseline.json; --bench DIR starts it on the decision rows in DIR to time U updates (default 5) with the
 # learner flags given and waits for bench.json (`learner.py --bench`, no publish, no checkpoint). The learner flags are passed through to
 # learner.py (see its docstring): --anchor-beta0, --warmup-updates, --decisions-per-update, --kl-check-fraction, --probe-rows, --full-prox,
-# --whole-groups. The container is stopped when any of the four is done or this script is. When a panel has a frontier seat the orchestrator runs under with-model.sh, which
+# --whole-groups, --start-version (the --init adapter's version, already published in the root for the games to play). The container is stopped when any of the four is done or this script is. When a panel has a frontier seat the orchestrator runs under with-model.sh, which
 # reads the LiteLLM key from SSM into its environment only (never printed, written or put on a command line).
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
@@ -34,6 +34,7 @@ while [ $# -gt 0 ]; do
     --bench-updates) BENCH_UPDATES=${2:-}; [[ $BENCH_UPDATES =~ ^[1-9][0-9]*$ ]] || die "--bench-updates needs a whole number"; shift 2 ;;
     --anchor-beta0) [[ ${2:-} =~ ^[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?$ ]] || die "--anchor-beta0 needs a number"; LEARNER+=("$1" "$2"); shift 2 ;;
     --kl-check-fraction) [[ ${2:-} =~ ^(1(\.0+)?|0?\.[0-9]*[1-9][0-9]*)$ ]] || die "--kl-check-fraction needs a number in (0, 1]"; LEARNER+=("$1" "$2"); shift 2 ;;
+    --start-version) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "--start-version needs a whole number of at least 1"; LEARNER+=("$1" "$2"); shift 2 ;;
     --warmup-updates|--decisions-per-update) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "$1 needs a whole number"; LEARNER+=("$1" "$2"); shift 2 ;;
     --probe-rows) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--probe-rows needs a whole number"; LEARNER+=("$1" "$2"); shift 2 ;;
     --full-prox|--whole-groups) LEARNER+=("$1"); shift ;;

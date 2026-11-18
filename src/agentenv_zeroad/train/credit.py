@@ -6,7 +6,9 @@ expected to be:
 
   R   the learner seat's reward for the game. Conquest decides first: a win is +1, a loss -1. At a cap (time_cap or
       safety_cap) R = 0.5 sign(m) + 0.5 tanh(m / s), m the final net-worth margin and s the margin's within-opponent
-      SD, so any cap win beats any cap loss and both sit inside a conquest win and loss. A game whose net worth is
+      SD, so any cap win beats any cap loss and both sit inside a conquest win and loss. `cap_weight` w (default 1, at
+      most 1) scales the cap term, R = w (0.5 sign(m) + 0.5 tanh(m / s)), so with w under 1 a conquest outweighs any
+      lead at the cap. A game whose net worth is
       missing for either seat (never read) or stale (carried over more than `results.NET_WORTH_STALE_MAX` reads at the
       end) falls back to the official score margin and is counted as such (`margin_fallback_official_score`, and
       `net_worth_stale` when it was stale). A game that did not finish, or ended any
@@ -116,6 +118,7 @@ class Critic(Protocol):
 @dataclass(frozen=True)
 class CreditConfig:
     margin_scale: float = 2000.0  # s: the net-worth margin's within-opponent SD
+    cap_weight: float = 1.0  # w: scales the reward of a game that reached a cap; conquest stays +1 / -1 / 0
     baseline_games: int = 64
     decisions: tuple[int, int] = (8, 12)  # trained per seat-game, drawn uniformly per game
     bin_s: float = 300.0
@@ -140,6 +143,8 @@ class CreditConfig:
     def __post_init__(self) -> None:
         if self.baseline not in BASELINES:
             raise ValueError(f"credit baseline must be one of {', '.join(BASELINES)}, not {self.baseline!r}")
+        if not 0 < self.cap_weight <= 1:
+            raise ValueError(f"credit cap_weight must be above 0 and at most 1, not {self.cap_weight!r}")
         if self.group_size < 1 or self.group_timeout_games < 1:
             raise ValueError("credit group_size and group_timeout_games are at least 1")
 
@@ -302,7 +307,7 @@ class Credit:
             if rs.net_worth_was_stale(results, slot, opp):
                 self.counts["net_worth_stale"] += 1
         self._check_winner(results, slot, margin, source)
-        return 0.5 * _sign(margin) + 0.5 * math.tanh(margin / self.cfg.margin_scale), source
+        return self.cfg.cap_weight * (0.5 * _sign(margin) + 0.5 * math.tanh(margin / self.cfg.margin_scale)), source
 
     def _check_winner(self, results: Mapping[str, Any], slot: str, margin: float, source: str) -> None:
         outcome = results["seats"][slot].get("outcome")
@@ -597,10 +602,10 @@ class Credit:
         self.held = {k: {"born": int(e["born"]), "games": list(e["games"])} for k, e in state["held"].items()}
 
 
-def game_reward(results: Mapping[str, Any], slot: str, margin_scale: float) -> float:
-    """R of a seat in a finished game by the cap rule at `margin_scale`, outside any run's state (the gates' read of a
-    run's games). A CreditError when the game's results contradict themselves."""
-    return Credit(CreditConfig(margin_scale=margin_scale))._reward(results, slot)[0]
+def game_reward(results: Mapping[str, Any], slot: str, margin_scale: float, cap_weight: float = 1.0) -> float:
+    """R of a seat in a finished game by the cap rule at `margin_scale` and `cap_weight`, outside any run's state (the
+    gates' read of a run's games). A CreditError when the game's results contradict themselves."""
+    return Credit(CreditConfig(margin_scale=margin_scale, cap_weight=cap_weight))._reward(results, slot)[0]
 
 
 def gae_advantages(values: Sequence[float], terminal: float, lam: float) -> list[float]:

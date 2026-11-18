@@ -281,3 +281,23 @@ def test_bench_takes_the_probe_from_the_first_rows_and_refuses_a_directory_under
     small = make_learner(tmp_path / "small", bench=True, decisions_per_update=40)
     with pytest.raises(SystemExit, match="at least one batch of 40"):
         L.bench(small, bench_dir(tmp_path / "small", 6), 1)
+
+
+# --- an init adapter with a version of its own ---
+
+
+def test_a_learner_started_from_an_init_adapter_counts_on_from_its_version_and_never_publishes_over_it(tmp_path):
+    learner = make_learner(tmp_path, start_version=3)
+    assert learner.version == 3
+    published = learner.cfg.adapters
+    published.mkdir(parents=True, exist_ok=True)
+    (published / "v3").mkdir()
+    (published / "v3" / "marker").write_text("the init adapter")
+    learner.update(rows(8))
+    assert learner.version == 4 and (published / "v4" / "manifest.json").exists()
+    assert (published / "v3" / "marker").read_text() == "the init adapter"
+    assert json.loads((published / "v4" / "manifest.json").read_text())["version"] == 4
+
+
+def test_the_default_start_version_is_zero(tmp_path):
+    assert make_learner(tmp_path).version == 0

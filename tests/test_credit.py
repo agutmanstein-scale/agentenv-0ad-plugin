@@ -39,6 +39,32 @@ def test_at_the_cap_reward_is_half_the_sign_plus_half_tanh_of_the_margin_over_th
     assert reward(c, net_worth=(4000.0, 4000.0), outcomes=("drawn", "drawn")) == 0.0
 
 
+def test_cap_weight_scales_a_cap_reward_and_leaves_conquest_alone():
+    full, half = Credit(CreditConfig(margin_scale=2000)), Credit(CreditConfig(margin_scale=2000, cap_weight=0.5))
+    assert reward(half, net_worth=(23000.0, 3000.0)) == pytest.approx(0.5 * reward(full, net_worth=(23000.0, 3000.0)))
+    assert reward(half, net_worth=(3000.0, 23000.0), outcomes=("lost", "won")) < -0.4
+    assert reward(half, ended_by="conquest", outcomes=("won", "lost")) == 1.0
+    assert reward(half, ended_by="conquest", outcomes=("lost", "won")) == -1.0
+
+
+def test_the_default_cap_weight_leaves_the_cap_reward_unchanged():
+    assert CreditConfig().cap_weight == 1.0
+    r = reward(Credit(CreditConfig(margin_scale=2000)), net_worth=(5000.0, 3000.0))
+    assert r == 0.5 + 0.5 * math.tanh(1.0)
+
+
+def test_a_conquest_win_beats_any_cap_win_when_the_cap_weight_is_under_one():
+    c = Credit(CreditConfig(cap_weight=0.5))
+    assert reward(c, net_worth=(1e9, 0.0)) < 0.5 + 1e-9
+    assert reward(c, net_worth=(0.0, 1e9), outcomes=("lost", "won")) > -0.5 - 1e-9
+
+
+@pytest.mark.parametrize("weight", [0.0, -0.1, 1.5])
+def test_cap_weight_must_be_above_zero_and_at_most_one(weight):
+    with pytest.raises(ValueError, match="cap_weight"):
+        CreditConfig(cap_weight=weight)
+
+
 def test_conquest_win_beats_any_cap_win_beats_any_cap_loss_beats_conquest_loss():
     c = Credit()
     tiny_win = reward(c, net_worth=(3001.0, 3000.0))

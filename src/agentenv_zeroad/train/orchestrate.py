@@ -319,6 +319,7 @@ class Orchestrator:
         await self._warm_start_critic()
         self.monitor.start()
         try:
+            self.require_init_adapter()
             await self._step("serving", self.refresh_serving)
             while self.stop_reason is None:
                 await self.tick()
@@ -335,6 +336,18 @@ class Orchestrator:
             await self.monitor.stop()
             await self.finish(self.stop_reason or "crash")
         return self.stop_reason or "crash"
+
+    def require_init_adapter(self) -> None:
+        """A run that starts from an adapter (`init_version`) needs it published before it starts."""
+        version = self.cfg.init_version
+        if version and version not in self.adapters.on_disk():
+            self.request_stop(f"the init adapter v{version} is not in {self.adapters.dir}")
+
+    @property
+    def init_served(self) -> bool:
+        """Whether the adapter the run starts from is current: before that a game that follows the current version
+        would be played by the base model."""
+        return self.current >= self.cfg.init_version
 
     async def tick(self) -> None:
         """One pass of everything that is due; the tests drive this directly. Each step is guarded: one that raises is
@@ -649,7 +662,7 @@ class Orchestrator:
     def fill(self) -> None:
         """Start games until `concurrency` are in flight, panel games first, then replays, then new training games. A
         box short of disk starts none."""
-        training = not self.cfg.panels_only and not self.training_closed()
+        training = not self.cfg.panels_only and not self.training_closed() and self.init_served
         while self.stop_reason is None and not self.disk_paused and len(self.in_flight) < self.cfg.concurrency:
             if not (
                 self._start_pending(self.panel_queue)
@@ -1063,6 +1076,8 @@ class Orchestrator:
         hours = self.clock.hours(self.now())
         for panel in self.cfg.panels:
             if panel.name in self.panels or hours < panel.at_hours:
+                continue
+            if panel.version is None and not self.init_served:
                 continue
             after_training = self.cfg.train_hours is not None and panel.at_hours >= self.cfg.train_hours
             if after_training and not self.final_adapter_ready():

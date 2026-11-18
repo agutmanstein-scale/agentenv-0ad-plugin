@@ -1840,3 +1840,45 @@ def test_end_panels_that_differ_only_by_version_play_identical_starts_game_by_ga
         assert replace(a, game_id="x") == replace(b, game_id="x")
         assert a.time_cap_minutes == 12 and a.seed in range(900000, 900500)
     assert len({s.seed for s in v0}) > 200
+
+
+# ---- a run that starts from an adapter ------------------------------------------------------------------------
+async def test_a_run_started_from_an_adapter_deals_no_game_until_the_init_adapter_is_served(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=2, init_version=1)
+    publish(t.root, 1)
+    for host in HOSTS:
+        t.fake.hosts[host]["refuse_loads"] = True
+    await t.orch.refresh_serving()
+    assert t.orch.current == 0
+    t.orch.fill()
+    await asyncio.sleep(0.02)
+    assert t.play.specs == []  # v0 is the base model: it must not play in this run
+    for host in HOSTS:
+        t.fake.hosts[host]["refuse_loads"] = False
+    await t.orch.refresh_serving()
+    t.orch.fill()
+    await until(lambda: len(t.play.specs) == 2)
+    assert {policy_version(s) for s in t.play.specs} == {1}
+
+
+async def test_an_unpinned_panel_waits_for_the_init_adapter_and_a_pinned_one_does_not(tmp_path, monkeypatch):
+    pinned = {"name": "base", "kind": "heldout", "at_hours": 0, "version": 0, "games": 2, "opponents": {"petra-2": 1.0}}
+    free = {"name": "follow", "kind": "heldout", "at_hours": 0, "games": 2, "opponents": {"petra-2": 1.0}}
+    t = make(tmp_path, monkeypatch, panels_only=True, init_version=1, panels=[pinned, free])
+    publish(t.root, 1)
+    t.orch.start_due_panels()
+    assert set(t.orch.panels) == {"base"}
+    await t.orch.refresh_serving()
+    t.orch.start_due_panels()
+    assert t.orch.panels["follow"].version == 1
+
+
+async def test_a_run_whose_init_adapter_is_not_published_stops_before_playing(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=1, init_version=1)
+    assert await t.orch.run() == f"the init adapter v1 is not in {t.orch.adapters.dir}"
+    assert t.play.specs == []
+
+
+def test_init_version_is_not_negative(tmp_path):
+    with pytest.raises(ValueError, match="init_version"):
+        config(tmp_path, init_version=-1)
