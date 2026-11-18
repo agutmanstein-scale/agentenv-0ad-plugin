@@ -1,0 +1,71 @@
+# E3: an RL run on the outcome the games already record (conquest +-1, at the 12-minute cap 0.5 sign(m) + 0.5 tanh(m / 3400),
+# m the final net-worth margin), against Petra-1 to -3, judged by a paired end-of-run panel (docs/s2-e2-results.md says why).
+# Credit's baseline is the mean of the start's other games (each start is dealt 4 times in a row), and the learner takes
+# whole groups. It trains for 3 h and then stops: no training game is dealt and no adapter is published once the end panels
+# start. `end-v0` and `end-final` (the adapter current at that moment) play the same 240 starts against Petra-2, game by
+# game, so their margins pair. Its adapters stay in this root.
+run_id = "s2-e3"
+root = "/var/lib/zeroad-live/train/s2/e3"
+duration_hours = 4.8        # train_hours + the two end panels (480 games, about 1.2 h) + drains and uploads, under cap_hours 5
+train_hours = 3.0
+budget_usd = 700            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false            # the sequence powers the box off itself, once, after the final upload
+stop_when_done = true       # the run ends, reason "complete", when both end panels are played
+engines = 24
+concurrency = 24
+seed = 3                    # a stream of its own: not E2's (1) nor the E2 baseline's (2)
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+petra-1 = 0.1
+petra-2 = 0.7
+petra-3 = 0.2
+
+[games]
+time_cap_minutes = 12
+no_cap_share = 0.0
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+seed_group = 4               # each start (opponent, civs, slot, map, seeds) is dealt 4 times in a row: credit's baseline group
+
+# None of these appears in a training game; the panels draw from them. No held-out map yet: one that passes the bot
+# smoke test goes in `maps`; until then the panels take the training map with held-out seeds and civ pairs.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[credit]
+positive_control = false     # the reward is the game's outcome
+margin_scale = 3400          # s in tanh(m / s): the 12-minute margins' within-opponent SD
+baseline = "start_loo"       # A = R - the mean R of the start's other games; every decision of a game shares it
+group_size = 4               # = games.seed_group
+decisions_per_update = 512   # the learner's batch (--decisions-per-update in sequence.toml's [e3] must match)
+
+# The two end panels play identical starts: the same positions, civs, sides and seeds, and only the policy differs.
+# They start at train_hours, after the learner has stopped, so `end-final` plays the last adapter it published.
+[[panels]]
+name = "end-v0"
+kind = "heldout"
+at_hours = 3.0
+version = 0
+games = 240
+positions = "held_out"
+time_cap_minutes = 12
+opponents = { "petra-2" = 1.0 }
+
+[[panels]]
+name = "end-final"
+kind = "heldout"
+at_hours = 3.0
+games = 240
+positions = "held_out"
+time_cap_minutes = 12
+opponents = { "petra-2" = 1.0 }
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-e3"

@@ -19,6 +19,11 @@ if the gates of the one before passed:
               ROOT/s2/baseline.json, which E2 and Run 1 are given as `--baseline`
   e2          the positive control: an RL run on the army-at-minute-10 reward against a frozen-v0 arm played beside it
               (`gates.positive_control_gates`); its adapters stay in its own root and are never used again
+  e3_check    E3's check, play-only v0 (a petra-3 cap panel and two panels of v0 on identical starts, whose paired test
+              must not reject: `gates.null_pair_gate`), then the learner's bench twice on the recorded rows, with E2's
+              flags and with E3's, for seconds per row
+  e3          the RL run on the game outcome with same-start leave-one-out credit, trained for `train_hours`, then two
+              end panels (v0 and the final adapter, identical starts) judged by `gates.paired_margin_gate`
   labels      `distill.py`: the teacher relabels the briefs under a spend cap
   sft         the learner in --sft mode, a checkpoint per epoch
   sft_panels  each epoch's adapter plays the first panel_games of the held-out panel; `stats.select_sft_checkpoint`
@@ -45,12 +50,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import logging
 import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -69,13 +76,22 @@ from agentenv_zeroad.train.config import RunConfig, check_run, load_config
 log = logging.getLogger("s2")
 
 STOPPED_BY_HAND = "stopped by hand (SIGTERM)"
-STEPS = ("e1", "baselines", "calibration", "tripwire", "e2", "labels", "sft", "sft_panels", "init", "run1")
+STEPS = (
+    "e1", "baselines", "calibration", "tripwire", "e2", "e3_check", "e3", "labels", "sft", "sft_panels", "init", "run1"
+)  # fmt: skip
 GRACE_S = 2400.0  # an orchestrator told to stop uploads for up to 3 x 10 minutes (sync.SYNC_TIMEOUT_S)
 SFT_PREFIX = "sft-epoch"
 SFT_REST = "sft-rest"  # the chosen epoch's second panel: the held-out configs the epoch panels did not play
 BASELINE_FILE = "baseline.json"  # ROOT/s2/baseline.json, the tripwire baseline; its records are in the baselines root
 E2_BASELINE_FILE = "baseline-e2.json"  # ROOT/s2/baseline-e2.json, E2's own when [e2] baseline_config is set
 DECISIONS_PER_UPDATE = 256  # the learner's batch: one health record per this many decisions
+E3_END_PANELS = ("end-v0", "end-final")  # e3.toml's end-of-run panels: v0, then the adapter current when they start
+E3_CHECK_PANELS = (
+    "petra3-cap",
+    "pair-a",
+    "pair-b",
+)  # e3-check.toml's panels: the cap rate, and v0 twice on identical starts
+PANEL_FINISHED_SHARE = 0.9  # of each E3 panel's games that must have finished
 
 # Every table of sequence.toml with its keys and their defaults; a key not listed is an error.
 SCHEMA: dict[str, dict[str, Any]] = {
@@ -107,6 +123,30 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "lr": 0.0,  # the learner's learning rate for E2; 0 keeps the learner's default
         "drift": "trip",  # the learner's --drift for E2: trip, or alarm to report the banded tripwires, no rollback
         "grad_norm": "trip",  # the learner's --grad-norm for E2: trip, or alarm to report a gradient-norm spike
+    },
+    "e3_check": {
+        "config": "e3-check.toml",
+        "cap_hours": 1.5,
+        "expected_hours": 1.0,
+        "bench_rows": "/var/lib/zeroad-live/train/s2/e2d/inbox/consumed",  # recorded rows the learner bench trains on
+        "bench_updates": 3,
+    },
+    "e3": {
+        "config": "e3.toml",
+        "cap_hours": 5.0,
+        "expected_hours": 4.4,
+        "lr": 3e-5,
+        "drift": "alarm",
+        "grad_norm": "alarm",
+        "baseline_config": "e2-baseline.toml",  # as E2's: a play-only v0 run whose health records band the tripwires
+        "min_updates": 5,
+        "max_p": 0.05,  # the paired margin test's one-sided Wilcoxon p
+        "anchor_beta0": 0.0,
+        "warmup_updates": 2,
+        "decisions_per_update": 512,  # the learner's batch; e3.toml's [credit] decisions_per_update must match
+        "kl_check_fraction": 0.25,
+        "probe_rows": 64,
+        "whole_groups": True,
     },
     "baselines": {
         "config": "baselines.toml",
@@ -253,9 +293,10 @@ def load_settings(path: Path) -> Settings:
         tables[step] = {**defaults, **given}
         if float(tables[step]["cap_hours"]) <= 0:
             raise ValueError(f"[{step}] cap_hours must be positive")
-    for switch in ("drift", "grad_norm"):
-        if tables["e2"][switch] not in ("trip", "alarm"):
-            raise ValueError(f"[e2] {switch} must be 'trip' or 'alarm', not {tables['e2'][switch]!r}")
+    for table in ("e2", "e3"):
+        for switch in ("drift", "grad_norm"):
+            if tables[table][switch] not in ("trip", "alarm"):
+                raise ValueError(f"[{table}] {switch} must be 'trip' or 'alarm', not {tables[table][switch]!r}")
     return Settings(Path(raw.get("root", DEFAULT_ROOT)), s3.get("uri"), tables, accept, stop_after, rerun)
 
 
@@ -311,7 +352,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     settings = load_settings(path / "sequence.toml")
     configs = ConfigDir(path, settings)
     rates, frontier = set(), False
-    for step in ("e1", "e2", "baselines", "sft", "sft_panels", "run1"):
+    for step in ("e1", "e2", "e3_check", "e3", "baselines", "sft", "sft_panels", "run1"):
         cfg = configs.load(step)
         keys = check_run(cfg)
         frontier = frontier or bool(keys)
@@ -332,25 +373,28 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
             )
         if cfg.s3_uri is None:
             raise ValueError(f"{step}: s3.uri is required: a step nobody uploads is lost with the box")
-    if settings["e2"]["baseline_config"]:
-        cfg = load_config(path / str(settings["e2"]["baseline_config"]))
+    for table in ("e2", "e3"):
+        if not settings[table]["baseline_config"]:
+            continue
+        cfg = load_config(path / str(settings[table]["baseline_config"]))
         check_run(cfg)
         rates.add(cfg.box_usd_per_hour)
         if cfg.shutdown or cfg.s3_uri is None or cfg.panels:
             raise ValueError(
-                "e2 baseline_config: shutdown must be false, s3.uri set and no panels (its games are v0's)"
+                f"{table} baseline_config: shutdown must be false, s3.uri set and no panels (its games are v0's)"
             )
         try:
             cfg.root.relative_to(settings.root)
         except ValueError as e:
-            raise ValueError(f"e2 baseline_config: root {cfg.root} is not under the sequence root") from e
-        if cfg.root == configs.load("e2").root:
-            raise ValueError("e2 baseline_config: its root must not be E2's own")
+            raise ValueError(f"{table} baseline_config: root {cfg.root} is not under the sequence root") from e
+        if cfg.root == configs.load(table).root:
+            raise ValueError(f"{table} baseline_config: its root must not be {table.upper()}'s own")
     if len(rates) != 1:
         raise ValueError(f"the step configs name different box rates: {sorted(rates)}")
     _check_panel_names(configs, settings)
     if configs.load("e2").credit.get("positive_control") is not True:
         raise ValueError("e2: [credit] positive_control must be true")
+    _check_e3(configs, settings)
     sp = settings["sft_panels"]
     if not 0 < int(sp["panel_games"]) < int(sp["heldout_games"]):
         raise ValueError(
@@ -371,6 +415,42 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
         "rate": rates.pop(),
         "frontier": frontier,
     }
+
+
+def _same_starts(cfg: RunConfig, first: str, second: str) -> bool:
+    """Whether two panels of a config play identical starts game by game: their specs differ at most by the game id."""
+    from agentenv_zeroad.train.calibration import panel_specs
+
+    a, b = (panel_specs(cfg, next(p for p in cfg.panels if p.name == n)) for n in (first, second))
+    return len(a) == len(b) and all(
+        dataclasses.replace(x, game_id="x") == dataclasses.replace(y, game_id="x") for x, y in zip(a, b, strict=True)
+    )
+
+
+def _check_e3(configs: ConfigDir, settings: Settings) -> None:
+    """What E3 and its check rely on: their panels exist and pair, E3 trains on the outcome with same-start credit in
+    batches the learner's size, and the check plays no training game."""
+    e3, check = configs.load("e3"), configs.load("e3_check")
+    for cfg, names in ((e3, E3_END_PANELS), (check, E3_CHECK_PANELS)):
+        missing = set(names) - {p.name for p in cfg.panels}
+        if missing:
+            raise ValueError(f"{cfg.run_id}: no panel named {', '.join(sorted(missing))}")
+    for cfg, pair in ((e3, E3_END_PANELS), (check, ("pair-a", "pair-b"))):
+        if not _same_starts(cfg, *pair):
+            raise ValueError(f"{cfg.run_id}: panels {pair[0]} and {pair[1]} do not play identical starts")
+    if e3.train_hours is None or any(p.at_hours < e3.train_hours for p in e3.panels if p.name in E3_END_PANELS):
+        raise ValueError("e3: train_hours must be set and no end panel may start before it")
+    if not check.panels_only or not check.stop_when_done:
+        raise ValueError("e3_check: the check plays panels only and ends when they are done")
+    credit = e3.credit
+    if credit.get("positive_control") or credit.get("baseline") != "start_loo":
+        raise ValueError("e3: [credit] must train on the outcome (no positive_control) with baseline = start_loo")
+    if int(credit.get("group_size", 1)) != e3.games.seed_group:
+        raise ValueError("e3: [credit] group_size must be games.seed_group")
+    if int(credit.get("decisions_per_update", 256)) != int(settings["e3"]["decisions_per_update"]):
+        raise ValueError("e3: [credit] decisions_per_update must match [e3] decisions_per_update, the learner's batch")
+    if len({e3.root, check.root}) != 2:
+        raise ValueError("e3 and e3_check need roots of their own")
 
 
 def _check_panel_names(configs: ConfigDir, settings: Settings) -> None:
@@ -693,16 +773,21 @@ def armies(folder: Path, minute: float, *, trained_only: bool, last: int | None 
     return values[-last:] if last else values
 
 
+def learner_flags(s: Mapping[str, Any]) -> list[str]:
+    """The learning rate and the drift and grad-norm switches a step's table sets (a default is left to the learner)."""
+    flags: list[str] = []
+    if float(s["lr"]) > 0:
+        flags += ["--lr", f"{float(s['lr']):g}"]
+    if s["drift"] != "trip":
+        flags += ["--drift", str(s["drift"])]
+    if s["grad_norm"] != "trip":
+        flags += ["--grad-norm", str(s["grad_norm"])]
+    return flags
+
+
 def step_e2(ctx: Ctx) -> Outcome:
     s, cfg = ctx.settings["e2"], ctx.cfg("e2")
-    flags = e2_baseline_flags(ctx) if s["baseline_config"] else baseline_flags(ctx)
-    if float(s["lr"]) > 0:
-        flags = [*flags, "--lr", f"{float(s['lr']):g}"]
-    if s["drift"] != "trip":
-        flags = [*flags, "--drift", str(s["drift"])]
-    if s["grad_norm"] != "trip":
-        flags = [*flags, "--grad-norm", str(s["grad_norm"])]
-    ctx.train_run(ctx.configs.file("e2"), flags, label="control run")
+    ctx.train_run(ctx.configs.file("e2"), e2_flags(ctx), label="control run")
     minute = float(s["minute"])
     policy = armies(cfg.root / "games", minute, trained_only=True, last=int(s["window_games"]))
     control = armies(cfg.root / "panels" / str(s["control_panel"]), minute, trained_only=False)
@@ -725,6 +810,116 @@ def step_e2(ctx: Ctx) -> Outcome:
         detail | {"updates": updates, "trips": trips},
     )
     return out
+
+
+# ---- E3 ------------------------------------------------------------------------------------------
+def panel_games(folder: Path) -> list[G.PanelGame]:
+    """The finished games of a panel folder, each with its start and the policy's final margin."""
+    games = (G.panel_game(read_json(p) or {}) for p in sorted(folder.glob("*/results.json")))
+    return [g for g in games if g is not None]
+
+
+def training_games(folder: Path, margin_scale: float) -> list[G.TrainingGame]:
+    """The finished training games of a run's games folder with their R at `margin_scale`."""
+    games = (G.training_game(read_json(p) or {}, margin_scale) for p in sorted(folder.glob("*/results.json")))
+    return [g for g in games if g is not None]
+
+
+def e3_learner_flags(s: Mapping[str, Any]) -> list[str]:
+    """E3's learner flags beyond E2's: no pull to the anchor, a short warm-up, whole same-start groups per update, the
+    KL stop checked on a fraction of the batch and a few probe rows."""
+    flags = [
+        "--anchor-beta0", f"{float(s['anchor_beta0']):g}",
+        "--warmup-updates", str(int(s["warmup_updates"])),
+        "--decisions-per-update", str(int(s["decisions_per_update"])),
+        "--kl-check-fraction", f"{float(s['kl_check_fraction']):g}",
+        "--probe-rows", str(int(s["probe_rows"])),
+    ]  # fmt: skip
+    return [*flags, "--whole-groups"] if s["whole_groups"] else flags
+
+
+def e3_flags(ctx: Ctx) -> list[str]:
+    """E3's learner flags, also the bench's: E2's bands, lr, drift and grad norm, then E3's own."""
+    s = ctx.settings["e3"]
+    base = e2_baseline_flags(ctx, "e3") if s["baseline_config"] else baseline_flags(ctx)
+    return [*base, *learner_flags(s), *e3_learner_flags(s)]
+
+
+def render_bench_config(ctx: Ctx, kind: str) -> Path:
+    """The check's config with a root, run id and prefix of its own, so each bench's bench.json is its own."""
+    text = ctx.configs.file("e3_check").read_text()
+    for key in ("root", "run_id"):
+        text, n = re.subn(rf'^({key} = ")(.*)(")$', rf"\1\2-bench-{kind}\3", text, count=1, flags=re.M)
+        if n != 1:
+            raise StepFailed(f"the e3_check config has no {key} line to give the {kind} bench its own")
+    text = re.sub(r'^(uri = ")(.*)(")$', rf"\1\2-bench-{kind}\3", text, count=1, flags=re.M)
+    out = ctx.s2 / "generated" / f"e3-check-bench-{kind}.toml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    return out
+
+
+def run_bench(ctx: Ctx, kind: str, flags: Sequence[str]) -> dict[str, Any]:
+    """One learner bench on the recorded rows: `train-run.sh --bench ROWS` in a root of its own; its bench.json."""
+    s = ctx.settings["e3_check"]
+    config = render_bench_config(ctx, kind)
+    rc = ctx.train_run(
+        config,
+        ["--bench", str(s["bench_rows"]), "--bench-updates", str(int(s["bench_updates"])), *flags],
+        f"{kind} bench",
+    )
+    result = read_json(load_config(config).root / "bench.json") or {}
+    return {"exit": rc, "seconds_per_row": result.get("seconds_per_row"), "bench": result}
+
+
+def step_e3_check(ctx: Ctx) -> Outcome:
+    """Is the end test sound and the learner fast enough: v0 played twice on identical starts must not differ under the
+    paired test, every panel must finish, and the learner's seconds per row under E3's flags and E2's (reported)."""
+    cfg = ctx.cfg("e3_check")
+    ctx.train_run(ctx.configs.file("e3_check"), ["--play-only"], label="play-only run")
+    panels = {name: panel_games(cfg.root / "panels" / name) for name in E3_CHECK_PANELS}
+    null_gate, null_detail = G.null_pair_gate(panels["pair-a"], panels["pair-b"])
+    gates = [null_gate, *panel_gates(cfg.root, E3_CHECK_PANELS, PANEL_FINISHED_SHARE)]
+    cap = panels["petra3-cap"]
+    margins = [g.margin for g in cap]
+    detail: dict[str, Any] = {
+        "null": null_detail,
+        "petra3_cap": {
+            "games": len(cap),
+            "cap_win_share": sum(m > 0 for m in margins) / len(margins) if margins else None,
+            "median_margin": statistics.median(margins) if margins else None,
+        },
+    }
+    e2_bench = run_bench(ctx, "e2", [*e2_flags(ctx), "--full-prox"])
+    e3_bench = run_bench(ctx, "e3", e3_flags(ctx))
+    a, b = e2_bench["seconds_per_row"], e3_bench["seconds_per_row"]
+    detail["bench"] = {"e2": e2_bench, "e3": e3_bench, "ratio_e3_to_e2": b / a if a and b else None}
+    return Outcome(gates, detail)
+
+
+def e2_flags(ctx: Ctx) -> list[str]:
+    """The learner flags E2 ran with, for the bench's old-flags arm."""
+    s = ctx.settings["e2"]
+    return [*(e2_baseline_flags(ctx) if s["baseline_config"] else baseline_flags(ctx)), *learner_flags(s)]
+
+
+def step_e3(ctx: Ctx) -> Outcome:
+    s, cfg = ctx.settings["e3"], ctx.cfg("e3")
+    ctx.train_run(ctx.configs.file("e3"), e3_flags(ctx), label="rl run")
+    final, v0 = (panel_games(cfg.root / "panels" / name) for name in reversed(E3_END_PANELS))
+    paired, paired_detail = G.paired_margin_gate(final, v0, max_p=float(s["max_p"]))
+    scale = float(cfg.credit.get("margin_scale", 2000.0))
+    slope, slope_detail = G.in_run_slope_gate(training_games(cfg.root / "games", scale))
+    updates, trips = updates_in(cfg.root / "health.jsonl"), trips_in(cfg.root / "health.jsonl")
+    gates = [
+        G.Gate("learner updates", float(updates), ">=", float(s["min_updates"])),
+        paired,
+        slope,
+        G.Gate("tripwire trips", float(trips), "<=", 0.0),
+        ended_normally(cfg.root, ("complete",)),
+    ]
+    detail = {"paired": paired_detail, "slope": slope_detail, "updates": updates, "trips": trips}
+    return Outcome(gates, detail | {"cap_win_share": paired_detail["cap_win_share"]})
 
 
 # ---- baselines, calibration and distillation -----------------------------------------------------
@@ -800,7 +995,7 @@ def baseline_records(ctx: Ctx, root: Path | None = None) -> int:
     return 0
 
 
-def e2_baseline_flags(ctx: Ctx) -> list[str]:
+def e2_baseline_flags(ctx: Ctx, table: str = "e2") -> list[str]:
     """`--baseline ROOT/s2/baseline-e2.json`: v0's health records on E2's own kind of games. The tripwire baseline
     comes from the 30-minute baseline games, and on E2's 12-minute games v0 itself falls outside its distinct-completion
     band (6 Nov: both of E2's trips came at its first records, KL to base 0.0000). `baseline_config` is a play-only v0
@@ -809,7 +1004,7 @@ def e2_baseline_flags(ctx: Ctx) -> list[str]:
     from agentenv_zeroad.train import baseline
 
     need = int(ctx.settings["tripwire"]["min_records"])
-    path = ctx.configs.path / str(ctx.settings["e2"]["baseline_config"])
+    path = ctx.configs.path / str(ctx.settings[table]["baseline_config"])
     cfg = load_config(path)
     produced, target = cfg.root / BASELINE_FILE, ctx.s2 / E2_BASELINE_FILE
     if not (produced.is_file() and baseline_records(ctx, cfg.root) >= need):
@@ -1079,6 +1274,8 @@ STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
     "calibration": step_calibration,
     "tripwire": step_tripwire,
     "e2": step_e2,
+    "e3_check": step_e3_check,
+    "e3": step_e3,
     "labels": step_labels,
     "sft": step_sft,
     "sft_panels": step_sft_panels,

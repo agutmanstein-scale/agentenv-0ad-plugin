@@ -395,14 +395,14 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 
 
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tmp_path):
-    S.check_dir(LIVE_S2, 650)  # as shipped, with this run's [sequence] calls
-    numbers = S.check_dir(make_config_dir(tmp_path), 650)  # the whole plan
+    S.check_dir(LIVE_S2, 700)  # as shipped, with this run's [sequence] calls
+    numbers = S.check_dir(make_config_dir(tmp_path), 700)  # the whole plan
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
-    assert 22 <= numbers["expected_hours"] <= 23 and numbers["cap_hours"] > numbers["expected_hours"]
+    assert 28 <= numbers["expected_hours"] <= 29 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
-    assert cost < 650
+    assert cost < 700
 
 
 @pytest.mark.parametrize(
@@ -410,7 +410,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tm
     [("e2.toml", "positive_control = true", "positive_control = false", "positive_control must be true"),
      ("run1.toml", "shutdown = false", "shutdown = true", "shutdown must be false"),
      ("run1.toml", "box_usd_per_hour = 10.49", "box_usd_per_hour = 15.07", "different box rates"),
-     ("e1.toml", "budget_usd = 650", "budget_usd = 700", "above the stage budget"),
+     ("e1.toml", "budget_usd = 700", "budget_usd = 750", "above the stage budget"),
      ("run1.toml", "duration_hours = 10", "duration_hours = 12", "past its cap_hours"),
      ("baselines.toml", 'uri = "s3://BUCKET/zeroad-train/run/s2-baselines"', "", "s3.uri is required"),
      ("sft-panels.toml", 's2/sft"', 's2/other"', "share one root"),
@@ -425,7 +425,7 @@ def test_a_config_directory_that_would_break_the_sequence_is_refused(tmp_path, f
     assert old in path.read_text(), old
     path.write_text(path.read_text().replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 650)
+        S.check_dir(cdir, 700)
 
 
 def test_every_step_is_recorded_with_its_start_and_end_and_the_next_starts_only_if_the_gate_passed(
@@ -513,6 +513,8 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (0.1, 0),
         (0.5, 0),
         (3.8, 0),
+        (1.5, 0),
+        (5.0, 0),
         (1.0, 132.0),
         (2.0, 0),
         (4.0, 0),
@@ -564,7 +566,7 @@ def test_a_failure_accepted_by_hand_stays_on_record_and_the_sequence_goes_on_pas
     assert S.sequence(ctx)[0] == "stopped" and order[-1] == "e2"
     order.clear()
     assert S.sequence(resumed(ctx, accept_failed=("e2",))) == ("complete", None)
-    assert order == ["labels", "sft", "sft_panels", "init", "run1"]  # e2 would fail again; it is not run
+    assert order == ["e3_check", "e3", "labels", "sft", "sft_panels", "init", "run1"]  # e2 would fail again: not run
     entry = json.loads((ctx.s2 / "gates.json").read_text())["steps"]["e2"]
     assert entry["status"] == "accepted" and entry["accepted"] == ctx.now()
     assert entry["gates"][0]["passed"] is False and "FAIL e2 gate" in entry["reason"]
@@ -625,12 +627,15 @@ def test_a_resume_expects_the_hours_of_a_pending_rerun_but_not_of_one_already_re
     settings = S.load_settings(cdir / "sequence.toml")
     s2 = tmp_path / "s2"
     s2.mkdir()
-    steps = {k: {"status": "passed"} for k in ("e1", "baselines", "calibration", "tripwire", "labels", "sft")}
+    steps = {
+        k: {"status": "passed"}
+        for k in ("e1", "baselines", "calibration", "tripwire", "e3_check", "e3", "labels", "sft")
+    }
     steps["e2"] = {"status": "accepted"}
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" not in S.resumed_steps(settings, s2)
     pending = float(settings["e2"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
-    assert S.check_dir(cdir, 650, s2)["expected_hours"] == pytest.approx(pending)
+    assert S.check_dir(cdir, 700, s2)["expected_hours"] == pytest.approx(pending)
     steps["e2"] = {"status": "accepted", "earlier": [{"status": "accepted"}]}
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" in S.resumed_steps(settings, s2)  # the rerun is on record
@@ -661,9 +666,9 @@ def test_stop_after_ends_the_sequence_after_that_step_on_every_resume_until_it_i
 
 
 def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(tmp_path):
-    whole = S.check_dir(make_config_dir(tmp_path / "a"), 650)
+    whole = S.check_dir(make_config_dir(tmp_path / "a"), 700)
     cdir = make_config_dir(tmp_path / "b", 'stop_after = "sft_panels"')
-    part, settings = S.check_dir(cdir, 650), S.load_settings(cdir / "sequence.toml")
+    part, settings = S.check_dir(cdir, 700), S.load_settings(cdir / "sequence.toml")
     assert part["expected_hours"] == pytest.approx(whole["expected_hours"] - float(settings["run1"]["expected_hours"]))
     assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
 
@@ -674,21 +679,21 @@ def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
     s2 = tmp_path / "s2"
     s2.mkdir()
     status = {"e1": "passed", "baselines": "passed", "calibration": "passed", "tripwire": "passed", "e2": "failed",
-              "labels": "passed", "sft": "failed"}  # fmt: skip
+              "e3_check": "passed", "e3": "passed", "labels": "passed", "sft": "failed"}  # fmt: skip
     (s2 / "gates.json").write_text(
         json.dumps({"verdict": "stopped", "steps": {k: {"status": v} for k, v in status.items()}})
     )
-    left = S.check_dir(cdir, 650, s2)["expected_hours"]
+    left = S.check_dir(cdir, 700, s2)["expected_hours"]
     assert left == pytest.approx(
         float(settings["sft"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
     )
-    assert S.check_dir(cdir, 650, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 650)["expected_hours"]
+    assert S.check_dir(cdir, 700, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 700)["expected_hours"]
 
 
 @pytest.mark.parametrize(
     ("calls", "message"),
     [('stop_after = "run2"', "names no step 'run2'"),
-     ('accept_failed = ["e3"]', "names no step 'e3'"),
+     ('accept_failed = ["e7"]', "names no step 'e7'"),
      ('rerun = ["e9"]', "names no step 'e9'"),
      ('skip = ["e2"]', "unknown \\[sequence\\] keys: skip")],
 )  # fmt: skip
@@ -978,7 +983,7 @@ def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_ref
     assert edit[0] in path.read_text()
     path.write_text(path.read_text().replace(edit[0], edit[1]))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 650)
+        S.check_dir(cdir, 700)
 
 
 def test_e2_counts_only_trained_games_for_the_policy_and_only_v0s_for_the_control(tmp_path):
@@ -1414,3 +1419,311 @@ def test_the_probe_cli_builds_the_recorded_prompts_outside_its_event_loop(tmp_pa
     monkeypatch.setenv("VLLM_API_KEY", "k")
     assert P.main(["--url", "http://x:8000", "--out", str(tmp_path / "out")]) == 0
     assert seen and seen[0] > 0 and (tmp_path / "out" / "throughput.json").exists()
+
+
+# ---- E3: the paired, null and slope gates ----------------------------------------------------------------------------
+def pg(start: str, margin: float) -> G.PanelGame:
+    return G.PanelGame(start, margin)
+
+
+def paired_panels(n=60, shift=0.0, seed=0):
+    """Two panels on the same n starts: v0's margins, and those plus `shift` and a little noise of the arm's own."""
+    import random
+
+    rng = random.Random(seed)
+    base = [rng.gauss(300, 1500) for _ in range(n)]
+    v0 = [pg(f"s{i}", m + rng.gauss(0, 400)) for i, m in enumerate(base)]
+    final = [pg(f"s{i}", m + shift + rng.gauss(0, 400)) for i, m in enumerate(base)]
+    return final, v0
+
+
+def test_wilcoxon_signed_rank_is_one_sided_drops_zeros_and_ranks_ties_by_their_mean():
+    up = G.wilcoxon_greater([1, 2, 3, 4, 5])
+    assert up["w_plus"] == 15 and up["p"] == pytest.approx(0.0295, abs=1e-3)
+    assert G.wilcoxon_greater([-1, -2, -3, -4, -5])["p"] > 0.97
+    assert G.wilcoxon_greater([0, 0, 1, 2, 3, 4, 5])["n"] == 5  # zeros are dropped
+    tied = G.wilcoxon_greater([2, -2, 2, -2, 1])
+    assert tied["w_plus"] == pytest.approx(3.5 + 3.5 + 1)  # |2| ties take rank 3.5 each
+    assert G.wilcoxon_greater([0, 0])["p"] == 1.0 and G.wilcoxon_greater([])["p"] is None
+
+
+def test_the_paired_gate_passes_a_real_gain_and_fails_the_same_policy_and_pairs_by_start():
+    final, v0 = paired_panels(shift=700)
+    gate, detail = G.paired_margin_gate(final, v0)
+    assert gate.passed and detail["n_pairs"] == 60 and 500 < detail["median_difference"] < 1000
+    assert "60 pairs" in gate.note and "Wilcoxon" in gate.name
+    shares = detail["cap_win_share"]
+    assert shares["final"] > shares["v0"] and shares["difference"] == pytest.approx(shares["final"] - shares["v0"])
+    low, high = shares["interval"]
+    assert low <= shares["difference"] <= high
+    rejects = sum(G.paired_margin_gate(*paired_panels(shift=0.0, seed=s))[0].passed for s in range(40))
+    assert rejects <= 5  # a 5% test on no difference
+    # games are paired by start, not by order: shuffle one arm, drop a start, add one only one arm played
+    shuffled = [*reversed(final[1:]), pg("only-final", 5.0)]
+    moved, detail = G.paired_margin_gate(shuffled, v0)
+    assert detail["n_pairs"] == 59 and detail["unpaired"] == {"final": 1, "v0": 1} and moved.passed
+
+
+def test_a_start_played_twice_in_an_arm_counts_once_at_its_mean_margin():
+    games = [pg("a", 100.0), pg("a", 300.0), pg("b", 50.0)]
+    detail = G.paired_margin_test(games, [pg("a", 0.0), pg("b", 0.0)])
+    assert detail["n_pairs"] == 2 and detail["mean_difference"] == pytest.approx((200 + 50) / 2)
+
+
+def test_the_gate_has_no_value_with_fewer_than_two_pairs_and_the_shares_come_from_the_margin_sign():
+    assert not G.paired_margin_gate([pg("a", 1.0)], [pg("a", 0.0)])[0].passed
+    assert not G.paired_margin_gate([], [])[0].passed
+    detail = G.paired_margin_test(
+        [pg(f"s{i}", 1.0 if i < 30 else -1.0) for i in range(40)], [pg(f"s{i}", -1.0) for i in range(40)]
+    )
+    assert detail["cap_win_share"]["final"] == 0.75 and detail["cap_win_share"]["v0"] == 0.0
+
+
+def test_the_null_gate_passes_when_v0_played_twice_does_not_differ_and_fails_when_it_does():
+    a, b = paired_panels(shift=0.0, seed=11)
+    gate, detail = G.null_pair_gate(a, b)
+    assert gate.passed and gate.op == ">=" and detail["n_pairs"] == 60
+    better, worse = paired_panels(shift=900)
+    assert not G.null_pair_gate(better, worse)[0].passed  # a test that rejects v0 against v0 is not a test
+
+
+def tg(index: int, version: int, start: str, reward: float) -> G.TrainingGame:
+    return G.TrainingGame(index, version, start, reward)
+
+
+def climbing(slope: float, starts=60, per_start=4, noise=0.3, seed=0):
+    import random
+
+    rng = random.Random(seed)
+    games = []
+    for s in range(starts):
+        offset = rng.gauss(0, noise)
+        for k in range(per_start):
+            version = (s * per_start + k) // 8
+            games.append(tg(s * per_start + k, version, f"s{s}", slope * version + offset + rng.gauss(0, noise)))
+    return games
+
+
+def test_the_slope_gate_passes_a_rising_reward_and_fails_a_flat_one_with_its_numbers():
+    gate, detail = G.in_run_slope_gate(climbing(0.02))
+    assert gate.passed and detail["games"] == 240 and detail["starts"] == 60 and detail["versions"] == [0, 29]
+    assert detail["slope_per_version"] == pytest.approx(0.02, abs=0.01)
+    assert detail["slope_per_10_versions"] == pytest.approx(10 * detail["slope_per_version"])
+    low, high = detail["interval"]
+    assert low > 0 and low < detail["slope_per_version"] < high
+    assert not G.in_run_slope_gate(climbing(0.0, seed=2))[0].passed
+    assert not G.in_run_slope_gate([tg(i, 1, f"s{i}", 0.5) for i in range(10)])[0].passed  # no version spread
+    assert not G.in_run_slope_gate([])[0].passed
+
+
+def test_the_slope_is_read_in_game_order_and_its_interval_resamples_starts_not_games():
+    games = climbing(0.02, seed=5)
+    shuffled = G.in_run_slope(list(reversed(games)))
+    assert shuffled == G.in_run_slope(games)
+    # one start's games share a large offset: resampling games would give a tighter interval than resampling starts
+    per_game = [tg(g.index, g.version, f"own-{g.index}", g.reward) for g in climbing(0.0, noise=1.0, seed=8)]
+    by_start = climbing(0.0, noise=1.0, seed=8)
+    width = lambda d: d["interval"][1] - d["interval"][0]  # noqa: E731
+    assert width(G.in_run_slope(by_start)) > width(G.in_run_slope(per_game))
+
+
+def written_game(folder: Path, game_id: str, *, seed: int, margin: float, version: int = 0, ended_by="time_cap"):
+    """A finished game of the policy (slot 1) from the start `seed`, ending `margin` ahead (or behind) on net worth."""
+    model = "local/qwen-base" if version == 0 else f"local/policy-v{version}"
+    mine, theirs = (5000.0 + margin, 5000.0) if margin >= 0 else (5000.0, 5000.0 - margin)
+    out = results(game_id, ended_by=ended_by, outcomes=("won", "lost") if margin >= 0 else ("lost", "won"),
+                  net_worth=(mine, theirs), model_1=model, turns={"1": [{"began_ms": 0, "model": model}]})  # fmt: skip
+    out["spec"]["seed"], out["spec"]["ai_seed"], out["spec"]["map"] = seed, seed + 1, "mainland"
+    path = folder / game_id / "results.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(out))
+
+
+def test_the_loaders_read_a_panel_games_margin_and_a_training_games_reward_and_number(tmp_path):
+    written_game(tmp_path, "end-final-0007-petra-2", seed=7, margin=1700.0)
+    (game,) = S.panel_games(tmp_path)
+    assert game.margin == 1700.0 and game.start.startswith("start:")
+    other = tmp_path / "x"
+    written_game(other, "s2-e3-g000012", seed=7, margin=3400.0, version=4)
+    written_game(other, "s2-e3-g000013-r1", seed=8, margin=-3400.0, version=5)
+    written_game(other, "s2-e3-g000014", seed=9, margin=100.0, ended_by="stopped")
+    got = {g.index: g for g in S.training_games(other, 3400.0)}
+    assert sorted(got) == [12, 13] and got[12].version == 4 and got[13].version == 5
+    assert got[12].reward == pytest.approx(0.5 + 0.5 * 0.7616, abs=1e-3)  # tanh(1)
+    assert got[13].reward == pytest.approx(-got[12].reward, abs=1e-3)
+    assert S.training_games(other, 1700.0)[0].reward != got[12].reward  # the run's margin scale is the one used
+
+
+# ---- E3: the check and the run ---------------------------------------------------------------------------------------
+def e3_check_world(ctx, *, pair_shift=0.0, finished=60, bench=None):
+    """What E3's check run and its two benches leave behind: three panels of games and a bench.json per bench root."""
+    import random
+
+    cfg = ctx.cfg("e3_check")
+    bench = bench or {"e2": 2.0, "e3": 1.2}
+
+    def play(argv):
+        rng = random.Random(4)
+        base = [rng.gauss(300, 1500) for _ in range(60)]
+        for panel, shift in (("petra3-cap", 0.0), ("pair-a", 0.0), ("pair-b", pair_shift)):
+            for i in range(finished):
+                m = base[i] + shift + rng.gauss(0, 400)
+                written_game(cfg.root / "panels" / panel, f"{panel}-v0-{panel}-{i:04d}", seed=1000 + i, margin=m)
+            (cfg.root / "panels" / panel / "summary.json").write_text(json.dumps({"games": 60, "finished": finished}))
+        return 0
+
+    def run_bench(argv):
+        root = S.load_config(Path(argv[argv.index("--bench") - 1])).root
+        kind = "e2" if "-bench-e2" in str(root) else "e3"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "bench.json").write_text(json.dumps({"seconds_per_row": bench[kind], "updates": 3}))
+        return 0
+
+    return {"e3-check.toml --play-only": play, "--bench": run_bench}
+
+
+def test_the_check_plays_v0_twice_on_identical_starts_then_benches_the_learner_on_both_flag_sets(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    runner.effects = e3_check_world(ctx)
+    install_e2_baseline(ctx)
+    out = run_step(ctx, "e3_check")
+    assert out.passed, out.why()
+    assert [g.name for g in out.gates][0].startswith("pair-a vs pair-b") and len(out.gates) == 4
+    lines = [line.split("box/train-run.sh ", 1)[1] for line in runner.lines()]
+    assert lines[0].endswith("e3-check.toml --play-only") and len(lines) == 3
+    e2_bench, e3_bench = (line.split() for line in lines[1:])
+    rows = str(tmp_path / "train" / "s2" / "e2d" / "inbox" / "consumed")
+    for argv, name in ((e2_bench, "e2"), (e3_bench, "e3")):
+        assert argv[0].endswith(f"e3-check-bench-{name}.toml") and argv[1:5] == [
+            "--bench",
+            rows,
+            "--bench-updates",
+            "3",
+        ]
+        assert argv[5:7] == ["--baseline", str(ctx.s2 / "baseline-e2.json")]
+    assert e2_bench[7:] == ["--lr", "3e-05", "--drift", "alarm", "--grad-norm", "alarm", "--full-prox"]
+    assert e3_bench[7:] == [
+        "--lr", "3e-05", "--drift", "alarm", "--grad-norm", "alarm", "--anchor-beta0", "0",
+        "--warmup-updates", "2", "--decisions-per-update", "512", "--kl-check-fraction", "0.25",
+        "--probe-rows", "64", "--whole-groups",
+    ]  # fmt: skip
+    roots = {S.load_config(ctx.s2 / "generated" / f"e3-check-bench-{k}.toml").root for k in ("e2", "e3")}
+    assert len(roots) == 2 and ctx.cfg("e3_check").root not in roots
+    bench = out.detail["bench"]
+    assert bench["e2"]["seconds_per_row"] == 2.0 and bench["e3"]["seconds_per_row"] == 1.2
+    assert bench["ratio_e3_to_e2"] == pytest.approx(0.6)
+    cap = out.detail["petra3_cap"]
+    assert cap["games"] == 60 and 0 < cap["cap_win_share"] < 1 and cap["median_margin"] is not None
+    assert out.detail["null"]["n_pairs"] == 60
+
+
+def test_the_check_fails_when_the_null_pair_differs_or_a_panel_did_not_finish(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    runner.effects = e3_check_world(ctx, pair_shift=-900)  # pair-a is far ahead of pair-b
+    install_e2_baseline(ctx)
+    out = run_step(ctx, "e3_check")
+    assert not out.passed and "does not reject" in out.why()
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path / "b", runner)
+    runner.effects = e3_check_world(ctx, finished=40)
+    install_e2_baseline(ctx)
+    assert "share of its games finished" in run_step(ctx, "e3_check").why()
+
+
+def e3_world(ctx, *, gain=700.0, reward_slope=0.02, trips=0, reason="complete", updates=12):
+    """What E3 leaves: training games whose reward climbs with the version, the end panels, health, final.json."""
+    import random
+
+    cfg = ctx.cfg("e3")
+
+    def run(argv):
+        rng = random.Random(1)
+        for i in range(120):
+            version = i // 10
+            margin = 3400 * (reward_slope * version - 0.1) * 2 + rng.gauss(0, 800)
+            written_game(cfg.root / "games", f"s2-e3-g{i:06d}", seed=i // 4, margin=margin, version=version)
+        base = [rng.gauss(300, 1500) for _ in range(240)]
+        for panel, shift, version in (("end-v0", 0.0, 0), ("end-final", gain, 12)):
+            for i, m in enumerate(base):
+                written_game(
+                    cfg.root / "panels" / panel, f"{panel}-{i:04d}-petra-2", seed=5000 + i,
+                    margin=m + shift + rng.gauss(0, 400), version=version,
+                )  # fmt: skip
+        (cfg.root / "orchestrator").mkdir(parents=True, exist_ok=True)
+        (cfg.root / "orchestrator" / "final.json").write_text(json.dumps({"reason": reason}))
+        records = [
+            {"version": v, "tripwires": {"trips": [{"message": "x"}] if v < trips else []}} for v in range(updates)
+        ]
+        (cfg.root / "health.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+        return 0
+
+    return {"train-run.sh": run}
+
+
+def test_e3_trains_with_its_flags_then_judges_the_end_panels_and_the_slope_and_reports_the_shares(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    runner.effects = e3_world(ctx)
+    install_e2_baseline(ctx)
+    out = run_step(ctx, "e3")
+    assert out.passed, out.why()
+    assert [g.name for g in out.gates][:1] == ["learner updates"] and len(out.gates) == 5
+    assert len(runner.calls) == 1 and "e3.toml" in runner.calls[0][2]
+    assert runner.calls[0][3:] == [
+        "--baseline", str(ctx.s2 / "baseline-e2.json"),
+        "--lr", "3e-05", "--drift", "alarm", "--grad-norm", "alarm",
+        "--anchor-beta0", "0", "--warmup-updates", "2", "--decisions-per-update", "512",
+        "--kl-check-fraction", "0.25", "--probe-rows", "64", "--whole-groups",
+    ]  # fmt: skip
+    assert out.detail["paired"]["n_pairs"] == 240 and out.detail["paired"]["median_difference"] > 500
+    assert out.detail["cap_win_share"]["final"] > out.detail["cap_win_share"]["v0"]
+    assert out.detail["slope"]["games"] == 120 and out.detail["updates"] == 12 and out.detail["trips"] == 0
+
+
+@pytest.mark.parametrize(
+    ("world", "failed"),
+    [({"gain": 0.0}, "paired net-worth margin"),
+     ({"reward_slope": 0.0}, "training reward slope"),
+     ({"trips": 2}, "tripwire trips"),
+     ({"reason": "duration"}, "the run ended normally"),
+     ({"updates": 3}, "learner updates")],
+)  # fmt: skip
+def test_e3_fails_on_each_gate_that_misses_and_names_it(tmp_path, world, failed):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    runner.effects = e3_world(ctx, **world)
+    install_e2_baseline(ctx)
+    out = run_step(ctx, "e3")
+    assert not out.passed and failed in out.why()
+
+
+def test_the_two_new_steps_follow_e2_and_the_shipped_sequence_stops_after_the_check_without_rerunning_e2(tmp_path):
+    steps = list(S.STEPS)
+    assert steps[steps.index("e2") + 1 : steps.index("e2") + 3] == ["e3_check", "e3"] and "labels" in steps[5:]
+    settings = S.load_settings(LIVE_S2 / "sequence.toml")
+    assert settings.accept_failed == ("e2",) and settings.rerun == () and settings.stop_after == "e3_check"
+    assert settings["e3"]["decisions_per_update"] == 512 and settings["e3"]["whole_groups"] is True
+
+
+@pytest.mark.parametrize(
+    ("file", "old", "new", "message"),
+    [("e3.toml", "group_size = 4", "group_size = 2", "group_size must be games.seed_group"),
+     ("e3.toml", "decisions_per_update = 512", "decisions_per_update = 256", "must match"),
+     ("e3.toml", 'baseline = "start_loo"', 'baseline = "ema"', "baseline = start_loo"),
+     ("e3.toml", "train_hours = 3.0", "", "train_hours must be set"),
+     ("e3.toml", "games = 240\npositions", "games = 200\npositions", "do not play identical starts"),
+     ("e3-check.toml", "panels_only = true\n", "", "panels only"),
+     ("e3-check.toml", 'opponents = { "petra-2" = 1.0 }\n\n[[panels]]\nname = "pair-b"',
+      'opponents = { "petra-1" = 1.0 }\n\n[[panels]]\nname = "pair-b"', "do not play identical starts"),
+     ("sequence.toml", 'drift = "alarm"            # as E2', 'drift = "no"', r"\[e3\] drift")],
+)  # fmt: skip
+def test_a_config_directory_whose_e3_would_not_be_a_paired_outcome_run_is_refused(tmp_path, file, old, new, message):
+    cdir = make_config_dir(tmp_path)
+    path = cdir / file
+    text = path.read_text()
+    assert old in text, old
+    path.write_text(text.replace(old, new, 1))
+    with pytest.raises(ValueError, match=message):
+        S.check_dir(cdir, 700) if file != "sequence.toml" else S.load_settings(path)

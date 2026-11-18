@@ -227,7 +227,7 @@ class Credit:
         self, results: Mapping[str, Any], rewards: Mapping[str, tuple[float, str | None]]
     ) -> list[dict[str, Any]]:
         """Keep the game's reward and picked decisions with its start's others; emit the groups that are now due."""
-        group = _group_of(results)
+        group = group_of(results)
         decisions = [
             {"slot": slot, "stratum": self._stratum(results, slot, turn), "row": self._row(results, slot, turn, 0.0)}
             for slot in rewards
@@ -470,7 +470,7 @@ class Credit:
             raise CreditError(f"seat {slot}: no policy version in its turns or model name")
         return {
             "game_id": f"{_game_id(results)}:{slot}",
-            "group": _group_of(results),
+            "group": group_of(results),
             "version": version,
             "prompt_token_ids": list(turn["prompt_token_ids"]),
             "token_ids": list(turn["token_ids"]),
@@ -597,6 +597,12 @@ class Credit:
         self.held = {k: {"born": int(e["born"]), "games": list(e["games"])} for k, e in state["held"].items()}
 
 
+def game_reward(results: Mapping[str, Any], slot: str, margin_scale: float) -> float:
+    """R of a seat in a finished game by the cap rule at `margin_scale`, outside any run's state (the gates' read of a
+    run's games). A CreditError when the game's results contradict themselves."""
+    return Credit(CreditConfig(margin_scale=margin_scale))._reward(results, slot)[0]
+
+
 def gae_advantages(values: Sequence[float], terminal: float, lam: float) -> list[float]:
     """A_t = sum_k lam^k (V_{t+k+1} - V_{t+k}) over values V_0..V_{n-1} followed by the terminal value."""
     chain = [*values, terminal]
@@ -624,7 +630,7 @@ def _batch_drift(entries: Sequence[tuple[str, float]]) -> dict[str, float]:
     return {"mean": mean, "sd": sd, "games": games, "ratio": ratio, "z": z}
 
 
-def _group_of(results: Mapping[str, Any]) -> str:
+def group_of(results: Mapping[str, Any]) -> str:
     """The id of the start a game was dealt from: the spec's `group`, else a key built from what a start repeats (map,
     seeds, cap, and each seat's kind, civ, difficulty, behaviour and whether it trains)."""
     spec = results.get("spec") or {}

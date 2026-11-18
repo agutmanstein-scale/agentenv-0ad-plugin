@@ -13,9 +13,8 @@ root = "/var/lib/zeroad-live/train/s2"
 uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
 
 [sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
-rerun = ["e2"]             # 17 Nov: E2 again as E2d, with per-turn GAE credit (e2.toml) and grad-norm spikes as alarms;
-                           # its recorded failure stays in gates.json under `earlier`
-stop_after = "e2"          # 17 Nov: E2 only; what follows is decided on its result
+accept_failed = ["e2"]     # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
+stop_after = "e3_check"    # 17 Nov: the check first; "e3" for the run itself
 
 [e1]                       # GPU gates
 config = "e1.toml"
@@ -49,6 +48,30 @@ min_median_army = 6.0
 max_p = 0.01               # Mann-Whitney, one-sided
 min_updates = 5
 minute = 10.0
+
+[e3_check]                 # 17 Nov: E3's check, play-only v0 on three panels, then the learner bench twice
+config = "e3-check.toml"
+cap_hours = 1.5            # 180 panel games (about 0.4 h) and two benches of a few learner updates each, with their model loads
+expected_hours = 1.0
+bench_rows = "/var/lib/zeroad-live/train/s2/e2d/inbox/consumed"   # E2d's rows the learner consumed: the bench's fixed input
+bench_updates = 3
+
+[e3]                       # 17 Nov: RL on the game outcome with same-start credit, then paired end panels (e3.toml)
+config = "e3.toml"
+cap_hours = 5.0            # e3.toml's duration_hours (4.8) + the final upload
+expected_hours = 4.4       # 3 h of training, then 480 panel games (about 1.2 h) at about 490 an hour
+lr = 3e-5                  # as E2
+drift = "alarm"            # as E2
+grad_norm = "alarm"        # as E2
+baseline_config = "e2-baseline.toml"   # the tripwire bands E2 used, on the same kind of games (already on disk)
+min_updates = 5
+max_p = 0.05               # the paired margin test (final vs v0, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor
+warmup_updates = 2
+decisions_per_update = 512  # must equal e3.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups
 
 [baselines]                # play-only v0: panels, calibration, briefs
 config = "baselines.toml"
