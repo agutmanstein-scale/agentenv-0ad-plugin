@@ -13,8 +13,9 @@ root = "/var/lib/zeroad-live/train/s2"
 uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
 
 [sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
-accept_failed = ["e2"]     # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
-stop_after = "e3"          # 17 Nov: the check, then E3 in the same session; a failed check stops it before E3
+accept_failed = ["e2", "e3"]   # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
+                               # 18 Nov: E3's in-run slope gate missed narrowly; its paired held-out gate passed (73.3% vs 54.2%, p 2e-5): accepted
+stop_after = "e4"          # 18 Nov: the long-game check, then E4 in the same session; a failed check stops it before E4
 
 [e1]                       # GPU gates
 config = "e1.toml"
@@ -69,6 +70,28 @@ max_p = 0.05               # the paired margin test (final vs v0, Wilcoxon signe
 anchor_beta0 = 0.0         # no pull back to the anchor
 warmup_updates = 2
 decisions_per_update = 512  # must equal e3.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups
+
+[e4_check]                 # 18 Nov: E4's check, play-only v0 and E3's final adapter on 200 30-minute games (e4-check.toml)
+config = "e4-check.toml"
+cap_hours = 3.0            # 200 games at about a third of the 12-minute rate (about 160 an hour), plus the adapter's copy and load
+expected_hours = 2.0
+
+[e4]                       # 18 Nov: RL from E3's adapter on 30-minute games, a cap weight of 0.5, paired end panels (e4.toml)
+config = "e4.toml"
+cap_hours = 7.5            # e4.toml's duration_hours (6.2) + the final upload
+expected_hours = 6.0       # 3.5 h of training, then 200 panel games of 30 minutes (about 2 h)
+lr = 3e-5                  # as E3
+drift = "alarm"            # as E3
+grad_norm = "alarm"        # as E3
+baseline_config = "e2-baseline.toml"   # the tripwire bands E2 used (already on disk)
+min_updates = 5
+max_p = 0.05               # the paired R test (final vs the start adapter, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor (the learner then loads none, so no --anchor is passed)
+warmup_updates = 2
+decisions_per_update = 512  # must equal e4.toml's [credit] decisions_per_update
 kl_check_fraction = 0.25
 probe_rows = 64
 whole_groups = true        # the learner batches whole same-start groups

@@ -1,0 +1,58 @@
+# E4's check: play-only, 30-minute games. Two held-out panels on identical starts (100 games, Petra-2 0.6 and Petra-3 0.4):
+# `long-base`, v0, and `long-e3`, E3's final adapter, which the step copies into this root as version 1 (E3's root is only
+# read). Whether E3's adapter plays the long games as well as it did the short ones, and the margin scale s of E4's
+# reward: the pooled within-opponent SD of v0's cap margins (clamped to 2000..20000). E4's end panels play the same
+# starts (live/s2/e4.toml), so all four panels pair game by game.
+run_id = "s2-e4-check"
+root = "/var/lib/zeroad-live/train/s2/e4-check"
+duration_hours = 2.5         # 200 games of 30 minutes (3 times a 12-minute game's wall time); stop_when_done ends it sooner
+budget_usd = 850             # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49     # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false             # the sequence powers the box off itself, once, after the final upload
+panels_only = true
+stop_when_done = true
+engines = 24
+concurrency = 24
+seed = 4                     # E4's: the panels' positions depend on it, and the check's starts must be E4's
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+petra-2 = 0.6
+petra-3 = 0.4
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.0
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[[panels]]
+name = "long-base"
+kind = "heldout"
+at_hours = 0
+version = 0
+games = 100
+positions = "held_out"
+time_cap_minutes = 30
+opponents = { "petra-2" = 0.6, "petra-3" = 0.4 }
+
+[[panels]]
+name = "long-e3"
+kind = "heldout"
+at_hours = 0
+version = 1                  # E3's final adapter, copied here as ROOT/adapters/v1 by the step
+games = 100
+positions = "held_out"
+time_cap_minutes = 30
+opponents = { "petra-2" = 0.6, "petra-3" = 0.4 }
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-e4-check"

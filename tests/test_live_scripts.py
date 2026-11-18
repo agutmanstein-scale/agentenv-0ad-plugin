@@ -1927,7 +1927,7 @@ def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_
     assert int(env["LIVE_MAX_HOURS"]) >= numbers["expected_hours"] + 2  # the bootstrap's hour and an hour of margin
     box = numbers["expected_hours"] * numbers["rate"]
     assert (
-        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 420
+        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 480
     )  # box, two frontier panels, calibration, labels
 
 
@@ -1961,11 +1961,11 @@ def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket
     out = run(s2_stubs(stubs), "s2.sh", ID, "start", str(S2_DIR), forbid_aws=True)
     plan = out.stderr
     assert out.returncode == 0, plan
-    assert "agentenv_zeroad.train.s2 check" in plan and "--budget 715" in plan and "against $715" in plan
+    assert "agentenv_zeroad.train.s2 check" in plan and "--budget 850" in plan and "against $850" in plan
     assert plan.count("aws ssm send-command") == 2
-    assert "box/s2.sh put-config" in plan and "box/s2.sh start --budget 715" in plan
-    assert plan.index("put-config") < plan.index("s2.sh start --budget 715")
-    assert "systemd-run --unit zeroad-s2" in plan and "s2-run.sh --budget 715" in plan.replace("\\", "")
+    assert "box/s2.sh put-config" in plan and "box/s2.sh start --budget 850" in plan
+    assert plan.index("put-config") < plan.index("s2.sh start --budget 850")
+    assert "systemd-run --unit zeroad-s2" in plan and "s2-run.sh --budget 850" in plan.replace("\\", "")
     [blob] = [b for b in re.findall(r"[A-Za-z0-9+/=]{500,}", plan)]
     with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob)), mode="r:gz") as tar:
         files = {m.name.removeprefix("./"): tar.extractfile(m).read().decode() for m in tar.getmembers() if m.isfile()}
@@ -1981,11 +1981,11 @@ def test_the_s2_start_plan_checks_and_sends_the_config_directory_with_the_bucket
 def test_the_s2_start_takes_resume_or_fresh_but_not_both_and_needs_a_config_directory(stubs):
     s2_stubs(stubs)
     assert (
-        "s2.sh start --budget 715 --resume"
+        "s2.sh start --budget 850 --resume"
         in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", forbid_aws=True).stderr
     )
     assert (
-        "s2.sh start --budget 715 --fresh"
+        "s2.sh start --budget 850 --fresh"
         in run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--fresh", forbid_aws=True).stderr
     )
     out = run(stubs, "s2.sh", ID, "start", str(S2_DIR), "--resume", "--fresh", forbid_aws=True)
@@ -2327,6 +2327,19 @@ def test_the_box_train_run_passes_the_lean_learner_flags_and_the_bench_mode_thro
         assert run_box(stubs, "train-run.sh", run1, *bad, DRY_RUN="1").returncode != 0, bad
     for good in ("1", "0.5", "0.25", "1.0", ".5"):
         assert run_box(stubs, "train-run.sh", run1, "--kl-check-fraction", good, DRY_RUN="1").returncode == 0, good
+
+
+def test_the_box_train_run_passes_the_init_adapters_version_to_the_learner(stubs):
+    run1 = str(S2_DIR / "run1.toml")
+    out = run_box(stubs, "train-run.sh", run1, "--init", "/x/a", "--start-version", "1", DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert "--init /x/a --start-version 1" in learner
+    assert "--start-version" not in run_box(stubs, "train-run.sh", run1, DRY_RUN="1").stdout
+    for bad in ("0", "-1", "one"):
+        assert run_box(stubs, "train-run.sh", run1, "--start-version", bad, DRY_RUN="1").returncode != 0, bad
 
 
 def run_learner_only(stubs, *args, writes: bool, ps: str = ""):

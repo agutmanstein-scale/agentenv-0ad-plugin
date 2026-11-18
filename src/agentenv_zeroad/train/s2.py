@@ -24,6 +24,12 @@ if the gates of the one before passed:
               flags and with E3's, for seconds per row
   e3          the RL run on the game outcome with same-start leave-one-out credit, trained for `train_hours`, then two
               end panels (v0 and the final adapter, identical starts) judged by `gates.paired_margin_gate`
+  e4_check    E4's check, play-only: 100 games each of v0 and of E3's final adapter on identical 30-minute starts
+              against Petra-2 and -3 (E3's adapter is copied into this step's own root as version 1); the finished
+              shares, and the margin scale E4's reward uses (the pooled within-opponent SD of v0's cap margins)
+  e4          the RL run from E3's final adapter on the reward with a cap weight under 1 (conquest outweighs a cap
+              lead), then two end panels on the check's starts (the start adapter and the final one) judged by
+              `gates.paired_reward_gate`
   labels      `distill.py`: the teacher relabels the briefs under a spend cap
   sft         the learner in --sft mode, a checkpoint per epoch
   sft_panels  each epoch's adapter plays the first panel_games of the held-out panel; `stats.select_sft_checkpoint`
@@ -77,7 +83,8 @@ log = logging.getLogger("s2")
 
 STOPPED_BY_HAND = "stopped by hand (SIGTERM)"
 STEPS = (
-    "e1", "baselines", "calibration", "tripwire", "e2", "e3_check", "e3", "labels", "sft", "sft_panels", "init", "run1"
+    "e1", "baselines", "calibration", "tripwire", "e2", "e3_check", "e3", "e4_check", "e4", "labels", "sft",
+    "sft_panels", "init", "run1"
 )  # fmt: skip
 GRACE_S = 2400.0  # an orchestrator told to stop uploads for up to 3 x 10 minutes (sync.SYNC_TIMEOUT_S)
 SFT_PREFIX = "sft-epoch"
@@ -91,6 +98,14 @@ E3_CHECK_PANELS = (
     "pair-a",
     "pair-b",
 )  # e3-check.toml's panels: the cap rate, and v0 twice on identical starts
+E4_CHECK_PANELS = ("long-base", "long-e3")  # e4-check.toml's panels: v0 and E3's final adapter on identical starts
+E4_END_PANELS = (
+    "end-start",
+    "end-final",
+)  # e4.toml's end panels: the start adapter, then the adapter current at the end
+E4_INIT_VERSION = 1  # E3's adapter is published as this version in the root of E4's check and of E4
+E4_MIN_CAP_GAMES = 30  # the margin scale is measured on at least this many of v0's cap-ended games
+E4_SCALE_RANGE = (2000.0, 20000.0)  # and clamped to this
 PANEL_FINISHED_SHARE = 0.9  # of each E3 panel's games that must have finished
 
 # Every table of sequence.toml with its keys and their defaults; a key not listed is an error.
@@ -144,6 +159,24 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "anchor_beta0": 0.0,
         "warmup_updates": 2,
         "decisions_per_update": 512,  # the learner's batch; e3.toml's [credit] decisions_per_update must match
+        "kl_check_fraction": 0.25,
+        "probe_rows": 64,
+        "whole_groups": True,
+    },
+    "e4_check": {"config": "e4-check.toml", "cap_hours": 3.0, "expected_hours": 2.0},
+    "e4": {
+        "config": "e4.toml",
+        "cap_hours": 7.5,
+        "expected_hours": 6.0,
+        "lr": 3e-5,
+        "drift": "alarm",
+        "grad_norm": "alarm",
+        "baseline_config": "e2-baseline.toml",
+        "min_updates": 5,
+        "max_p": 0.05,  # the paired R test's one-sided Wilcoxon p
+        "anchor_beta0": 0.0,
+        "warmup_updates": 2,
+        "decisions_per_update": 512,  # the learner's batch; e4.toml's [credit] decisions_per_update must match
         "kl_check_fraction": 0.25,
         "probe_rows": 64,
         "whole_groups": True,
@@ -293,7 +326,7 @@ def load_settings(path: Path) -> Settings:
         tables[step] = {**defaults, **given}
         if float(tables[step]["cap_hours"]) <= 0:
             raise ValueError(f"[{step}] cap_hours must be positive")
-    for table in ("e2", "e3"):
+    for table in ("e2", "e3", "e4"):
         for switch in ("drift", "grad_norm"):
             if tables[table][switch] not in ("trip", "alarm"):
                 raise ValueError(f"[{table}] {switch} must be 'trip' or 'alarm', not {tables[table][switch]!r}")
@@ -352,7 +385,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     settings = load_settings(path / "sequence.toml")
     configs = ConfigDir(path, settings)
     rates, frontier = set(), False
-    for step in ("e1", "e2", "e3_check", "e3", "baselines", "sft", "sft_panels", "run1"):
+    for step in ("e1", "e2", "e3_check", "e3", "e4_check", "e4", "baselines", "sft", "sft_panels", "run1"):
         cfg = configs.load(step)
         keys = check_run(cfg)
         frontier = frontier or bool(keys)
@@ -373,7 +406,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
             )
         if cfg.s3_uri is None:
             raise ValueError(f"{step}: s3.uri is required: a step nobody uploads is lost with the box")
-    for table in ("e2", "e3"):
+    for table in ("e2", "e3", "e4"):
         if not settings[table]["baseline_config"]:
             continue
         cfg = load_config(path / str(settings[table]["baseline_config"]))
@@ -395,6 +428,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     if configs.load("e2").credit.get("positive_control") is not True:
         raise ValueError("e2: [credit] positive_control must be true")
     _check_e3(configs, settings)
+    _check_e4(configs, settings)
     sp = settings["sft_panels"]
     if not 0 < int(sp["panel_games"]) < int(sp["heldout_games"]):
         raise ValueError(
@@ -417,11 +451,13 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     }
 
 
-def _same_starts(cfg: RunConfig, first: str, second: str) -> bool:
-    """Whether two panels of a config play identical starts game by game: their specs differ at most by the game id."""
+def _same_starts(cfg: RunConfig, first: str, second: str, other: RunConfig | None = None) -> bool:
+    """Whether two panels play identical starts game by game: their specs differ at most by the game id. They are
+    panels of `cfg`, or `second` is a panel of `other`."""
     from agentenv_zeroad.train.calibration import panel_specs
 
-    a, b = (panel_specs(cfg, next(p for p in cfg.panels if p.name == n)) for n in (first, second))
+    other = other or cfg
+    a, b = (panel_specs(c, next(p for p in c.panels if p.name == n)) for c, n in ((cfg, first), (other, second)))
     return len(a) == len(b) and all(
         dataclasses.replace(x, game_id="x") == dataclasses.replace(y, game_id="x") for x, y in zip(a, b, strict=True)
     )
@@ -451,6 +487,51 @@ def _check_e3(configs: ConfigDir, settings: Settings) -> None:
         raise ValueError("e3: [credit] decisions_per_update must match [e3] decisions_per_update, the learner's batch")
     if len({e3.root, check.root}) != 2:
         raise ValueError("e3 and e3_check need roots of their own")
+
+
+def _check_e4(configs: ConfigDir, settings: Settings) -> None:
+    """What E4 and its check rely on: the four panels exist and all pair (the check's two with E4's two, on identical
+    starts), E4 trains from the check's adapter on a cap weight under 1 with same-start credit and a margin scale the
+    step renders, and the check plays no training game."""
+    e4, check = configs.load("e4"), configs.load("e4_check")
+    for cfg, names in ((e4, E4_END_PANELS), (check, E4_CHECK_PANELS)):
+        missing = set(names) - {p.name for p in cfg.panels}
+        if missing:
+            raise ValueError(f"{cfg.run_id}: no panel named {', '.join(sorted(missing))}")
+    for other, name in ((check, E4_CHECK_PANELS[1]), (e4, E4_END_PANELS[0]), (e4, E4_END_PANELS[1])):
+        if not _same_starts(check, E4_CHECK_PANELS[0], name, other):
+            raise ValueError(
+                f"e4_check's {E4_CHECK_PANELS[0]} and {other.run_id}'s {name} do not play identical starts"
+            )
+    panel = {p.name: p for p in check.panels}
+    if panel[E4_CHECK_PANELS[0]].version != 0 or panel[E4_CHECK_PANELS[1]].version != E4_INIT_VERSION:
+        raise ValueError(f"e4_check: long-base plays v0 and long-e3 plays v{E4_INIT_VERSION}, E3's adapter")
+    end = {p.name: p for p in e4.panels}
+    if end[E4_END_PANELS[0]].version != E4_INIT_VERSION or end[E4_END_PANELS[1]].version is not None:
+        raise ValueError(f"e4: end-start plays v{E4_INIT_VERSION}, the init adapter, and end-final the final adapter")
+    if e4.train_hours is None or any(p.at_hours < e4.train_hours for p in e4.panels if p.name in E4_END_PANELS):
+        raise ValueError("e4: train_hours must be set and no end panel may start before it")
+    if not check.panels_only or not check.stop_when_done:
+        raise ValueError("e4_check: the check plays panels only and ends when they are done")
+    if e4.init_version != E4_INIT_VERSION:
+        raise ValueError(
+            f"e4: init_version must be {E4_INIT_VERSION}: the adapter the learner and the games start from"
+        )
+    credit = e4.credit
+    if credit.get("positive_control") or credit.get("baseline") != "start_loo":
+        raise ValueError("e4: [credit] must train on the outcome (no positive_control) with baseline = start_loo")
+    if int(credit.get("group_size", 1)) != e4.games.seed_group:
+        raise ValueError("e4: [credit] group_size must be games.seed_group")
+    if int(credit.get("decisions_per_update", 256)) != int(settings["e4"]["decisions_per_update"]):
+        raise ValueError("e4: [credit] decisions_per_update must match [e4] decisions_per_update, the learner's batch")
+    if not 0 < float(credit.get("cap_weight", 1.0)) < 1:
+        raise ValueError(
+            "e4: [credit] cap_weight must be above 0 and under 1, so a conquest outweighs a lead at the cap"
+        )
+    if "margin_scale" not in credit:
+        raise ValueError("e4: [credit] needs a margin_scale line for the step to replace with the check's measured one")
+    if len({e4.root, check.root, configs.load("e3").root}) != 3:
+        raise ValueError("e3, e4 and e4_check need roots of their own")
 
 
 def _check_panel_names(configs: ConfigDir, settings: Settings) -> None:
@@ -813,15 +894,18 @@ def step_e2(ctx: Ctx) -> Outcome:
 
 
 # ---- E3 ------------------------------------------------------------------------------------------
-def panel_games(folder: Path) -> list[G.PanelGame]:
-    """The finished games of a panel folder, each with its start and the policy's final margin."""
-    games = (G.panel_game(read_json(p) or {}) for p in sorted(folder.glob("*/results.json")))
+def panel_games(folder: Path, margin_scale: float | None = None, cap_weight: float = 1.0) -> list[G.PanelGame]:
+    """The finished games of a panel folder, each with its start and the policy's final margin (and, given a
+    `margin_scale`, its R)."""
+    games = (G.panel_game(read_json(p) or {}, margin_scale, cap_weight) for p in sorted(folder.glob("*/results.json")))
     return [g for g in games if g is not None]
 
 
-def training_games(folder: Path, margin_scale: float) -> list[G.TrainingGame]:
-    """The finished training games of a run's games folder with their R at `margin_scale`."""
-    games = (G.training_game(read_json(p) or {}, margin_scale) for p in sorted(folder.glob("*/results.json")))
+def training_games(folder: Path, margin_scale: float, cap_weight: float = 1.0) -> list[G.TrainingGame]:
+    """The finished training games of a run's games folder with their R at `margin_scale` and `cap_weight`."""
+    games = (
+        G.training_game(read_json(p) or {}, margin_scale, cap_weight) for p in sorted(folder.glob("*/results.json"))
+    )
     return [g for g in games if g is not None]
 
 
@@ -920,6 +1004,164 @@ def step_e3(ctx: Ctx) -> Outcome:
     ]
     detail = {"paired": paired_detail, "slope": slope_detail, "updates": updates, "trips": trips}
     return Outcome(gates, detail | {"cap_win_share": paired_detail["cap_win_share"]})
+
+
+# ---- E4 ------------------------------------------------------------------------------------------
+def e3_adapter(ctx: Ctx) -> tuple[int, Path]:
+    """E3's final adapter: the version its end-final panel played and that version's folder in E3's root."""
+    root = ctx.cfg("e3").root
+    version = int((read_json(root / "panels" / E3_END_PANELS[1] / "summary.json") or {}).get("version") or 0)
+    if not version:
+        raise StepFailed(f"E3's end-final panel left no summary with the adapter version it played in {root}")
+    return version, root / "adapters" / f"v{version}"
+
+
+def seed_adapter(source: Path, root: Path, version: int) -> Path:
+    """Publish a copy of the adapter in `source` as ROOT/adapters/v{version}, which the run's games and panels then play
+    and its learner starts from. The copy is made beside it and renamed into place, and one already made from the same
+    source is left alone. E3's own root is only read."""
+    needed = ("adapter_config.json", "adapter_model.safetensors")
+    if not all((source / name).is_file() for name in needed):
+        raise StepFailed(f"{source} is not an adapter folder ({', '.join(needed)}): was it pruned?")
+    stamp = {"copied_from": str(source), "source_version": (read_json(source / "manifest.json") or {}).get("version")}
+    dest = root / "adapters" / f"v{version}"
+    made = read_json(dest / "manifest.json") or {}
+    if all(made.get(k) == v for k, v in stamp.items()) and all((dest / name).is_file() for name in needed):
+        return dest
+    tmp = dest.with_name(dest.name + ".tmp")
+    for stale in (tmp, dest):
+        shutil.rmtree(stale, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, tmp)
+    manifest = {"mode": "rl", "version": version, "update": 0, **stamp, "time": time.time()}
+    (tmp / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    os.replace(tmp, dest)
+    return dest
+
+
+def panel_report(games: Sequence[G.PanelGame]) -> dict[str, dict[str, Any]]:
+    """A panel's games overall and per opponent: the games, the shares that ended in a conquest won or lost, the share
+    that ended at a cap with the policy ahead on net worth (of all the games), the median net-worth margin of the cap
+    games and the median wall seconds of a game."""
+
+    def share(n: int, of: int) -> float | None:
+        return n / of if of else None
+
+    groups: dict[str, list[G.PanelGame]] = {"all": list(games)}
+    for g in games:
+        groups.setdefault(g.opponent, []).append(g)
+    out = {}
+    for name, found in groups.items():
+        cap = [g for g in found if g.ended_by in rs.CAP_ENDS]
+        walls = [g.wall_s for g in found if g.wall_s is not None]
+        out[name] = {
+            "games": len(found),
+            "conquest_won_share": share(
+                sum(g.ended_by == "conquest" and g.outcome == "won" for g in found), len(found)
+            ),
+            "conquest_lost_share": share(
+                sum(g.ended_by == "conquest" and g.outcome == "lost" for g in found), len(found)
+            ),
+            "ahead_at_cap_share": share(sum(g.margin > 0 for g in cap), len(found)),
+            "median_cap_margin": statistics.median(g.margin for g in cap) if cap else None,
+            "median_wall_s": statistics.median(walls) if walls else None,
+        }
+    return out
+
+
+def step_e4_check(ctx: Ctx) -> Outcome:
+    """Do E3's adapter and v0 play the long games: E3's adapter is copied into this root as version 1 and plays beside
+    v0 on identical 30-minute starts. Gates: every panel finishes, and v0 has enough cap-ended games to measure the
+    margin scale E4's reward uses (reported in the detail, with each panel per opponent and the paired comparison)."""
+    cfg = ctx.cfg("e4_check")
+    version, source = e3_adapter(ctx)
+    copy = seed_adapter(source, cfg.root, E4_INIT_VERSION)
+    ctx.say(f"e4_check: E3's v{version} ({source}) is v{E4_INIT_VERSION} in {cfg.root}")
+    ctx.train_run(ctx.configs.file("e4_check"), ["--play-only"], label="play-only run")
+    base, e3 = (panel_games(cfg.root / "panels" / name) for name in E4_CHECK_PANELS)
+    pooled = G.pooled_margin_sd(base)
+    gates = [
+        *panel_gates(cfg.root, E4_CHECK_PANELS, PANEL_FINISHED_SHARE),
+        G.Gate(
+            f"cap-ended games of {E4_CHECK_PANELS[0]}",
+            float(pooled["cap_games"]),
+            ">=",
+            float(E4_MIN_CAP_GAMES),
+            "the margin scale's sample",
+        ),
+    ]
+    detail: dict[str, Any] = {
+        "adapter": {"source": str(source), "source_version": version, "copy": str(copy)},
+        "panels": {name: panel_report(g) for name, g in zip(E4_CHECK_PANELS, (base, e3), strict=True)},
+        "margin": pooled,
+        "paired_e3_vs_base": G.paired_margin_test(e3, base),
+    }
+    if pooled["sd"] is not None and pooled["cap_games"] >= E4_MIN_CAP_GAMES:
+        low, high = E4_SCALE_RANGE
+        detail["margin_scale"] = min(max(float(pooled["sd"]), low), high)
+    return Outcome(gates, detail)
+
+
+def e4_margin_scale(ctx: Ctx) -> float:
+    """The margin scale E4's check measured, or a step failure when it measured none."""
+    scale = ((ctx.record.data["steps"].get("e4_check") or {}).get("detail") or {}).get("margin_scale")
+    if not scale:
+        raise StepFailed("e4_check recorded no margin_scale: E4's reward has no scale to take")
+    return float(scale)
+
+
+def render_e4(ctx: Ctx, scale: float) -> Path:
+    """e4.toml with its [credit] margin_scale replaced by the check's, in ROOT/s2/generated/."""
+    text, n = re.subn(
+        r"^(margin_scale\s*=\s*)[0-9.eE+-]+", lambda m: f"{m.group(1)}{scale:.1f}", ctx.configs.file("e4").read_text(),
+        count=1, flags=re.M,
+    )  # fmt: skip
+    if n != 1:
+        raise StepFailed("the e4 config has no margin_scale line to set")
+    out = ctx.s2 / "generated" / "e4.toml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    return out
+
+
+def e4_flags(ctx: Ctx) -> list[str]:
+    """E3's learner flags, started from the init adapter published as version 1 in E4's root. No --anchor: with
+    anchor_beta0 0 the learner does not load an anchor, whatever it names."""
+    s, root = ctx.settings["e4"], ctx.cfg("e4").root
+    base = e2_baseline_flags(ctx, "e4") if s["baseline_config"] else baseline_flags(ctx)
+    init = ["--init", str(root / "adapters" / f"v{E4_INIT_VERSION}"), "--start-version", str(E4_INIT_VERSION)]
+    return [*base, *learner_flags(s), *e3_learner_flags(s), *init]
+
+
+def step_e4(ctx: Ctx) -> Outcome:
+    s, cfg = ctx.settings["e4"], ctx.cfg("e4")
+    scale, weight = e4_margin_scale(ctx), float(cfg.credit["cap_weight"])
+    seed_adapter(e3_adapter(ctx)[1], cfg.root, E4_INIT_VERSION)
+    rendered = render_e4(ctx, scale)
+    ctx.train_run(rendered, e4_flags(ctx), label="rl run")
+    final, start = (panel_games(cfg.root / "panels" / name, scale, weight) for name in reversed(E4_END_PANELS))
+    paired, paired_detail = G.paired_reward_gate(final, start, max_p=float(s["max_p"]))
+    _, slope = G.in_run_slope_gate(training_games(cfg.root / "games", scale, weight))
+    check_base = panel_games(ctx.cfg("e4_check").root / "panels" / E4_CHECK_PANELS[0], scale, weight)
+    updates, trips = updates_in(cfg.root / "health.jsonl"), trips_in(cfg.root / "health.jsonl")
+    gates = [
+        G.Gate("learner updates", float(updates), ">=", float(s["min_updates"])),
+        paired,
+        G.Gate("tripwire trips", float(trips), "<=", 0.0),
+        ended_normally(cfg.root, ("complete",)),
+    ]
+    detail = {
+        "margin_scale": scale,
+        "cap_weight": weight,
+        "paired": paired_detail,
+        "paired_margin": G.paired_margin_test(final, start),
+        "final_vs_check_base": G.paired_reward_gate(final, check_base)[1],
+        "slope": slope,
+        "panels": {name: panel_report(g) for name, g in zip(E4_END_PANELS, (start, final), strict=True)},
+        "updates": updates,
+        "trips": trips,
+    }
+    return Outcome(gates, detail)
 
 
 # ---- baselines, calibration and distillation -----------------------------------------------------
@@ -1276,6 +1518,8 @@ STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
     "e2": step_e2,
     "e3_check": step_e3_check,
     "e3": step_e3,
+    "e4_check": step_e4_check,
+    "e4": step_e4,
     "labels": step_labels,
     "sft": step_sft,
     "sft_panels": step_sft_panels,

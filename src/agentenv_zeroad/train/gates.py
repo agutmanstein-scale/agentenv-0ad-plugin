@@ -13,6 +13,9 @@ records each verdict in ROOT/s2/gates.json. They are separate so each rule can b
   margin against v0's on the same starts, game by game (Wilcoxon signed-rank, one-sided, p under 0.05). The training
   games' reward regressed on the policy version, with an interval that resamples starts (not games). And the check's
   null: two panels of v0 on the same starts must not differ.
+- `paired_reward_gate`, `pooled_margin_sd`: E4. The same paired test on each game's R (conquest +-1, a cap game's by the
+  cap rule with its weight) between the final adapter and the one the run started from, and the margin scale s of
+  E4's reward measured on the check's panel of the start policy.
 - `init_decision`: whether Run 1 starts from the distilled adapter or from the base model, by the rule written in
   advance: the chosen SFT checkpoint beats v0 on the same held-out configs at one-sided p under 0.05 on the
   opponent-stratified panel test (`stats.panel_test`).
@@ -24,7 +27,7 @@ import math
 import random
 import re
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from statistics import NormalDist
 from typing import Any
@@ -220,10 +223,16 @@ def init_decision(
 @dataclass(frozen=True)
 class PanelGame:
     """One finished panel game: its start (what two panels on identical starts share) and the policy seat's final
-    net-worth margin over its opponent."""
+    net-worth margin over its opponent. The rest is read for reports: the opponent's id, how the game ended, the policy
+    seat's outcome, its wall seconds and, when the reader was given a margin scale, its R."""
 
     start: str
     margin: float
+    opponent: str = ""
+    ended_by: str = ""
+    outcome: str = ""
+    wall_s: float | None = None
+    reward: float | None = None
 
 
 @dataclass(frozen=True)
@@ -236,8 +245,12 @@ class TrainingGame:
     reward: float
 
 
-def panel_game(results: Mapping[str, Any]) -> PanelGame | None:
-    """The panel game of a results.json, None when it did not finish or has no margin to read."""
+def panel_game(
+    results: Mapping[str, Any], margin_scale: float | None = None, cap_weight: float = 1.0
+) -> PanelGame | None:
+    """The panel game of a results.json, None when it did not finish or has no margin to read. With a `margin_scale` the
+    game also carries its R (conquest +-1, a cap game's by the cap rule at that scale and `cap_weight`), a game that
+    ended by conquest with no margin to read is kept with margin 0, and one whose R cannot be read is None."""
     if results.get("status") != "finished" or len(results.get("seats") or {}) != 2:
         return None
     slot = rs.policy_slot(results, None)
@@ -245,11 +258,31 @@ def panel_game(results: Mapping[str, Any]) -> PanelGame | None:
     if slot is None or opp is None:
         return None
     margin, _ = rs.final_margin(results, slot, opp)
-    return None if margin is None else PanelGame(group_of(results), margin)
+    reward = None
+    if margin_scale is not None:
+        try:
+            reward = game_reward(results, slot, margin_scale, cap_weight)
+        except CreditError:
+            return None
+        if margin is None and results.get("ended_by") == "conquest":
+            margin = 0.0
+    if margin is None:
+        return None
+    wall = results.get("wall_s")
+    return PanelGame(
+        group_of(results),
+        margin,
+        rs.player_id(results, opp),
+        str(results.get("ended_by") or ""),
+        str((results["seats"][slot] or {}).get("outcome") or ""),
+        None if wall is None else float(wall),
+        reward,
+    )
 
 
-def training_game(results: Mapping[str, Any], margin_scale: float) -> TrainingGame | None:
-    """The training game of a results.json with its R at `margin_scale`, None when it was not a finished conquest or
+def training_game(results: Mapping[str, Any], margin_scale: float, cap_weight: float = 1.0) -> TrainingGame | None:
+    """The training game of a results.json with its R at `margin_scale` and `cap_weight`, None when it was not a
+    finished conquest or
     cap game, has no game number in its id, or its results contradict themselves."""
     if results.get("status") != "finished" or len(results.get("seats") or {}) != 2:
         return None
@@ -261,7 +294,7 @@ def training_game(results: Mapping[str, Any], margin_scale: float) -> TrainingGa
     if slot is None or version is None or found is None:
         return None
     try:
-        reward = game_reward(results, slot, margin_scale)
+        reward = game_reward(results, slot, margin_scale, cap_weight)
     except CreditError:
         return None
     return TrainingGame(int(found.group(1)), version, group_of(results), reward)
@@ -295,11 +328,21 @@ def wilcoxon_greater(differences: Sequence[float]) -> dict[str, Any]:
     return out
 
 
-def _by_start(games: Sequence[PanelGame]) -> dict[str, float]:
-    """A panel's margin per start (the mean when a start was played more than once)."""
+def _margin(game: PanelGame) -> float:
+    return game.margin
+
+
+def _reward(game: PanelGame) -> float:
+    if game.reward is None:
+        raise ValueError(f"panel game {game.start} has no R: read it with a margin scale")
+    return game.reward
+
+
+def _by_start(games: Sequence[PanelGame], value: Callable[[PanelGame], float] = _margin) -> dict[str, float]:
+    """A panel's value (the margin unless given) per start (the mean when a start was played more than once)."""
     grouped: dict[str, list[float]] = {}
     for g in games:
-        grouped.setdefault(g.start, []).append(g.margin)
+        grouped.setdefault(g.start, []).append(value(g))
     return {start: statistics.fmean(v) for start, v in grouped.items()}
 
 
@@ -316,15 +359,18 @@ def paired_margin_test(
     *,
     resamples: int = BOOTSTRAP_RESAMPLES,
     seed: int = 0,
+    value: Callable[[PanelGame], float] = _margin,
 ) -> dict[str, Any]:
-    """The numbers of a paired comparison: games paired by start, the paired differences in final net-worth margin
-    (final less v0) under a one-sided Wilcoxon signed-rank test, their median, and each arm's share of games ending
-    ahead (margin above zero) with the difference of the shares and its bootstrap 95% interval over pairs."""
-    a, b = _by_start(final_games), _by_start(v0_games)
+    """The numbers of a paired comparison: games paired by start, the paired differences in `value` of a game (its final
+    net-worth margin unless given; final less v0) under a one-sided Wilcoxon signed-rank test, their median, and each
+    arm's share of games ending ahead (net-worth margin above zero) with the difference of the shares and its
+    bootstrap 95% interval over pairs."""
+    a, b = _by_start(final_games, value), _by_start(v0_games, value)
     starts = sorted(set(a) & set(b))
     diffs = [a[s] - b[s] for s in starts]
     test = wilcoxon_greater(diffs)
-    ahead_a, ahead_b = [a[s] > 0 for s in starts], [b[s] > 0 for s in starts]
+    margins_a, margins_b = _by_start(final_games), _by_start(v0_games)
+    ahead_a, ahead_b = [margins_a[s] > 0 for s in starts], [margins_b[s] > 0 for s in starts]
     n = len(starts)
     share_a = sum(ahead_a) / n if n else None
     share_b = sum(ahead_b) / n if n else None
@@ -357,14 +403,51 @@ def paired_margin_gate(
     max_p: float = PAIRED_MAX_P,
     resamples: int = BOOTSTRAP_RESAMPLES,
     seed: int = 0,
+    value: Callable[[PanelGame], float] = _margin,
+    what: str = "net-worth margin",
+    digits: int = 0,
 ) -> tuple[Gate, dict[str, Any]]:
     """E3's end-of-run verdict: the final adapter beats v0 on the same starts, by net-worth margin at the end of the
-    game, one-sided Wilcoxon signed-rank p under `max_p`. The cap-win shares are reported, not gated."""
-    detail = paired_margin_test(final_games, v0_games, resamples=resamples, seed=seed)
+    game (or by `value` of a game, named `what`), one-sided Wilcoxon signed-rank p under `max_p`. The cap-win shares are
+    reported, not gated."""
+    detail = paired_margin_test(final_games, v0_games, resamples=resamples, seed=seed, value=value)
     median = detail["median_difference"]
-    note = f"{detail['n_pairs']} pairs" + ("" if median is None else f", median paired difference {median:+.0f}")
-    name = "final beats v0 on the paired net-worth margin (Wilcoxon signed-rank, one-sided p)"
+    note = f"{detail['n_pairs']} pairs" + ("" if median is None else f", median paired difference {median:+.{digits}f}")
+    name = f"final beats v0 on the paired {what} (Wilcoxon signed-rank, one-sided p)"
     return Gate(name, detail["p"], "<", max_p, note), detail
+
+
+def paired_reward_gate(
+    final_games: Sequence[PanelGame],
+    start_games: Sequence[PanelGame],
+    *,
+    max_p: float = PAIRED_MAX_P,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+    seed: int = 0,
+) -> tuple[Gate, dict[str, Any]]:
+    """E4's end-of-run verdict: the final adapter beats the adapter the run started from on the same starts, by R (the
+    games must be read with a margin scale), one-sided Wilcoxon signed-rank p under `max_p`."""
+    gate, detail = paired_margin_gate(
+        final_games, start_games, max_p=max_p, resamples=resamples, seed=seed, value=_reward, what="R", digits=3
+    )
+    return Gate(gate.name.replace("final beats v0", "final beats the start"), gate.value, "<", max_p, gate.note), detail
+
+
+def pooled_margin_sd(games: Sequence[PanelGame]) -> dict[str, Any]:
+    """The within-opponent SD of the final net-worth margins of the games that ended at a cap, pooled over opponents
+    (sum of squares about each opponent's mean over the degrees of freedom): the s of E4's tanh(m / s)."""
+    by_opponent: dict[str, list[float]] = {}
+    for g in games:
+        if g.ended_by in rs.CAP_ENDS:
+            by_opponent.setdefault(g.opponent, []).append(g.margin)
+    n = sum(len(v) for v in by_opponent.values())
+    squares = sum(sum((x - statistics.fmean(v)) ** 2 for x in v) for v in by_opponent.values())
+    dof = n - len(by_opponent)
+    return {
+        "cap_games": n,
+        "opponents": {k: len(v) for k, v in sorted(by_opponent.items())},
+        "sd": math.sqrt(squares / dof) if dof > 0 else None,
+    }
 
 
 def null_pair_gate(
