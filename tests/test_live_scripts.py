@@ -2282,6 +2282,53 @@ def test_the_learner_only_modes_start_the_learner_in_sft_or_probe_mode_and_no_or
     assert refused.returncode != 0 and "--grad-norm needs trip or alarm" in refused.stderr + refused.stdout
 
 
+def test_the_box_train_run_passes_the_lean_learner_flags_and_the_bench_mode_through(stubs):
+    run1 = str(S2_DIR / "run1.toml")
+    flags = (
+        "--anchor-beta0", "0", "--warmup-updates", "5", "--decisions-per-update", "128", "--kl-check-fraction", "0.25",
+        "--probe-rows", "64", "--full-prox", "--whole-groups",
+    )  # fmt: skip
+    out = run_box(stubs, "train-run.sh", run1, *flags, DRY_RUN="1")
+    assert out.returncode == 0, out.stderr
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert " ".join(flags) in learner and "--bench" not in learner
+    plain = run_box(stubs, "train-run.sh", run1, DRY_RUN="1").stdout
+    assert not any(f in plain for f in ("--full-prox", "--whole-groups", "--probe-rows", "--anchor-beta0"))
+    out = run_box(
+        stubs, "train-run.sh", run1, "--init", "/x/a", "--full-prox", "--bench", "/x/train/rows",
+        "--bench-updates", "3", DRY_RUN="1",
+    )  # fmt: skip
+    [learner] = [
+        line for line in out.stdout.replace("\\", "").splitlines() if "docker run -d --name zeroad-learner" in line
+    ]
+    assert (
+        "--bench /x/train/rows --bench-updates 3" in learner and "--full-prox" in learner and "--init /x/a" in learner
+    )
+    assert "orchestrate run" not in out.stdout and "bench.json" in out.stdout
+    out = run_box(stubs, "train-run.sh", run1, "--bench", "/x/train/rows", DRY_RUN="1")
+    assert "--bench /x/train/rows --bench-updates 5" in out.stdout.replace("\\", "")
+    for bad in (
+        ("--anchor-beta0", "lots"),
+        ("--kl-check-fraction", "0"),
+        ("--kl-check-fraction", "1.5"),
+        ("--kl-check-fraction", "fast"),
+        ("--probe-rows", "-1"),
+        ("--warmup-updates", "0"),
+        ("--decisions-per-update", "many"),
+        ("--bench", "bad path"),
+        ("--bench-updates", "3"),
+        ("--bench", "/x/y", "--bench-updates", "0"),
+        ("--bench", "/x/y", "--play-only"),
+        ("--bench", "/x/y", "--stats-only", "/x/z"),
+        ("--bench", "/x/y", "--sft", "2"),
+    ):
+        assert run_box(stubs, "train-run.sh", run1, *bad, DRY_RUN="1").returncode != 0, bad
+    for good in ("1", "0.5", "0.25", "1.0", ".5"):
+        assert run_box(stubs, "train-run.sh", run1, "--kl-check-fraction", good, DRY_RUN="1").returncode == 0, good
+
+
 def run_learner_only(stubs, *args, writes: bool, ps: str = ""):
     """train-run.sh for real against a docker that (maybe) writes the learner's result file when it is started."""
     state = stubs["tmp"] / "state"
