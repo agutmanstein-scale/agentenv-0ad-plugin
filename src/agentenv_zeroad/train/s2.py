@@ -869,7 +869,7 @@ def run_bench(ctx: Ctx, kind: str, flags: Sequence[str]) -> dict[str, Any]:
         f"{kind} bench",
     )
     result = read_json(load_config(config).root / "bench.json") or {}
-    return {"exit": rc, "seconds_per_row": result.get("seconds_per_row"), "bench": result}
+    return {"exit": rc, "seconds_per_row": result.get("mean_seconds_per_row"), "bench": result}
 
 
 def step_e3_check(ctx: Ctx) -> Outcome:

@@ -1576,7 +1576,7 @@ def e3_check_world(ctx, *, pair_shift=0.0, finished=60, bench=None):
         root = S.load_config(Path(argv[argv.index("--bench") - 1])).root
         kind = "e2" if "-bench-e2" in str(root) else "e3"
         root.mkdir(parents=True, exist_ok=True)
-        (root / "bench.json").write_text(json.dumps({"seconds_per_row": bench[kind], "updates": 3}))
+        (root / "bench.json").write_text(json.dumps({"mean_seconds_per_row": bench[kind], "updates": []}))
         return 0
 
     return {"e3-check.toml --play-only": play, "--bench": run_bench}
