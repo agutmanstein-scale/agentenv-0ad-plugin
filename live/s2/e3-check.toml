@@ -5,7 +5,7 @@
 run_id = "s2-e3-check"
 root = "/var/lib/zeroad-live/train/s2/e3-check"
 duration_hours = 1.0         # 180 games at about 490 an hour: 0.4 h; stop_when_done ends it sooner
-budget_usd = 700             # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+budget_usd = 715             # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
 box_usd_per_hour = 10.49     # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
 shutdown = false             # the sequence powers the box off itself, once, after the final upload
 panels_only = true

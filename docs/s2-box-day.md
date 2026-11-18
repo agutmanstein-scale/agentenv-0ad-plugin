@@ -56,7 +56,8 @@ runs the distillation steps only; Run 1 is decided on the SFT panels' results.
 ### E3 and its check
 
 Why E3 is not another E2 is in `docs/s2-e2-results.md`. Two steps follow E2 in `sequence.toml`. The shipped `[sequence]`
-table accepts E2's recorded failure (`accept_failed = ["e2"]`, so E2 does not run again) and has `stop_after = "e3_check"`.
+table accepts E2's recorded failure (`accept_failed = ["e2"]`, so E2 does not run again) and has `stop_after = "e3"`:
+the check and E3 run in one session, and a failed check stops the sequence before E3.
 
 **The check** (`e3_check`, 1.0 h) plays no training game. It plays v0 only: a 60-game Petra-3 panel, and `pair-a` and
 `pair-b`, v0 twice on the same 60 starts (the first 60 of E3's end panels: same seed, held-out positions, civs and sides).
@@ -85,10 +86,9 @@ Wilcoxon signed-rank, p under 0.05) and `gates.in_run_slope_gate` (the training 
 game-number order, the 95% interval from a bootstrap that resamples starts; the lower bound must be above 0). The cap-win
 shares (games ending ahead) and their difference, with a bootstrap interval over pairs, are reported and not gated.
 
-**To resume.** The check first: `live/s2.sh ID start live/s2 --yes` with `stop_after = "e3_check"`. When it has passed,
-change `stop_after` to `"e3"` in `live/s2/sequence.toml` and start again with `--resume`: the passed steps are skipped and E2
-stays accepted. An E3 that was cut off and resumed keeps its run clock, replays its unfinished panel games from the panels'
-`games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $700 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
+**To start or resume.** `live/s2.sh ID start live/s2 --resume --yes`: the passed steps are skipped and E2 stays accepted. To
+look at the check before E3, set `stop_after = "e3_check"` first and change it back to `"e3"` for the second start. An E3 that was cut off and resumed keeps its run clock, replays its unfinished panel games from the panels'
+`games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $715 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
 `LIVE_MAX_HOURS` in `s2.env.example` is 31 for the whole sequence; set the box's own `live/s2.env` to match before starting.
 
 ### Why the tripwire baseline sits between the baselines and E2
@@ -131,7 +131,7 @@ panels), credited with Run 1's `[credit]` settings and no critic.
 1. `cp live/s2.env.example live/s2.env` (git-ignored) and fill in the AWS profile, account, subnets, security group,
    instance profile (needs SSM), bucket and owner tag, and the LiteLLM URL, as for `live/train.env`. The rest is set:
    `g6e.12xlarge` then `g6e.24xlarge` at $10.49 and $15.07 an hour, `LIVE_REQUIRE_RATE=1`, stop-not-terminate,
-   `LIVE_MAX_HOURS=31`, `LIVE_BUDGET_USD=700`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
+   `LIVE_MAX_HOURS=31`, `LIVE_BUDGET_USD=715`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
    every `live/s2/*.toml` to 15.07 first (`s2.sh start` refuses a mismatch) and expect about a third more box cost.
 2. Copy `live/s2` somewhere to edit, or edit it in place: nothing in it is a secret. Check the three frontier model names
    in `baselines.toml` and `run1.toml` (`anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5`, `openai/gpt-6-astra`)
@@ -239,7 +239,7 @@ still up after `s2.sh stop`. Remove the LiteLLM key from SSM when no more runs n
 
 About $343 if every step takes its expected time, at the planning prices. On the first box day (6 Nov) frontier games cost
 about $2.5-3.5 each and an Opus label about $0.036, so the frontier spend is nearer $275 than $130 and the day about
-$490 at the on-demand box rate; `LIVE_BUDGET_USD=700`. The design's S2 + S3 line was about $290
+$490 at the on-demand box rate; `LIVE_BUDGET_USD=715`. The design's S2 + S3 line was about $290
 ($157 + $131). This sequence costs more because it adds the E2 positive control's two hours (the design counted E2 inside
 the 6.5 h), the SFT panels (two epochs of 192 games, then the chosen epoch's other 192: 0.7 h, $7 more than the 1.4 h
 that two epochs alone took), the tripwire baseline (0.3 h), the 6 extra calibration games and the bootstrap hour. The
@@ -250,7 +250,7 @@ steps ran long is stopped by that check (with the guard's words in `gates.json`)
 The check before Run 1 is the tight one. It adds what the box and the ledger have spent (10.0 h of box and the bootstrap
 at $10.49 is $105, plus about $104 of frontier spend: the calibration, the frontier panel and the labels) to Run 1's
 11 h cap ($115) and its $30 of spend caps: about $354 at the expected pace. At $350 the sequence would stop at Run 1's
-start with "the budget guard refuses it", so the budget is $700 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
+start with "the budget guard refuses it", so the budget is $715 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
 which `s2.sh start` requires to be at or under it): room for steps that run long, and still a stop for a runaway box.
 
 ## Uncertain until the first run

@@ -14,7 +14,7 @@ uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json
 
 [sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
 accept_failed = ["e2"]     # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
-stop_after = "e3_check"    # 17 Nov: the check first; "e3" for the run itself
+stop_after = "e3"          # 17 Nov: the check, then E3 in the same session; a failed check stops it before E3
 
 [e1]                       # GPU gates
 config = "e1.toml"

@@ -395,14 +395,14 @@ def step_stubs(monkeypatch, verdicts: dict[str, bool], order: list[str]):
 
 
 def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tmp_path):
-    S.check_dir(LIVE_S2, 700)  # as shipped, with this run's [sequence] calls
-    numbers = S.check_dir(make_config_dir(tmp_path), 700)  # the whole plan
+    S.check_dir(LIVE_S2, 715)  # as shipped, with this run's [sequence] calls
+    numbers = S.check_dir(make_config_dir(tmp_path), 715)  # the whole plan
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 10
     assert 28 <= numbers["expected_hours"] <= 29 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
-    assert cost < 700
+    assert cost < 715
 
 
 @pytest.mark.parametrize(
@@ -410,7 +410,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tm
     [("e2.toml", "positive_control = true", "positive_control = false", "positive_control must be true"),
      ("run1.toml", "shutdown = false", "shutdown = true", "shutdown must be false"),
      ("run1.toml", "box_usd_per_hour = 10.49", "box_usd_per_hour = 15.07", "different box rates"),
-     ("e1.toml", "budget_usd = 700", "budget_usd = 750", "above the stage budget"),
+     ("e1.toml", "budget_usd = 715", "budget_usd = 750", "above the stage budget"),
      ("run1.toml", "duration_hours = 10", "duration_hours = 12", "past its cap_hours"),
      ("baselines.toml", 'uri = "s3://BUCKET/zeroad-train/run/s2-baselines"', "", "s3.uri is required"),
      ("sft-panels.toml", 's2/sft"', 's2/other"', "share one root"),
@@ -425,7 +425,7 @@ def test_a_config_directory_that_would_break_the_sequence_is_refused(tmp_path, f
     assert old in path.read_text(), old
     path.write_text(path.read_text().replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 700)
+        S.check_dir(cdir, 715)
 
 
 def test_every_step_is_recorded_with_its_start_and_end_and_the_next_starts_only_if_the_gate_passed(
@@ -635,7 +635,7 @@ def test_a_resume_expects_the_hours_of_a_pending_rerun_but_not_of_one_already_re
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" not in S.resumed_steps(settings, s2)
     pending = float(settings["e2"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
-    assert S.check_dir(cdir, 700, s2)["expected_hours"] == pytest.approx(pending)
+    assert S.check_dir(cdir, 715, s2)["expected_hours"] == pytest.approx(pending)
     steps["e2"] = {"status": "accepted", "earlier": [{"status": "accepted"}]}
     (s2 / "gates.json").write_text(json.dumps({"verdict": "stopped", "steps": steps}))
     assert "e2" in S.resumed_steps(settings, s2)  # the rerun is on record
@@ -666,9 +666,9 @@ def test_stop_after_ends_the_sequence_after_that_step_on_every_resume_until_it_i
 
 
 def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(tmp_path):
-    whole = S.check_dir(make_config_dir(tmp_path / "a"), 700)
+    whole = S.check_dir(make_config_dir(tmp_path / "a"), 715)
     cdir = make_config_dir(tmp_path / "b", 'stop_after = "sft_panels"')
-    part, settings = S.check_dir(cdir, 700), S.load_settings(cdir / "sequence.toml")
+    part, settings = S.check_dir(cdir, 715), S.load_settings(cdir / "sequence.toml")
     assert part["expected_hours"] == pytest.approx(whole["expected_hours"] - float(settings["run1"]["expected_hours"]))
     assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
 
@@ -683,11 +683,11 @@ def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
     (s2 / "gates.json").write_text(
         json.dumps({"verdict": "stopped", "steps": {k: {"status": v} for k, v in status.items()}})
     )
-    left = S.check_dir(cdir, 700, s2)["expected_hours"]
+    left = S.check_dir(cdir, 715, s2)["expected_hours"]
     assert left == pytest.approx(
         float(settings["sft"]["expected_hours"]) + float(settings["sft_panels"]["expected_hours"])
     )
-    assert S.check_dir(cdir, 700, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 700)["expected_hours"]
+    assert S.check_dir(cdir, 715, tmp_path / "none")["expected_hours"] == S.check_dir(cdir, 715)["expected_hours"]
 
 
 @pytest.mark.parametrize(
@@ -983,7 +983,7 @@ def test_a_config_dir_whose_e2_baseline_run_has_panels_or_shares_e2s_root_is_ref
     assert edit[0] in path.read_text()
     path.write_text(path.read_text().replace(edit[0], edit[1]))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 700)
+        S.check_dir(cdir, 715)
 
 
 def test_e2_counts_only_trained_games_for_the_policy_and_only_v0s_for_the_control(tmp_path):
@@ -1699,11 +1699,11 @@ def test_e3_fails_on_each_gate_that_misses_and_names_it(tmp_path, world, failed)
     assert not out.passed and failed in out.why()
 
 
-def test_the_two_new_steps_follow_e2_and_the_shipped_sequence_stops_after_the_check_without_rerunning_e2(tmp_path):
+def test_the_two_new_steps_follow_e2_and_the_shipped_sequence_runs_both_without_rerunning_e2(tmp_path):
     steps = list(S.STEPS)
     assert steps[steps.index("e2") + 1 : steps.index("e2") + 3] == ["e3_check", "e3"] and "labels" in steps[5:]
     settings = S.load_settings(LIVE_S2 / "sequence.toml")
-    assert settings.accept_failed == ("e2",) and settings.rerun == () and settings.stop_after == "e3_check"
+    assert settings.accept_failed == ("e2",) and settings.rerun == () and settings.stop_after == "e3"
     assert settings["e3"]["decisions_per_update"] == 512 and settings["e3"]["whole_groups"] is True
 
 
@@ -1726,4 +1726,4 @@ def test_a_config_directory_whose_e3_would_not_be_a_paired_outcome_run_is_refuse
     assert old in text, old
     path.write_text(text.replace(old, new, 1))
     with pytest.raises(ValueError, match=message):
-        S.check_dir(cdir, 700) if file != "sequence.toml" else S.load_settings(path)
+        S.check_dir(cdir, 715) if file != "sequence.toml" else S.load_settings(path)
