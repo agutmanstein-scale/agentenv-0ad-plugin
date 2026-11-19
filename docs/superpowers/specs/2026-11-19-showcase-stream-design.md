@@ -63,6 +63,9 @@ These would make the stream a failure even if it ran:
     effort and max tokens, and the policy's sampling (`TRAIN_SAMPLING`).
 - **How the existing renderer differs.** It plays in real time (`-rl-realtime`: the engine's frame loop advances the
   game, and model thinking time costs game time). That's a different contest, so it can't be used as is.
+- **The stock rendered engine can't be used either.** Stepped one turn per `/step`, it advances in 200 ms jumps, so
+  units move five times a second (`docs/spike-results.md`). Smooth live play under the lockstep rules needs a new
+  engine patch (decided at planning, see "The box").
 - **How fast each model replies, measured on base's frontier games** (`live/fetched/run1/base-frontier`):
 
   | Model | Median | 90th percentile | 99th percentile | Calls over 5 s |
@@ -208,6 +211,11 @@ The rule is the same for both sides, so it can't favour Qwen.
   - the session runner.
 - **The adapter:** copied from Run 1's S3 folder to the box.
 - **Frontier models:** through the LiteLLM proxy, with the key from SSM as the live stack does.
+- **The engine (decided at planning):** a new patch, `rl-paced-render`, adds `-rl-paced`. The frame loop draws and
+  interpolates, but the game runs a turn only when `/step` allows one. It goes on its own image
+  (`zeroad-engine:0.28-show`), so training's engine is unchanged.
+- **vLLM:** the same image and flags as Run 1's serving (bf16, max context 8192), with a smaller GPU memory share so the
+  renderer fits beside it. Neither the share nor the adapter-slot count changes what the model sees.
 - **Fallback if Xorg or NVENC won't run on the L40S:** the g6.4xlarge (L4) render box the runbook uses. That needs
   vLLM to fit on 24 GB (bf16 weights about 16.4 GB, a shorter context) and the pilot's 40 GB check relaxed for this mode.
   It's allowed only if every prompt in Run 1's frontier games fits the shorter context, so no brief is ever cut.
@@ -222,13 +230,14 @@ The rule is the same for both sides, so it can't favour Qwen.
 
 ### Watching and recording
 
-- **Recording:** every session is recorded by the relay and the per-game MP4s.
+- **Recording:** one broadcast runs for the whole session, intermissions included. The relay records it in one-hour
+  segments, and ffmpeg keeps its own MP4 of the session as a second copy.
 - **Getting it off the box (Claude's call):** before the box powers off, the session runner uploads to
   `s3://$LIVE_BUCKET/zeroad-train/run/showcase-<stamp>/`. Fetching is then an S3 read from the laptop, with no
   restart.
   - **What's uploaded:** the session file, every game's `results.json` and the relay's continuous segments, which
     include the intermissions. A 6-hour session is about 16 GB, and `aws s3 cp` multipart has no 5 GB limit.
-  - **What stays on the box:** the per-game MP4s, which duplicate the segments.
+  - **What stays on the box:** ffmpeg's MP4 of the session, which duplicates the segments.
   - **Permission:** the box uses the instance profile the training box already has (S3 write under
     `zeroad-train/run/`, `train-iam.sh`), so no new IAM is needed. If that profile doesn't fit the live stack's SSM
     reads, a scoped role is an IAM write for the user's go-ahead at launch.
@@ -274,6 +283,7 @@ What each stage must show before the next one starts:
    - the director camera works;
    - the overlay updates;
    - 30 fps;
+   - units move smoothly, not in five jumps a second;
    - the game's result matches its `results.json`.
 
    The spike game also saves its replay, so A2 can be tested on the same game. If the stepped renderer doesn't work,
@@ -310,8 +320,8 @@ shortcut, so it has to pass the same checks:
 - **The paced clock:**
   - where the wall-time floor lives (a `LockstepClock` option is the obvious place);
   - how a hold shows in the overlay's data.
-- **How the rendered engine is stepped:** the engine image and flags for a visual, non-realtime engine driven by
-  `/step`, and whether the director mod needs anything in that mode.
+- **The paced engine patch's C++:** how `-rl-paced` gates the turn manager, and whether the director mod needs
+  anything in that mode.
 - **The overlay server:** where it runs (the session runner serving `overlay_state` for its match, or the env server),
   and how the intermission card replaces the game panels.
 - **A2:** how the replay is rendered (the engine's replay mode and its flags), and how the overlay follows the replay's
