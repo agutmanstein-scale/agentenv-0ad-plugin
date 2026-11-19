@@ -95,6 +95,8 @@ function thinking(seat, elapsed) {
 const sessionRows = table => (table || []).map(r =>
   `<div class="line"><span>vs ${esc(r.opponent)}</span><b>${r.w}-${r.l}${r.d ? "-" + r.d + "D" : ""}${r.nr ? " · " + r.nr + " no result" : ""}</b></div>`).join("");
 
+const droppedLines = ss => ss ? (ss.dropped || []).map(t => `<div class="muted">${esc(t)}</div>`).join("") : "";
+
 // The showcase's blocks are drawn only when the state carries their keys; the env's overlay has none of them.
 function renderShowcase(elapsed) {
   const s = last.series, ss = last.session, im = last.intermission;
@@ -103,7 +105,7 @@ function renderShowcase(elapsed) {
     ? `<div class="line big"><span>${esc(s.policy)}</span><span>vs ${esc(s.opponent ?? "…")}</span></div>
        <div class="line"><span>game ${s.game} · round ${s.round}</span><span>${esc(s.clock)}</span></div>` : "";
   document.getElementById("session").innerHTML = ss
-    ? `<h2>Session</h2>${sessionRows(ss.table)}${ss.no_result_reason ? `<div class="muted">no result: ${esc(ss.no_result_reason)}</div>` : ""}` : "";
+    ? `<h2>Session</h2>${sessionRows(ss.table)}${ss.no_result_reason ? `<div class="muted">no result: ${esc(ss.no_result_reason)}</div>` : ""}${droppedLines(ss)}` : "";
   document.getElementById("hold").textContent = last.hold && !im
     ? `⏸ waiting on ${last.hold.model ?? "a seat"} · ${(last.hold.waited_s + elapsed).toFixed(1)} s` : "";
   document.getElementById("backstory").innerHTML = last.backstory
@@ -111,8 +113,8 @@ function renderShowcase(elapsed) {
   const card = document.getElementById("intermission");
   card.style.display = im ? "" : "none";
   card.innerHTML = im
-    ? `<h2>Between games</h2><div class="big">${esc(im.last.winner)} won · ${esc(im.last.how)}</div>
-       <div>next: ${esc(im.next)}</div>${sessionRows(im.table)}` : "";
+    ? `<h2>Between games</h2><div class="big">${esc(im.last.headline)}</div>
+       <div>next: ${esc(im.next)}</div>${sessionRows(im.table)}${droppedLines(ss)}` : "";
   document.getElementById("seats").style.display = im ? "none" : "flex";
 }
 

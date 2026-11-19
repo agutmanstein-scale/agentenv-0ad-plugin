@@ -92,7 +92,7 @@ def test_hold_line_names_the_model_and_seconds():
 def test_intermission_replaces_panels():
     card = {"last": {"winner": "Qwen", "how": "conquest"}, "next": "Astra", "table": []}
     state = _state(intermission=card, match=_match())
-    assert state["intermission"]["last"] == {"winner": "Qwen", "how": "conquest"}
+    assert state["intermission"]["last"]["headline"] == "Qwen won · conquest"
     assert state["intermission"]["next"] == "Astra"
     assert _state()["intermission"] is None
     state = _state(intermission={"last": {"winner": "Qwen", "how": "conquest"}, "next": "Astra"}, match=None)
@@ -119,6 +119,23 @@ def test_table_rows_in_rotation_order_with_no_result_reason():
         "round": 2,
         "clock": "04:12",
     }
+
+
+def test_dropped_opponent_is_named_under_the_table():
+    state = _state(dropped=["Astra"])
+    assert state["session"]["dropped"] == ["Astra skipped for the rest of the session (2 no-results in a row)"]
+    assert _state()["session"]["dropped"] == []
+
+
+def test_intermission_says_draw_and_no_result_plainly():
+    def line(last):
+        return _state(intermission={"last": last, "next": "Astra"})["intermission"]["last"]["headline"]
+
+    assert line({"result": "draw", "winner": None, "how": "net worth"}) == "Draw · net worth tied at 30:00"
+    assert line({"result": "no_result", "reason": "Astra errors over 10%"}) == "No result · Astra errors over 10%"
+    assert line({"winner": "Qwen", "loser": "Petra-3", "how": "net worth lead at 30:00"}) == (
+        "Qwen beat Petra-3 · net worth lead at 30:00"
+    )
 
 
 def test_replay_label():
@@ -195,9 +212,11 @@ def _render(state: dict) -> dict:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node to run the page's JavaScript")
 def test_page_renders_between_games_with_no_match_and_an_env_state_without_showcase_keys():
-    card = {"last": {"winner": "Qwen", "how": "conquest"}, "next": "Astra"}
-    between = _render(_state(match=None, intermission=card) | {"hold": None})
+    card = {"last": {"winner": "Qwen", "loser": "Opus 5.5", "how": "conquest"}, "next": "Astra"}
+    between = _render(_state(match=None, intermission=card, dropped=["Astra"]) | {"hold": None})
     assert "Between games" in between["intermission"][0] and "Astra" in between["intermission"][0]
+    assert "Qwen beat Opus 5.5 · conquest" in between["intermission"][0]
+    assert "Astra skipped for the rest of the session (2 no-results in a row)" in between["session"][0]
     assert between["seats"][2] == "none" and "RUN 1" in between["backstory"][0]
     assert "QWEN3-8B" in between["series"][0]
 

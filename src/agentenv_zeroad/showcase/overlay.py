@@ -50,6 +50,19 @@ def _latest_no_result_reason(session: SessionView) -> str | None:
     return None
 
 
+def _last_game(last: dict) -> dict:
+    """The last game's card line. `result` is win (default), draw or no_result; a win names `winner`, `loser`, `how`."""
+    result = last.get("result", "win")
+    if result == "draw":
+        headline = "Draw · net worth tied at 30:00"
+    elif result == "no_result":
+        headline = f"No result · {last.get('reason') or 'the game could not be scored'}"
+    else:
+        verb = f"{last['winner']} beat {last['loser']}" if last.get("loser") else f"{last['winner']} won"
+        headline = f"{verb} · {last['how']}"
+    return {**last, "headline": headline}
+
+
 def showcase_state(
     session: SessionView,
     match: Any,
@@ -62,6 +75,7 @@ def showcase_state(
     mode: str,
     played_at: str | None,
     intermission: dict | None,
+    dropped: Sequence[str] = (),
 ) -> dict[str, Any]:
     """`overlay_state(match)` (or nothing without a match) plus the showcase's blocks. Never holds a secret."""
     state: dict[str, Any] = overlay_state(match) if match is not None else {}
@@ -74,10 +88,15 @@ def showcase_state(
         "round": round_no,
         "clock": state.get("clock", "00:00"),
     }
-    state["session"] = {"table": table, "no_result_reason": _latest_no_result_reason(session)}
+    notes = [f"{name} skipped for the rest of the session (2 no-results in a row)" for name in dropped]
+    state["session"] = {"table": table, "no_result_reason": _latest_no_result_reason(session), "dropped": notes}
     state["backstory"] = BACKSTORY
     state["hold"] = hold
-    state["intermission"] = {**intermission, "table": intermission.get("table", table)} if intermission else None
+    state["intermission"] = (
+        {**intermission, "last": _last_game(intermission["last"]), "table": intermission.get("table", table)}
+        if intermission
+        else None
+    )
     label = (played_at or "").removesuffix(" ET")
     state["replay"] = {"played_at": f"{label} ET"} if mode == "replay" and label else None
     return state
