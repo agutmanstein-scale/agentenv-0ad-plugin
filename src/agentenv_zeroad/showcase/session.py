@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import secrets
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -36,7 +38,7 @@ from agentenv_zeroad.showcase.specs import ShowcaseConfig, next_starts, used_see
 from agentenv_zeroad.train.config import PanelConfig, RunConfig
 from agentenv_zeroad.train.game import LockstepMatch, play_game
 from agentenv_zeroad.train.mix import repin
-from agentenv_zeroad.train.panels import UNSET_URL, game_at
+from agentenv_zeroad.train.panels import UNSET_URL, game_at, position
 from agentenv_zeroad.train.spec import GameSpec, SeatSpec
 
 log = logging.getLogger(__name__)
@@ -47,7 +49,11 @@ FRONTIER_SEAT_CAP_USD = 9.0
 PLANNED_GAME_HOURS = 0.75
 ENGINE_FAILURES_IN_A_ROW = 3
 WATCH_EVERY_S = 1.0
+POLICY_FAILURES_IN_A_ROW = 2
 STOPPED_BY_HAND = "stopped by hand"
+CRASHED = "the box or the runner failed"
+NON_RUN_CONFIGS = frozenset({"sequence.toml", "sft-panels.toml"})  # settings and a template, not run configs
+NO_FAILURES = {"policy": 0, "opponent": 0}
 OVERLAY_PORT = 18766
 
 ModelFor = Callable[[SeatSpec, str], StrategistModel]
@@ -74,15 +80,21 @@ class SessionOptions:
 @dataclass(frozen=True)
 class SessionDeps:
     """What the session needs from the box; tests fake them. `budget_ok` is `budget.sh check`, `preflight` returns
-    the problems found (one check per model in the rotation)."""
+    the problems found (one check per model in the rotation, run before every game), `record_spend(what, usd)` books a
+    game's spend estimate in the box ledger `budget.sh check` reads."""
 
     start_engine: Callable[[], Awaitable[RunningEngine]]
     budget_ok: Callable[[float, float], Awaitable[bool]]
     poweroff_left_s: Callable[[], float]
     model_for: ModelFor
     preflight: Callable[[], Awaitable[list[str]]]
+    record_spend: Callable[[str, float], None]
     now: Callable[[], float]
     sleep: Callable[[float], Awaitable[None]]
+
+
+class _Stopped(Exception):
+    """SIGTERM arrived while the engine was starting or the game was being set up."""
 
 
 class _HeldEngine:
@@ -128,18 +140,11 @@ def game_spec(
 
 
 def run_configs(rules_config: Path) -> list[Path]:
-    """The configs beside the rules config whose panels' seeds a showcase start must avoid. Files in the folder that
-    aren't run configs (the sequence's settings, a panels template) don't load alone and are skipped."""
-    found = []
-    for path in sorted(rules_config.parent.glob("*.toml")):
-        try:
-            used_seeds([path])
-        except Exception as e:  # noqa: BLE001 - not a run config
-            log.info("not a run config, its seeds are not read: %s (%s)", path.name, type(e).__name__)
-        else:
-            found.append(path)
+    """The configs beside the rules config whose panels' seeds a showcase start must avoid: every `*.toml` there but
+    `NON_RUN_CONFIGS`. One that fails to load raises later, since a skipped config could let a seen start through."""
+    found = [p for p in sorted(rules_config.parent.glob("*.toml")) if p.name not in NON_RUN_CONFIGS]
     if rules_config not in found:
-        raise ValueError(f"the rules config {rules_config.name} does not load as a run config")
+        raise ValueError(f"the rules config {rules_config.name} is not a run config beside it")
     return found
 
 
@@ -169,6 +174,7 @@ class _Runner:
         self.started_at = 0.0
         self.tools: list[Any] = []
         self.token = ""
+        self.running: RunningEngine | None = None
         self.earlier: set[int] | None = None
 
     async def run(self) -> Session:
@@ -179,6 +185,10 @@ class _Runner:
                 raise ValueError(f"the rotation names {opponent!r}, which is no teacher of panel {self.panel.name}")
         self.tools = await tool_specs()
         self.session.load()
+        self.session.rows = [
+            replace(r, result="no_result", reason=CRASHED, blame="engine") if r.result == "pending" else r
+            for r in self.session.rows
+        ]
         self.session.ended = self.session.ended_why = None
         self.started_at = self.deps.now()
         loop = asyncio.get_running_loop()
@@ -225,6 +235,7 @@ class _Runner:
             mode=self.opts.mode,
             played_at=None,
             intermission=live.intermission,
+            dropped=sorted(self.session.dropped()),
         )
 
     def _end(self, code: str, why: str) -> None:
@@ -232,13 +243,12 @@ class _Runner:
         log.info("session ends: %s (%s)", code, why)
 
     async def _run(self) -> None:
-        problems = await self.deps.preflight()
-        if problems:
-            return self._end("preflight", "; ".join(problems))
         while True:
             opponent = self._next_opponent()
             if opponent is None:
                 return self._end("opponents", "every opponent in the rotation was dropped")
+            if problems := await self.deps.preflight():
+                return self._end("preflight", "; ".join(problems))
             if (refusal := await self._refusal(opponent)) is not None:
                 return self._end(*refusal)
             try:
@@ -251,11 +261,23 @@ class _Runner:
             self.engine_failures = self.engine_failures + 1 if row.blame == "engine" else 0
             if self.engine_failures >= ENGINE_FAILURES_IN_A_ROW:
                 return self._end("engine", f"{self.engine_failures} games in a row failed on the engine")
+            recent = self.session.rows[-POLICY_FAILURES_IN_A_ROW:]
+            if len(recent) == POLICY_FAILURES_IN_A_ROW and all(r.blame == "policy" for r in recent):
+                return self._end("policy", f"{POLICY_FAILURES_IN_A_ROW} games in a row failed on the policy's calls")
 
     def _used(self) -> set[int]:
         if self.earlier is None:
-            self.earlier = used_seeds(run_configs(self.cfg.rules_config))
-        return self.earlier | self.session.seeds()
+            siblings = sorted(self.opts.out.parent.glob("*/session.json"))
+            self.earlier = used_seeds(run_configs(self.cfg.rules_config), siblings)
+        return self.earlier | self.session.seeds() | self._started_here()
+
+    def _started_here(self) -> set[int]:
+        """The seeds of the starts whose game folder exists in this session's folder, whatever became of the game."""
+        found = set()
+        for folder in (self.opts.out / "games").glob(f"{self.panel.name}-*"):
+            if match := re.match(rf"{re.escape(self.panel.name)}-(\d+)-", folder.name):
+                found.add(position(self.run_cfg, "held_out", int(match.group(1))).seed)
+        return found
 
     def _next_opponent(self) -> str | None:
         """The rotation's opponent after the last game's, skipping dropped ones (as the rotation's id, not its name)."""
@@ -293,33 +315,80 @@ class _Runner:
         slot = str(next(n for n, seat in enumerate(spec.seats, 1) if seat.trainable))
         rows = len(self.session.rows)
         self.live = _Live("starting", name, None, None, rows + 1, rows // len(self.names) + 1)
-        running: RunningEngine | None = None
-        try:
-            running = await self.deps.start_engine()
-            await self._show(running)
-            results = await self._play(spec, running)
-        except Exception as e:  # noqa: BLE001 - one game's failure is its no result, not the session's end
-            log.error("game %s failed: %s", spec.game_id, type(e).__name__)
-            results = {
-                "status": "failed",
-                "ended_by": "failed",
-                "detail": f"{type(e).__name__}: ",
-                "spec": spec.to_json(),
-            }
-        row = classify(results, index=self.session.next_index(), opponent=name, policy_slot=slot)
-        if self.stop.is_set():
-            row = replace(row, result="no_result", how=None, reason=STOPPED_BY_HAND, blame=None)
-        self.session.add(row)
+        pending = GameRow(
+            index=self.session.next_index(),
+            game_id=spec.game_id,
+            opponent=name,
+            seed=spec.seed,
+            policy_slot=slot,
+            result="pending",  # type: ignore[arg-type]
+            how=None,
+            reason=None,
+            failed=dict(NO_FAILURES),
+            decisions=dict(NO_FAILURES),
+            played_at=time.time(),
+        )
+        self.session.add(
+            pending
+        )  # claimed before anything starts: a crash leaves this row, so the start isn't replayed
         self.session.save()
-        self.played += 1
+        self.running = None
+        booked = False
         try:
+            results = await self._run_game(spec)
+            row = classify(results, index=pending.index, opponent=name, policy_slot=slot)
+            if self.stop.is_set():
+                row = replace(row, result="no_result", how=None, reason=STOPPED_BY_HAND, blame=None)
+            self.session.rows[-1] = row
+            self.session.save()
+            self.played += 1
+            self._book(spec, results)
+            booked = True
             if not self.stop.is_set():
                 await self._intermission(row)
         finally:
-            if running is not None:
+            if not booked:
+                self._book(spec, None)
+            if self.running is not None:
                 with contextlib.suppress(Exception):
-                    await running.close()
+                    await self.running.close()
         return row
+
+    async def _run_game(self, spec: GameSpec) -> dict[str, Any]:
+        """The game's results; a failure (or a stop before the match began) is a failed game's results."""
+        try:
+            self.running = await self._until_stop(self.deps.start_engine())
+            await self._until_stop(self._show(self.running))
+            return await self._play(spec, self.running)
+        except _Stopped:
+            failure = "stopped"
+        except Exception as e:  # noqa: BLE001 - one game's failure is its no result, not the session's end
+            log.error("game %s failed: %s", spec.game_id, type(e).__name__)
+            failure = type(e).__name__
+        return {"status": "failed", "ended_by": "failed", "detail": f"{failure}: ", "spec": spec.to_json()}
+
+    async def _until_stop(self, work: Awaitable[Any]) -> Any:
+        """`work`'s result, or `_Stopped` (with `work` cancelled) if SIGTERM comes first."""
+        task = asyncio.ensure_future(work)
+        stopper = asyncio.ensure_future(self.stop.wait())
+        try:
+            await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                return task.result()
+            raise _Stopped
+        finally:
+            stopper.cancel()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _book(self, spec: GameSpec, results: dict[str, Any] | None) -> None:
+        """The game's spend into the box ledger: its estimate from the results, or the caps of its frontier seats when
+        there are none (the game failed, or was interrupted), as run-match.sh books a match it can't read."""
+        usd = (results or {}).get("spend_usd_est")
+        if usd is None:
+            usd = self.opts.seat_cap_usd * sum(1 for s in spec.seats if s.kind == "llm" and not s.trainable)
+        self.deps.record_spend(spec.game_id, float(usd))
 
     async def _show(self, running: RunningEngine) -> None:
         if self.broadcast is None:
@@ -348,7 +417,12 @@ class _Runner:
             await asyncio.wait({game, stopper}, return_when=asyncio.FIRST_COMPLETED)
             if not game.done():
                 await self._stop_match(game)
-            return await game
+            try:
+                return await game
+            except asyncio.CancelledError:
+                if self.stop.is_set() and game.cancelled():
+                    raise _Stopped from None
+                raise
         finally:
             for task in (stopper, self.live.watch):
                 if task is not None:
@@ -360,9 +434,10 @@ class _Runner:
         self.live.watch = asyncio.create_task(self._watch_failures(match))
 
     async def _stop_match(self, game: asyncio.Task[dict[str, Any]]) -> None:
-        while self.live.match is None and not game.done():
-            await asyncio.sleep(0.05)
-        if self.live.match is not None:
+        if self.live.match is None:
+            game.cancel()  # still setting up: play_game stops its match and re-raises
+            await asyncio.gather(game, return_exceptions=True)
+        else:
             await self.live.match.stop(STOPPED_BY_HAND)
 
     async def _watch_failures(self, match: LockstepMatch) -> None:
@@ -384,15 +459,21 @@ class _Runner:
                     return
 
     async def _intermission(self, row: GameRow) -> None:
-        last = self.opts.hours * 3600 <= self.deps.now() - self.started_at or (
+        final = self.opts.hours * 3600 <= self.deps.now() - self.started_at or (
             self.opts.max_games is not None and self.played >= self.opts.max_games
         )
         upcoming = self._next_opponent()
-        winner = {"win": "Qwen", "loss": row.opponent}.get(row.result, "Nobody")
+        won, lost = {"win": ("Qwen", row.opponent), "loss": (row.opponent, "Qwen")}.get(row.result, (None, None))
         self.live.match, self.live.phase = None, "intermission"
         self.live.intermission = {
-            "last": {"winner": winner, "how": row.how or row.reason or row.result},
-            "next": "end of session" if last or upcoming is None else display_name(upcoming),
+            "last": {
+                "winner": won,
+                "loser": lost,
+                "how": row.how,
+                "result": row.result if row.result in ("draw", "no_result") else "win",
+                "reason": row.reason,
+            },
+            "next": "end of session" if final or upcoming is None else display_name(upcoming),
             "table": self.session.table(),
         }
         sleeper = asyncio.create_task(self.deps.sleep(self.opts.intermission_s))

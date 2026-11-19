@@ -12,13 +12,16 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from agentenv_zeroad.showcase import session as session_mod
-from agentenv_zeroad.showcase.__main__ import main
+from agentenv_zeroad.showcase.__main__ import _check, main
 from agentenv_zeroad.showcase.results import GameRow, Session
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
+from agentenv_zeroad.train.panels import position
+from agentenv_zeroad.train.spec import SeatSpec
 from tests.fake_models import FakeStrategist
 from tests.zeroad_fakes import Handle, ScriptedEngine, placer
 
@@ -79,6 +82,9 @@ class World:
         self.budget = True
         self.left_s = 1e9
         self.preflight: list[str] = []
+        self.preflights = 0
+        self.policy_fails = False
+        self.spend: list[tuple[str, float]] = []
         self.on_call: Any = None
         self.cap_minutes = cap_minutes
         self.t = 0.0
@@ -92,7 +98,8 @@ class World:
         async def play(*args, **kwargs):
             return await real_play(*args, match_options={"placer": placer()}, **kwargs)
 
-        monkeypatch.setattr(session_mod, "used_seeds", lambda configs, sessions=(): set())
+        real_used = session_mod.used_seeds
+        monkeypatch.setattr(session_mod, "used_seeds", lambda configs, sessions=(): real_used([], sessions))
         monkeypatch.setattr(session_mod, "run_configs", lambda rules: [rules])
         monkeypatch.setattr(session_mod, "game_at", game_at)
         monkeypatch.setattr(session_mod, "play_game", play)
@@ -126,12 +133,15 @@ class World:
             return self.budget
 
         async def preflight() -> list[str]:
+            self.preflights += 1
             return self.preflight
 
         def model_for(seat, slot):
             self.seen.append((seat, slot))
             if seat.trainable:
-                return CountingModel(on_call=self.on_call)
+                return CountingModel(
+                    on_call=self.on_call, fail=RuntimeError("vllm down") if self.policy_fails else None
+                )
             failing = (seat.name or "") in self.failing
             return CountingModel(fail=RuntimeError("proxy down") if failing else None)
 
@@ -141,6 +151,7 @@ class World:
             poweroff_left_s=lambda: self.left_s,
             model_for=model_for,
             preflight=preflight,
+            record_spend=lambda what, usd: self.spend.append((what, usd)),
             now=lambda: self.t,
             sleep=sleep or fake_sleep,
         )
@@ -411,3 +422,114 @@ def test_verify_cli_exits_1_on_a_problem(tmp_path: Path, capsys: pytest.CaptureF
     assert main(["verify", str(tmp_path)]) == 1
     out = capsys.readouterr().out
     assert results["spec"]["game_id"] in out and "landed 5200 ms later, not 5000" in out
+
+
+def test_preflight_runs_before_every_game(world: World) -> None:
+    world.run(world.opts(max_games=2))
+    assert world.preflights >= 2
+
+
+def test_preflight_refuses_a_200_without_the_model_and_a_bad_key() -> None:
+    seat = SeatSpec(kind="llm", civ="rome", model="local/policy-v1", base_url="http://v.invalid/v1", api_key_env="K")
+
+    def check(handler):
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                return await _check(seat, {"K": "secret-key"}, http)
+
+        return asyncio.run(go())
+
+    served = lambda ids: lambda request: httpx.Response(200, json={"data": [{"id": i} for i in ids]})  # noqa: E731
+    assert check(served(["local/policy-v1"])) is None
+    assert "not among the models" in check(served(["local/qwen-base"]))
+    assert check(lambda request: httpx.Response(401)) == "local/policy-v1: HTTP 401"
+    assert "could not be read" in check(lambda request: httpx.Response(200, text="<html>"))
+    assert "secret-key" not in (check(served([])) or "")
+
+
+def test_two_policy_no_results_in_a_row_end_the_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    world = World(tmp_path, monkeypatch, cap_minutes=3.0)
+    world.policy_fails = True
+    session = world.run(world.opts(max_games=6))
+    assert [(r.result, r.blame) for r in session.rows] == [("no_result", "policy")] * 2
+    assert session.ended == "policy"
+
+
+def test_an_interrupted_game_is_a_no_result_and_its_start_is_not_replayed(world: World) -> None:
+    async def interrupted() -> None:
+        task = asyncio.ensure_future(run_session(world.opts(), CFG, world.deps(), None))
+        world.on_call = lambda: asyncio.get_running_loop().call_soon(task.cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(interrupted())
+    saved = json.loads((world.out / "session.json").read_text())
+    assert [r["result"] for r in saved["rows"]] == ["pending"]
+    assert len(world.spend) == 1 and world.spend[0][1] == 9.0  # booked at its caps
+    world.on_call = None
+    again = world.run(world.opts(max_games=1))
+    first, second = again.rows
+    assert (first.result, first.blame, first.reason) == ("no_result", "engine", "the box or the runner failed")
+    assert second.seed != first.seed and second.opponent == "Astra"
+
+
+def test_a_start_with_a_game_folder_is_not_replayed(world: World) -> None:
+    first = world.run(world.opts(max_games=1))
+    (world.out / "session.json").unlink()
+    again = world.run(world.opts(max_games=1))
+    assert again.rows[0].seed != first.rows[0].seed
+
+
+def test_a_sibling_sessions_seed_is_skipped(world: World) -> None:
+    seed = position(CFG.run_config(), "held_out", CFG.first_index).seed
+    sibling = world.out.parent / "earlier"
+    sibling.mkdir(parents=True)
+    (sibling / "session.json").write_text(json.dumps({"rows": [{"seed": seed, "game_id": "x"}], "ended": None}))
+    session = world.run(world.opts(max_games=2))
+    assert seed not in {r.seed for r in session.rows}
+
+
+def test_spend_is_booked_once_per_game(world: World) -> None:
+    session = world.run(world.opts(max_games=2))
+    assert [what for what, _ in world.spend] == [r.game_id for r in session.rows]
+    results = json.loads((world.out / "games" / session.rows[0].game_id / "results.json").read_text())
+    assert world.spend[0][1] == results["spend_usd_est"]
+
+
+def test_an_engine_failed_game_is_booked_at_its_caps(world: World) -> None:
+    async def broken() -> Handle:
+        raise OSError("no display")
+
+    deps = replace(world.deps(), start_engine=broken)
+    asyncio.run(run_session(world.opts(max_games=2, rotation=("opus", "petra-3")), CFG, deps, None))
+    assert [usd for _, usd in world.spend] == [9.0, 0.0]
+
+
+def test_the_overlay_carries_a_no_result_and_the_dropped_opponents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(tmp_path, monkeypatch, cap_minutes=3.0)
+    world.failing = {"astra"}
+    monkeypatch.setattr(session_mod, "OverlayServer", FakeOverlay)
+    shots: list[dict[str, Any]] = []
+
+    async def sleep(seconds: float) -> None:
+        if seconds == 5.0:
+            shots.append(FakeOverlay.last.state())
+            world.t += seconds
+        await asyncio.sleep(0.001)
+
+    deps = world.deps(sleep=sleep)
+    asyncio.run(run_session(world.opts(rotation=("astra",), max_games=2), CFG, deps, FakeBroadcast()))  # type: ignore[arg-type]
+    last = shots[0]["intermission"]["last"]
+    assert (last["result"], last["reason"]) == ("no_result", "Astra, 5 failed calls in a row")
+    assert shots[0]["session"]["dropped"] == []
+    assert len(shots[1]["session"]["dropped"]) == 1 and "Astra" in shots[1]["session"]["dropped"][0]
+
+
+def test_run_refuses_without_a_spend_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("ZEROAD_SPEND_LEDGER", raising=False)
+    assert main(["run", "--out", str(tmp_path / "s")]) == 2
+    assert "ZEROAD_SPEND_LEDGER" in capsys.readouterr().err

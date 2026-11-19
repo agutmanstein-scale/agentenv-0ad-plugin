@@ -29,6 +29,7 @@ from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, base_of
 from agentenv_zeroad.showcase.results import GameRow, verify_lockstep
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, game_spec, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
+from agentenv_zeroad.spend import append_ledger
 from agentenv_zeroad.train.calibration import LITELLM_URL_ENV
 from agentenv_zeroad.train.game import build_model
 from agentenv_zeroad.train.panels import UNSET_URL
@@ -40,7 +41,8 @@ DEFAULT_LIVE_HOME = "/opt/zeroad-live"
 DEADLINE_FILE_ENV = "ZEROAD_DEADLINE_FILE"
 DEFAULT_DEADLINE_FILE = "/etc/zeroad-live/deadline"
 BUDGET_ENV = "LIVE_BUDGET_USD"
-VLLM_URL_ENV = "VLLM_BASE_URL"
+VLLM_URL_ENV = "ZEROAD_VLLM_URL"
+LEDGER_ENV = "ZEROAD_SPEND_LEDGER"
 DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
 READY_TIMEOUT_S = 180.0
 
@@ -70,6 +72,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("replay mode is not built yet", file=sys.stderr)
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request URL at INFO
     return asyncio.run(run_command(args))
 
 
@@ -90,6 +93,10 @@ def verify_dir(directory: Path) -> int:
 
 
 async def run_command(args: argparse.Namespace) -> int:
+    ledger = os.environ.get(LEDGER_ENV)
+    if not ledger:
+        print(f"{LEDGER_ENV} is not set: the session's spend would never reach the box ledger", file=sys.stderr)
+        return 2
     cfg = ShowcaseConfig.load(args.config)
     rotation = tuple(args.rotation.split(",")) if args.rotation else cfg.rotation
     opts = SessionOptions(
@@ -117,6 +124,7 @@ async def run_command(args: argparse.Namespace) -> int:
             poweroff_left_s=poweroff_left_s,
             model_for=lambda seat, slot: build_model(seat, slot, http=http, cap_usd=opts.seat_cap_usd),
             preflight=lambda: preflight_problems(cfg, opts, http),
+            record_spend=lambda what, usd: append_ledger(Path(ledger), what, usd),
             now=time.monotonic,
             sleep=asyncio.sleep,
         )
@@ -168,7 +176,7 @@ def poweroff_left_s() -> float:
 
 
 async def preflight_problems(cfg: ShowcaseConfig, opts: SessionOptions, http: httpx.AsyncClient) -> list[str]:
-    """One check per model in the rotation (and the policy's): its server answers `GET /v1/models` with the seat's key.
+    """One check per model in the rotation (and the policy's): `GET /v1/models` with the seat's key lists the model.
     A model call would spend, and the first game's own calls find anything this misses."""
     seats: dict[str, SeatSpec] = {}
     run_cfg = cfg.run_config()
@@ -181,6 +189,8 @@ async def preflight_problems(cfg: ShowcaseConfig, opts: SessionOptions, http: ht
 
 
 async def _check(seat: SeatSpec, environ: Mapping[str, str], http: httpx.AsyncClient) -> str | None:
+    """None if the server answers with the seat's key and lists the seat's model, else the problem (never the key or
+    the endpoint)."""
     assert seat.base_url and seat.api_key_env
     key = environ.get(seat.api_key_env)
     if not key:
@@ -189,7 +199,13 @@ async def _check(seat: SeatSpec, environ: Mapping[str, str], http: httpx.AsyncCl
         response = await http.get(base_of(seat.base_url) + "/v1/models", headers={"Authorization": f"Bearer {key}"})
     except httpx.HTTPError as e:
         return f"{seat.model}: no answer ({type(e).__name__})"
-    return None if response.status_code == 200 else f"{seat.model}: HTTP {response.status_code}"
+    if response.status_code != 200:
+        return f"{seat.model}: HTTP {response.status_code}"
+    try:
+        served = {str(m["id"]) for m in response.json()["data"]}
+    except (ValueError, KeyError, TypeError):
+        return f"{seat.model}: its model list could not be read"
+    return None if seat.model in served else f"{seat.model}: not among the models the server lists"
 
 
 if __name__ == "__main__":
