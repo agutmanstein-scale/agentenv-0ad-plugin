@@ -2823,7 +2823,14 @@ def test_the_train_and_pilot_bootstraps_start_vllm_with_these_exact_docker_run_l
     plain = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
     assert vllm_run_lines(plain.stdout) == [
         expected_vllm_run(
-            state, "zeroad-vllm", "0\\,1", 8000, 2, "pilot/adapters:/adapters:ro", 12288, "--max-loras 4 --max-cpu-loras 16"
+            state,
+            "zeroad-vllm",
+            "0\\,1",
+            8000,
+            2,
+            "pilot/adapters:/adapters:ro",
+            12288,
+            "--max-loras 4 --max-cpu-loras 16",
         )
     ]
 
@@ -2859,3 +2866,191 @@ def test_the_engine_test_must_pass_with_nothing_skipped_or_the_bootstrap_dies(st
     out = subprocess.run(["bash", "-c", script], env=box_env(stubs), capture_output=True, text=True, timeout=30)
     assert (out.returncode == 0 and "reached" in out.stdout) == ok, (out.stdout, out.stderr)
     assert ok or "ERROR:" in out.stderr
+
+
+SHOWCASE_SCRIPTS = (LIVE / "showcase.sh", BOX / "showcase.sh", BOX / "showcase-run.sh")
+LOOPBACK_RELAY = "rtmp://127.0.0.1:1935/zeroad"
+
+
+def showcase(stubs, *args: str, forbid_aws=True, **extra):
+    return run(showcase_stubs(stubs), "showcase.sh", ID, *args, forbid_aws=forbid_aws, extra=extra)
+
+
+def test_showcase_start_dry_run_prints_the_plan(stubs):
+    out = showcase(stubs, "start", "--hours", "2", "--max-games", "4", "--rotation", "opus,petra-3", "--mode", "live")
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "systemd-run --unit zeroad-showcase" in plan and "box/showcase-run.sh" in plan
+    for arg in ("--hours 2", "--max-games 4", "--rotation opus,petra-3", "--mode live", "--budget 60"):
+        assert arg in plan, arg
+    assert "frontier" in plan  # the guard's sum: 2 h of box at $2.24 plus 2 frontier games' caps
+    assert "bucket-1" not in plan and "bucket-1" not in out.stdout
+    assert not aws_calls(stubs)  # nothing was called: forbid_aws would have made the stub exit 99
+    watch = showcase(stubs, "watch", "--dry-run")
+    assert watch.returncode == 0, watch.stderr
+    assert "AWS-StartPortForwardingSession" in watch.stderr and '"portNumber":["1935"]' in watch.stderr
+    assert LOOPBACK_RELAY in watch.stdout + watch.stderr
+
+
+def test_showcase_start_refuses_over_budget(stubs):
+    out = showcase(stubs, "start", "--hours", "8")  # 8 h at $2.24 and 11 frontier games at $9 pass $60
+    assert out.returncode != 0 and "REFUSED" in out.stderr and "systemd-run" not in out.stderr
+
+
+def test_showcase_start_refuses_short_poweroff(stubs):
+    deadline = stubs["tmp"] / "deadline"
+    deadline.write_text(str(1_800_000_000 + 3 * 3600))
+    env = {"ZEROAD_DEADLINE_FILE": str(deadline), "ZEROAD_NOW_EPOCH": "1800000000"}
+    out = showcase(stubs, "start", "--hours", "3", **env)  # needs 3 h + 1
+    assert out.returncode != 0 and "powers off in 3.00 h" in out.stderr and "extend-poweroff.sh" in out.stderr
+    assert "systemd-run" not in out.stderr
+    deadline.write_text(str(1_800_000_000 + 4 * 3600))
+    ok = showcase(stubs, "start", "--hours", "3", **env)
+    assert ok.returncode == 0 and "systemd-run --unit zeroad-showcase" in ok.stderr
+
+
+def showcase_box(stubs, *args: str, sleeps=False, rules=(), **extra):
+    """Run box/showcase-run.sh for real against stubs: docker, shutdown and aws (which holds the key rule)."""
+    tmp = stubs["tmp"]
+    etc = tmp / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.env").write_text("VLLM_API_KEY=vllm-secret-value\n")
+    seg = tmp / "state" / "rec" / "zeroad"
+    seg.mkdir(parents=True, exist_ok=True)
+    for name in ("2026-11-19_11-59-59-000001.mp4", "2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"):
+        (seg / name).write_text("x")
+    wait = f"while [ ! -e {tmp}/stopped ]; do sleep 0.05; done; " if sleeps else ""
+    write_exe(
+        stubs["bin"] / "docker",
+        f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
+        f'case $1 in run) echo "key=$LITELLM_API_KEY" >> {tmp}/docker.env; {wait}exit 0 ;; '
+        f"stop) touch {tmp}/stopped ;; esac\n",
+    )
+    write_exe(
+        stubs["bin"] / "shutdown",
+        f'#!/bin/sh\necho \'{{"argv": ["shutdown", "\'"$*"\'"]}}\' >> {stubs["log"]}\n',
+    )
+    all_rules = json.dumps([["ssm get-parameter", SECRET, 0], *rules])
+    return run_box(
+        stubs,
+        "showcase-run.sh",
+        *args,
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_S3_BUCKET="bucket-1",
+        ZEROAD_S3_PREFIX="zeroad-train",
+        STUB_AWS_RULES=all_rules,
+    )
+
+
+def test_showcase_run_uploads_before_shutdown(stubs):
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--hours", "2")
+    assert out.returncode == 0, out.stderr
+    prefix = "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    calls = aws_calls(stubs)
+    cps = [c["argv"] for c in calls if c["argv"][:2] == ["s3", "cp"]]
+    session = stubs["tmp"] / "state" / "showcase" / "showcase-20261119-120000"
+    assert (session / "stamp").read_text().strip() == "20261119-120000"
+    assert any(a[-2:] == [str(session), prefix] and "--recursive" in a for a in cps)
+    videos = sorted(a[-2].rsplit("/", 1)[1] for a in cps if a[-1].startswith(prefix + "video/"))
+    assert videos == ["2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"]  # none from before the start
+    assert calls[-1]["argv"] == ["shutdown", "-h now"], calls[-1]  # the last thing, after every upload
+    docker = (stubs["tmp"] / "docker.log").read_text()
+    assert (
+        "--entrypoint python zeroad-showcase -m agentenv_zeroad.showcase run --out /out" in docker
+        and "--hours 2" in docker
+    )
+    assert "--config live/showcase/showcase.toml" in docker and "--name zeroad-showcase" in docker
+    assert LOOPBACK_RELAY in docker and "--gpus all" in docker and "DISPLAY=:0" in docker
+    assert SECRET not in docker and "vllm-secret-value" not in docker  # the keys travel in the environment only
+    assert f"key={SECRET}" in (stubs["tmp"] / "docker.env").read_text()  # with-model.sh gave the child the key
+    assert "bucket-1" not in out.stdout + out.stderr
+
+
+@pytest.mark.parametrize("how", ["upload fails", "--no-shutdown"])
+def test_showcase_run_no_shutdown_when_upload_fails(stubs, how):
+    failing = [["s3 cp", "", 1]] if how == "upload fails" else []
+    extra = ["--no-shutdown"] if how == "--no-shutdown" else []
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", *extra, rules=failing)
+    calls = aws_calls(stubs)
+    assert [c for c in calls if c["argv"][:2] == ["s3", "cp"]]  # the upload was tried either way
+    assert not [c for c in calls if c["argv"][0] == "shutdown"]
+    assert (out.returncode != 0) == (how == "upload fails")
+    if how == "upload fails":
+        assert "not shutting down" in out.stderr + out.stdout
+
+
+def test_showcase_run_stopped_by_hand_uploads_and_leaves_the_box_up(stubs):
+    import threading
+
+    result = {}
+    thread = threading.Thread(
+        target=lambda: result.update(
+            out=showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--hours", "7.77", sleeps=True)
+        )
+    )
+    thread.start()  # the stub docker waits for `docker stop`; the unit's stop is SIGTERM to the script
+    docker_log = stubs["tmp"] / "docker.log"
+    for _ in range(200):
+        if (stubs["tmp"] / "docker.env").exists():
+            break
+        time.sleep(0.05)
+    pids = subprocess.run(["pgrep", "-f", "showcase-run.sh --budget 60"], capture_output=True, text=True).stdout.split()
+    assert pids
+    os.kill(int(pids[0]), signal.SIGTERM)
+    thread.join(timeout=30)
+    out = result["out"]
+    assert out.returncode == 0, out.stderr
+    assert "docker stop" in docker_log.read_text()
+    calls = aws_calls(stubs)
+    assert any(c["argv"][:2] == ["s3", "cp"] for c in calls)  # the session still uploaded
+    assert not [c for c in calls if c["argv"][0] == "shutdown"]  # and the box stays up
+
+
+def test_showcase_output_redacts_the_bucket(stubs):
+    for args in (("start", "--hours", "1"), ("stop",), ("fetch",), ("watch", "--dry-run"), ("status", "--dry-run")):
+        out = showcase(stubs, *args)
+        assert out.returncode == 0, (args, out.stderr)
+        assert "bucket-1" not in out.stdout + out.stderr, args
+    fetch = showcase(stubs, "fetch")
+    assert "s3://<bucket>/zeroad-train/run/showcase-" in fetch.stderr
+    box = run_box(
+        stubs,
+        "showcase-run.sh",
+        "--budget",
+        "60",
+        "--stamp",
+        "20261119-120000",
+        DRY_RUN="1",
+        ZEROAD_S3_BUCKET="bucket-1",
+    )
+    assert box.returncode == 0, box.stderr
+    assert "bucket-1" not in box.stdout + box.stderr
+    assert "s3://<bucket>/zeroad-train/run/showcase-20261119-120000/" in box.stdout
+
+
+def test_showcase_fetch_reads_the_newest_session_without_video_unless_asked(stubs):
+    fetched = stubs["tmp"] / "fetched"
+    fetched.mkdir()
+    listing = "".join(f"{' ' * 27}PRE showcase-{stamp}/\n" for stamp in ("20261118-090000", "20261119-120000"))
+    rules = [["sts get-caller-identity", "123456789012\n", 0], ["s3 ls", listing, 0]]
+    extra = {"STUB_AWS_RULES": json.dumps(rules), "LIVE_FETCHED_DIR": str(fetched)}
+    out = showcase(stubs, "fetch", "--yes", forbid_aws=False, **extra)
+    assert out.returncode == 0, out.stderr
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    assert sync[3].endswith("showcase-20261119-120000") and "video/*" in sync and "--exclude" in sync
+    assert "bucket-1" not in out.stdout + out.stderr
+    stubs["log"].unlink()
+    showcase(stubs, "fetch", "--with-video", "--yes", forbid_aws=False, **extra)
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert "--exclude" not in sync
+
+
+def test_showcase_never_pushes(stubs):
+    for script in SHOWCASE_SCRIPTS:
+        text = script.read_text()
+        assert "push.sh" not in text and "zeroad-push" not in text, script
+        assert set(re.findall(r"rtmps?://[^\s\"']+", text)) <= {LOOPBACK_RELAY}, script
+    out = showcase(stubs, "start", "--hours", "1")
+    assert "push" not in out.stderr.lower()
+    assert set(re.findall(r"rtmps?://[^\s\"']+", out.stderr)) <= {LOOPBACK_RELAY}
