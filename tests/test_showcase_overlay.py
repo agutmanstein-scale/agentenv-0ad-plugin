@@ -1,11 +1,15 @@
 import json
+import re
+import shutil
 import socket
+import subprocess
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
-from agentenv_zeroad.live import overlay_html
+from agentenv_zeroad.live import overlay_html, overlay_state
 from agentenv_zeroad.showcase.overlay import BACKSTORY, OverlayServer, hold_of, showcase_state
 
 SECRET = "sk-test-secret-value"
@@ -58,7 +62,16 @@ def _session(rows=()):
 
 
 def _state(session=None, match=None, **over):
-    args = dict(phase="playing", game_no=4, round_no=2, hold=None, mode="live", played_at=None, intermission=None)
+    args = dict(
+        phase="playing",
+        opponent="Opus 5.5",
+        game_no=4,
+        round_no=2,
+        hold=None,
+        mode="live",
+        played_at=None,
+        intermission=None,
+    )
     args.update(over)
     return showcase_state(session or _session(), match if match is not None else _match(), **args)
 
@@ -101,7 +114,7 @@ def test_table_rows_in_rotation_order_with_no_result_reason():
     assert _state()["session"]["no_result_reason"] is None
     assert state["series"] == {
         "policy": "QWEN3-8B + 8 h RL",
-        "opponent": "Opus",
+        "opponent": "Opus 5.5",
         "game": 4,
         "round": 2,
         "clock": "04:12",
@@ -154,3 +167,41 @@ def test_page_draws_showcase_blocks_only_when_present():
         assert key in html
     assert "waiting on" in html and "replay · played" in html
     assert '"/state.json"' in html and "esc(seat.say.text)" in html and "thinking…" in html  # env's overlay kept
+
+
+HARNESS = """
+const els = {};
+const el = () => ({innerHTML: "", textContent: "", style: {}});
+const document = {body: {classList: {add() {}, toggle() {}}}, getElementById: id => (els[id] ??= el())};
+const location = {pathname: "/live", search: ""};
+const performance = {now: () => 0};
+const fetch = async () => { throw new Error("no network"); };
+const setInterval = () => 0;
+%s
+last = %s; fetchedAt = 0;
+render();
+const out = Object.entries(els).map(([k, v]) => [k, [v.innerHTML, v.textContent, v.style.display]]);
+console.log(JSON.stringify(Object.fromEntries(out)));
+"""
+
+
+def _render(state: dict) -> dict:
+    script = re.search(r"<script>(.*)</script>", overlay_html(), re.S).group(1)
+    code = HARNESS % (script, json.dumps(state))
+    done = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node to run the page's JavaScript")
+def test_page_renders_between_games_with_no_match_and_an_env_state_without_showcase_keys():
+    card = {"last": {"winner": "Qwen", "how": "conquest"}, "next": "Astra"}
+    between = _render(_state(match=None, intermission=card) | {"hold": None})
+    assert "Between games" in between["intermission"][0] and "Astra" in between["intermission"][0]
+    assert between["seats"][2] == "none" and "RUN 1" in between["backstory"][0]
+    assert "QWEN3-8B" in between["series"][0]
+
+    plain = _render(json.loads(json.dumps(overlay_state(_match()))))
+    assert plain["seats"][0].count('class="seat') == 2 and plain["series"][0] == ""
+    assert plain["backstory"][0] == "" and plain["hold"][1] == "" and plain["intermission"][2] == "none"
+    assert plain["seats"][2] == "flex" and plain["clock"][1] == "04:12"

@@ -118,9 +118,10 @@ function renderShowcase(elapsed) {
 
 function render() {
   if (!last) return;
+  last.seats ??= []; last.scoreboard ??= [];  // no match between games: the showcase blocks still draw
   const elapsed = last.status === "playing" ? (performance.now() - fetchedAt) / 1000 : 0;
   document.body.classList.toggle("compact", last.seats.length > 2);
-  document.getElementById("clock").textContent = clock(last.game_ms + elapsed * 1000);
+  document.getElementById("clock").textContent = clock((last.game_ms ?? 0) + elapsed * 1000);
   document.getElementById("cap").textContent = last.cap ? "/ " + last.cap : "";
   document.getElementById("detail").textContent = last.detail || (last.status === "starting" ? "Starting…" : "");
   document.getElementById("board").innerHTML = last.scoreboard.map((s, i) =>

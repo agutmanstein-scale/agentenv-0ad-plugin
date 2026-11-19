@@ -50,18 +50,12 @@ def _latest_no_result_reason(session: SessionView) -> str | None:
     return None
 
 
-def _opponent(state: dict[str, Any], intermission: dict | None) -> str | None:
-    for seat in state.get("seats", []):
-        if not str(seat["model"]).startswith("local/policy"):
-            return seat["model"]
-    return intermission["next"] if intermission else None
-
-
 def showcase_state(
     session: SessionView,
     match: Any,
     *,
     phase: str,
+    opponent: str,
     game_no: int,
     round_no: int,
     hold: dict | None,
@@ -75,7 +69,7 @@ def showcase_state(
     state["phase"] = phase
     state["series"] = {
         "policy": POLICY_LABEL,
-        "opponent": _opponent(state, intermission),
+        "opponent": opponent,
         "game": game_no,
         "round": round_no,
         "clock": state.get("clock", "00:00"),
