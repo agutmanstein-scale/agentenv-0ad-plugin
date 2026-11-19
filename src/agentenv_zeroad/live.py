@@ -449,6 +449,13 @@ class Broadcast:
         rtmp = " and streaming over RTMP" if s.rtmp_url else ""
         log.info("recording %s %s to 1920x1080, %d fps (%s)%s", self.display, s.layout.frame, s.fps, s.encoder, rtmp)
 
+    async def attach_game(self) -> None:
+        """Place and focus the window of an engine that just opened (the session's recording runs across games)."""
+        assert self.display is not None, "open_display() first"
+        env = {**os.environ, "DISPLAY": self.display}
+        await self._xdotool(window_move_command(self.settings.layout.game), env, "move the game's window", sync=True)
+        await self._xdotool(window_focus_command(), env, "focus the game's window")
+
     async def _xdotool(self, cmd: list[str], env: dict[str, str], what: str, *, sync: bool = False) -> None:
         if shutil.which("xdotool") is None:
             log.warning("no xdotool: could not %s", what)

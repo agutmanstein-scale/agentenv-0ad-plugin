@@ -641,3 +641,11 @@ async def test_an_engine_log_older_than_the_broadcast_is_not_kept_as_this_matchs
     old.write_text("<p>this match's log</p>")
     await b.stop()
     assert b.engine_log is not None and "this match" in b.engine_log.read_text()
+
+
+async def test_attach_game_moves_and_focuses_the_new_window(tmp_path, fake_processes):
+    events, _, _, _ = fake_processes
+    b = live.Broadcast(BroadcastSettings(display=":0"), tmp_path / "out")
+    await b.open_display()
+    await b.attach_game()
+    assert events == ["xdotool search --sync --class pyrogenesis", "xdotool search --class pyrogenesis windowfocus"]

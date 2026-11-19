@@ -12,7 +12,8 @@ from agentenv_zeroad.grading import BRAIN_TIMEOUT_S
 from agentenv_zeroad.match import LiveMatch, MatchConfig, SeatPlan
 from agentenv_zeroad.server import tool_specs
 from agentenv_zeroad.spend import SpendCapReached
-from agentenv_zeroad.train.game import LockstepMatch
+from agentenv_zeroad.train.game import LockstepMatch, play_game
+from agentenv_zeroad.train.spec import GameSpec
 from tests.fake_models import FakeStrategist
 from tests.zeroad_fakes import Handle, ScriptedEngine, placer
 
@@ -222,3 +223,33 @@ async def test_an_in_process_army_order_with_explicit_default_waves_is_recorded_
     await link.call("army", explicit)
     both = [a.what for a in match.seats["1"].actions]
     assert both[0] == both[1] == unset[0] and "min_size" not in both[1]
+
+
+async def test_lockstep_match_passes_pace_to_its_clock(tmp_path):
+    match = make(tmp_path, BOT_VS_PETRA, pace_s=0.2)
+    assert match.lockstep.metrics()["pace_s"] == 0.2
+
+
+def petra_spec() -> GameSpec:
+    petra = {"kind": "petra", "civ": "pers"}
+    return GameSpec.from_json(
+        {"game_id": "g1", "seats": [{**petra, "civ": "rome"}, petra], "size": 128, "time_cap_minutes": 1}
+    )
+
+
+async def test_play_game_hands_the_match_over_before_start(tmp_path):
+    seen: list[bool] = []
+    await play_game(
+        petra_spec(),
+        Handle(),
+        tmp_path / "g1",
+        tools=[],
+        match_options={"placer": placer()},
+        on_match=lambda match: seen.append(match.started),
+    )
+    assert seen == [False]
+
+
+async def test_play_game_unpaced_by_default(tmp_path):
+    results = await play_game(petra_spec(), Handle(), tmp_path / "g1", tools=[], match_options={"placer": placer()})
+    assert results["clock"]["pace_s"] is None
