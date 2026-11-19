@@ -1,0 +1,1137 @@
+{
+ "status": "finished",
+ "detail": "Agent 1 won on net worth at the time cap, 30:00",
+ "ended_by": "time_cap",
+ "game_time_s": 1800.0,
+ "time_cap_s": 1800,
+ "score_rule": "net_worth",
+ "spec": {
+  "game_id": "frontier-v0-frontier-opus-04",
+  "map": "mainland",
+  "seed": 900004,
+  "ai_seed": 714073,
+  "size": 128,
+  "biome": "generic/temperate",
+  "placement": "circle",
+  "time_cap_minutes": 30,
+  "latency_ms": 5000,
+  "score_rule": "net_worth",
+  "ceasefire_minutes": 0,
+  "experimental_starting_resources": null,
+  "seats": [
+   {
+    "kind": "llm",
+    "civ": "athen",
+    "model": "local/qwen-base",
+    "base_url": "redacted",
+    "api_key_env": "VLLM_API_KEY",
+    "sampling": {
+     "temperature": 1.0,
+     "top_p": 1.0,
+     "top_k": -1
+    },
+    "extra_body": {
+     "chat_template_kwargs": {
+      "enable_thinking": false
+     }
+    },
+    "max_tokens": 512,
+    "difficulty": 3,
+    "behaviour": "balanced",
+    "interval_s": 25.0,
+    "min_gap_s": 8.0,
+    "trainable": true,
+    "interface": "v2"
+   },
+   {
+    "kind": "llm",
+    "civ": "cart",
+    "name": "opus",
+    "model": "anthropic/claude-opus-5-5",
+    "base_url": "redacted",
+    "api_key_env": "LITELLM_API_KEY",
+    "sampling": {},
+    "extra_body": {},
+    "max_tokens": 1024,
+    "effort": "low",
+    "difficulty": 3,
+    "behaviour": "balanced",
+    "interval_s": 25.0,
+    "min_gap_s": 8.0,
+    "trainable": false,
+    "interface": "v2"
+   }
+  ]
+ },
+ "lockstep": {
+  "latency_ms": 5000,
+  "decisions": [
+   {
+    "slot": "1",
+    "frozen_ms": 0,
+    "due_ms": 5000,
+    "applied_ms": 5000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 0,
+    "due_ms": 5000,
+    "applied_ms": 5000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 25000,
+    "due_ms": 30000,
+    "applied_ms": 30000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 25000,
+    "due_ms": 30000,
+    "applied_ms": 30000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 50000,
+    "due_ms": 55000,
+    "applied_ms": 55000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 50000,
+    "due_ms": 55000,
+    "applied_ms": 55000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 75000,
+    "due_ms": 80000,
+    "applied_ms": 80000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 75000,
+    "due_ms": 80000,
+    "applied_ms": 80000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 100000,
+    "due_ms": 105000,
+    "applied_ms": 105000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 100000,
+    "due_ms": 105000,
+    "applied_ms": 105000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 125000,
+    "due_ms": 130000,
+    "applied_ms": 130000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 125000,
+    "due_ms": 130000,
+    "applied_ms": 130000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 150000,
+    "due_ms": 155000,
+    "applied_ms": 155000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 150000,
+    "due_ms": 155000,
+    "applied_ms": 155000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 175000,
+    "due_ms": 180000,
+    "applied_ms": 180000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 175000,
+    "due_ms": 180000,
+    "applied_ms": 180000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 200000,
+    "due_ms": 205000,
+    "applied_ms": 205000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 200000,
+    "due_ms": 205000,
+    "applied_ms": 205000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 225000,
+    "due_ms": 230000,
+    "applied_ms": 230000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 225000,
+    "due_ms": 230000,
+    "applied_ms": 230000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 250000,
+    "due_ms": 255000,
+    "applied_ms": 255000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 250000,
+    "due_ms": 255000,
+    "applied_ms": 255000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 275000,
+    "due_ms": 280000,
+    "applied_ms": 280000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 275000,
+    "due_ms": 280000,
+    "applied_ms": 280000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 283000,
+    "due_ms": 288000,
+    "applied_ms": 288000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 300000,
+    "due_ms": 305000,
+    "applied_ms": 305000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 308000,
+    "due_ms": 313000,
+    "applied_ms": 313000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 325000,
+    "due_ms": 330000,
+    "applied_ms": 330000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 333000,
+    "due_ms": 338000,
+    "applied_ms": 338000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 350000,
+    "due_ms": 355000,
+    "applied_ms": 355000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 358000,
+    "due_ms": 363000,
+    "applied_ms": 363000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 375000,
+    "due_ms": 380000,
+    "applied_ms": 380000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 383000,
+    "due_ms": 388000,
+    "applied_ms": 388000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 400000,
+    "due_ms": 405000,
+    "applied_ms": 405000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 408000,
+    "due_ms": 413000,
+    "applied_ms": 413000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 425000,
+    "due_ms": 430000,
+    "applied_ms": 430000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 433000,
+    "due_ms": 438000,
+    "applied_ms": 438000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 441000,
+    "due_ms": 446000,
+    "applied_ms": 446000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 450000,
+    "due_ms": 455000,
+    "applied_ms": 455000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 466000,
+    "due_ms": 471000,
+    "applied_ms": 471000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 475000,
+    "due_ms": 480000,
+    "applied_ms": 480000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 491000,
+    "due_ms": 496000,
+    "applied_ms": 496000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 500000,
+    "due_ms": 505000,
+    "applied_ms": 505000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 516000,
+    "due_ms": 521000,
+    "applied_ms": 521000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 525000,
+    "due_ms": 530000,
+    "applied_ms": 530000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 541000,
+    "due_ms": 546000,
+    "applied_ms": 546000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 550000,
+    "due_ms": 555000,
+    "applied_ms": 555000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 566000,
+    "due_ms": 571000,
+    "applied_ms": 571000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 575000,
+    "due_ms": 580000,
+    "applied_ms": 580000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 591000,
+    "due_ms": 596000,
+    "applied_ms": 596000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 600000,
+    "due_ms": 605000,
+    "applied_ms": 605000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 616000,
+    "due_ms": 621000,
+    "applied_ms": 621000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 625000,
+    "due_ms": 630000,
+    "applied_ms": 630000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 641000,
+    "due_ms": 646000,
+    "applied_ms": 646000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 650000,
+    "due_ms": 655000,
+    "applied_ms": 655000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 666000,
+    "due_ms": 671000,
+    "applied_ms": 671000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 675000,
+    "due_ms": 680000,
+    "applied_ms": 680000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 691000,
+    "due_ms": 696000,
+    "applied_ms": 696000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 700000,
+    "due_ms": 705000,
+    "applied_ms": 705000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 716000,
+    "due_ms": 721000,
+    "applied_ms": 721000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 725000,
+    "due_ms": 730000,
+    "applied_ms": 730000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 741000,
+    "due_ms": 746000,
+    "applied_ms": 746000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 750000,
+    "due_ms": 755000,
+    "applied_ms": 755000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 766000,
+    "due_ms": 771000,
+    "applied_ms": 771000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 775000,
+    "due_ms": 780000,
+    "applied_ms": 780000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 791000,
+    "due_ms": 796000,
+    "applied_ms": 796000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 800000,
+    "due_ms": 805000,
+    "applied_ms": 805000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 816000,
+    "due_ms": 821000,
+    "applied_ms": 821000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 825000,
+    "due_ms": 830000,
+    "applied_ms": 830000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 841000,
+    "due_ms": 846000,
+    "applied_ms": 846000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 850000,
+    "due_ms": 855000,
+    "applied_ms": 855000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 866000,
+    "due_ms": 871000,
+    "applied_ms": 871000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 875000,
+    "due_ms": 880000,
+    "applied_ms": 880000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 891000,
+    "due_ms": 896000,
+    "applied_ms": 896000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 900000,
+    "due_ms": 905000,
+    "applied_ms": 905000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 916000,
+    "due_ms": 921000,
+    "applied_ms": 921000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 925000,
+    "due_ms": 930000,
+    "applied_ms": 930000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 941000,
+    "due_ms": 946000,
+    "applied_ms": 946000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 950000,
+    "due_ms": 955000,
+    "applied_ms": 955000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 966000,
+    "due_ms": 971000,
+    "applied_ms": 971000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 975000,
+    "due_ms": 980000,
+    "applied_ms": 980000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 991000,
+    "due_ms": 996000,
+    "applied_ms": 996000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1000000,
+    "due_ms": 1005000,
+    "applied_ms": 1005000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1016000,
+    "due_ms": 1021000,
+    "applied_ms": 1021000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1025000,
+    "due_ms": 1030000,
+    "applied_ms": 1030000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1041000,
+    "due_ms": 1046000,
+    "applied_ms": 1046000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1050000,
+    "due_ms": 1055000,
+    "applied_ms": 1055000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1066000,
+    "due_ms": 1071000,
+    "applied_ms": 1071000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1075000,
+    "due_ms": 1080000,
+    "applied_ms": 1080000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1091000,
+    "due_ms": 1096000,
+    "applied_ms": 1096000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1100000,
+    "due_ms": 1105000,
+    "applied_ms": 1105000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1116000,
+    "due_ms": 1121000,
+    "applied_ms": 1121000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1125000,
+    "due_ms": 1130000,
+    "applied_ms": 1130000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1141000,
+    "due_ms": 1146000,
+    "applied_ms": 1146000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1150000,
+    "due_ms": 1155000,
+    "applied_ms": 1155000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1166000,
+    "due_ms": 1171000,
+    "applied_ms": 1171000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1175000,
+    "due_ms": 1180000,
+    "applied_ms": 1180000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1191000,
+    "due_ms": 1196000,
+    "applied_ms": 1196000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1200000,
+    "due_ms": 1205000,
+    "applied_ms": 1205000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1216000,
+    "due_ms": 1221000,
+    "applied_ms": 1221000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1225000,
+    "due_ms": 1230000,
+    "applied_ms": 1230000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1241000,
+    "due_ms": 1246000,
+    "applied_ms": 1246000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1250000,
+    "due_ms": 1255000,
+    "applied_ms": 1255000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1266000,
+    "due_ms": 1271000,
+    "applied_ms": 1271000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1275000,
+    "due_ms": 1280000,
+    "applied_ms": 1280000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1291000,
+    "due_ms": 1296000,
+    "applied_ms": 1296000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1300000,
+    "due_ms": 1305000,
+    "applied_ms": 1305000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1316000,
+    "due_ms": 1321000,
+    "applied_ms": 1321000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1325000,
+    "due_ms": 1330000,
+    "applied_ms": 1330000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1341000,
+    "due_ms": 1346000,
+    "applied_ms": 1346000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1350000,
+    "due_ms": 1355000,
+    "applied_ms": 1355000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1366000,
+    "due_ms": 1371000,
+    "applied_ms": 1371000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1375000,
+    "due_ms": 1380000,
+    "applied_ms": 1380000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1391000,
+    "due_ms": 1396000,
+    "applied_ms": 1396000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1400000,
+    "due_ms": 1405000,
+    "applied_ms": 1405000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1416000,
+    "due_ms": 1421000,
+    "applied_ms": 1421000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1425000,
+    "due_ms": 1430000,
+    "applied_ms": 1430000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1441000,
+    "due_ms": 1446000,
+    "applied_ms": 1446000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1450000,
+    "due_ms": 1455000,
+    "applied_ms": 1455000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1466000,
+    "due_ms": 1471000,
+    "applied_ms": 1471000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1475000,
+    "due_ms": 1480000,
+    "applied_ms": 1480000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1491000,
+    "due_ms": 1496000,
+    "applied_ms": 1496000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1500000,
+    "due_ms": 1505000,
+    "applied_ms": 1505000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1516000,
+    "due_ms": 1521000,
+    "applied_ms": 1521000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1525000,
+    "due_ms": 1530000,
+    "applied_ms": 1530000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1541000,
+    "due_ms": 1546000,
+    "applied_ms": 1546000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1550000,
+    "due_ms": 1555000,
+    "applied_ms": 1555000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1566000,
+    "due_ms": 1571000,
+    "applied_ms": 1571000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1575000,
+    "due_ms": 1580000,
+    "applied_ms": 1580000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1591000,
+    "due_ms": 1596000,
+    "applied_ms": 1596000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1600000,
+    "due_ms": 1605000,
+    "applied_ms": 1605000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1616000,
+    "due_ms": 1621000,
+    "applied_ms": 1621000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1625000,
+    "due_ms": 1630000,
+    "applied_ms": 1630000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1641000,
+    "due_ms": 1646000,
+    "applied_ms": 1646000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1650000,
+    "due_ms": 1655000,
+    "applied_ms": 1655000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1666000,
+    "due_ms": 1671000,
+    "applied_ms": 1671000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1675000,
+    "due_ms": 1680000,
+    "applied_ms": 1680000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1691000,
+    "due_ms": 1696000,
+    "applied_ms": 1696000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1700000,
+    "due_ms": 1705000,
+    "applied_ms": 1705000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1716000,
+    "due_ms": 1721000,
+    "applied_ms": 1721000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1725000,
+    "due_ms": 1730000,
+    "applied_ms": 1730000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1741000,
+    "due_ms": 1746000,
+    "applied_ms": 1746000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1750000,
+    "due_ms": 1755000,
+    "applied_ms": 1755000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1766000,
+    "due_ms": 1771000,
+    "applied_ms": 1771000,
+    "missed": false
+   },
+   {
+    "slot": "1",
+    "frozen_ms": 1775000,
+    "due_ms": 1780000,
+    "applied_ms": 1780000,
+    "missed": false
+   },
+   {
+    "slot": "2",
+    "frozen_ms": 1791000,
+    "due_ms": 1796000,
+    "applied_ms": 1796000,
+    "missed": false
+   }
+  ]
+ },
+ "sampler": {
+  "1": {
+   "calls": 72,
+   "failed_calls": 0,
+   "logprobs_aligned": 72,
+   "logprobs_mismatched": 0,
+   "logprobs_missing": 0
+  },
+  "2": {
+   "calls": 74,
+   "failed_calls": 0,
+   "logprobs_aligned": 0,
+   "logprobs_mismatched": 0,
+   "logprobs_missing": 0
+  }
+ },
+ "seats": {
+  "1": {
+   "player": 1,
+   "kind": "agent",
+   "civ": "athen",
+   "name": "Agent 1",
+   "model": "local/qwen-base",
+   "state": "active",
+   "outcome": "won",
+   "moves": {
+    "made": 72,
+    "missed": 0
+   }
+  },
+  "2": {
+   "player": 2,
+   "kind": "agent",
+   "civ": "cart",
+   "name": "opus",
+   "model": "anthropic/claude-opus-5-5",
+   "state": "active",
+   "outcome": "lost",
+   "moves": {
+    "made": 74,
+    "missed": 0
+   }
+  }
+ }
+}
