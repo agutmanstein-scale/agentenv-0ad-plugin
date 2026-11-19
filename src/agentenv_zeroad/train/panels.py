@@ -169,6 +169,27 @@ def frontier_specs(cfg: RunConfig, panel: PanelConfig, base_url: str = UNSET_URL
     return specs
 
 
+def game_at(cfg: RunConfig, panel: PanelConfig, j: int, opponent: str, base_url: str = UNSET_URL) -> GameSpec:
+    """The policy seat's game at held-out index `j` against `opponent` (a teacher of `panel`, or "petra-<n>"), with the
+    seats, position and settings `frontier_specs` and `heldout_specs` give that index."""
+    pos = position(cfg, "held_out", j)
+    policy = _policy(cfg, panel, pos.policy_civ)
+    if opponent.startswith("petra-"):
+        other = SeatSpec(
+            kind="petra",
+            civ=pos.opponent_civ,
+            difficulty=int(opponent.removeprefix("petra-")),
+            behaviour=pos.behaviour,
+        )
+    else:
+        teacher = next((t for t in panel.teachers if t.name == opponent), None)
+        if teacher is None:
+            raise ValueError(f"panel {panel.name} has no teacher {opponent!r}")
+        other = _teacher_seat(cfg, panel, teacher, pos.opponent_civ, base_url)
+    seats = (policy, other) if j % 2 == 0 else (other, policy)
+    return _game(cfg, panel, f"{panel.name}-{j:04d}-{opponent}", pos, seats)
+
+
 def _teacher_seat(cfg: RunConfig, panel: PanelConfig, teacher: TeacherConfig, civ: str, base_url: str) -> SeatSpec:
     return SeatSpec(
         kind="llm",
