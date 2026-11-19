@@ -77,6 +77,8 @@ run mkdir -p "$BOX_HOME/bin" "$STATE/pilot/adapters" "$STATE/train" "$STATE/agen
 run sh -c 'rm -rf "$1/box.new" && mkdir -p "$1/box.new" && curl -fsSL "$2" | tar xz -C "$1/box.new"' _ "$BOX_HOME" "$PAYLOAD_URL"
 run sh -c 'rm -rf "$1/box" && mv "$1/box.new/box" "$1/box" && install -m 644 "$1/box.new/zeroad-live.conf" /etc/zeroad-live.conf && rm -rf "$1/box.new"' _ "$BOX_HOME"
 run sh -c 'rm -rf "$1/repo.new" && mkdir -p "$1/repo.new" && curl -fsSL "$2" | tar xz -C "$1/repo.new" && rm -rf "$1/repo" && mv "$1/repo.new" "$1/repo"' _ "$BOX_HOME" "$REPO_URL"
+# shellcheck source=lib.sh
+source "$BOX_HOME/box/lib.sh"
 run uv sync --project "$BOX_HOME/repo" --frozen --no-dev ${EXTRA[@]+"${EXTRA[@]}"}
 # agent-env passes the model endpoint to each agent from these variables; pilot-run.sh sets them.
 run sh -c 'printf "[model]\nbase_url = \"env:LITELLM_BASE_URL\"\napi_key = \"env:LITELLM_API_KEY\"\n" > "$1/agent-env.toml"' _ "$ETC"
@@ -124,11 +126,7 @@ PORTS=()
 for instance in "${INSTANCES[@]}"; do IFS='|' read -r _ _ port _ <<<"$instance"; PORTS+=("$port"); done
 run sh -c 'out=$1; shift; for p in "$@"; do echo "http://$0:$p"; done > "$out"' "$BRIDGE" "$ETC/vllm.urls" "${PORTS[@]}"
 run sh -c 'printf "PILOT_TRAIN_GPUS=%s\nPILOT_SHARE_GPU=%s\n" "$1" "$2" > "$3/pilot.conf"' _ "$TRAIN_GPUS" "$SHARE" "$ETC"
-if [ "$DRY_RUN" = 1 ]; then
-  echo "+ make $ETC/vllm.env (0600): VLLM_API_KEY=<random>, unless it exists"
-elif [ ! -s "$ETC/vllm.env" ]; then
-  (umask 077; printf 'VLLM_API_KEY=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$ETC/vllm.env")
-fi
+make_vllm_key "$ETC"
 run docker pull -q "$VLLM_IMAGE"
 for instance in "${INSTANCES[@]}"; do
   IFS='|' read -r NAME DEVICES PORT TPN <<<"$instance"
@@ -160,21 +158,13 @@ if [ "$TRAIN" = 1 ]; then
 fi
 
 step "the box-time timer (the budget guard's box hours)"
-run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
-run systemctl daemon-reload
-run systemctl enable --now zeroad-boxtime.timer
+enable_boxtime_timer
 
 step "vLLM up, then one strategist call through it (a tool call and its token ids$([ "$TRAIN" = 1 ] && echo ', and one log-prob per token') must come back)"
 if [ "$DRY_RUN" = 1 ]; then
   echo "+ wait for http://$BRIDGE:<each vLLM port>/health (the model downloads once, about 16 GB), then $([ "$TRAIN" = 1 ] && echo train.smoke || echo pilot.smoke)"
 else
-  for port in "${PORTS[@]}"; do
-    for i in $(seq 1 180); do
-      curl -fsS "http://$BRIDGE:$port/health" >/dev/null 2>&1 && break
-      [ "$i" = 180 ] && { docker logs --tail 40 "$(docker ps -a --filter "publish=$port" --format '{{.Names}}' | head -1)" >&2; echo "vLLM on $port never came up" >&2; exit 1; }
-      sleep 10
-    done
-  done
+  wait_vllm_up "$BRIDGE" "${PORTS[@]}"
   set -a; source "$ETC/vllm.env"; set +a
   for port in "${PORTS[@]}"; do
     smoke=agentenv_zeroad.pilot.smoke; [ "$TRAIN" = 1 ] && smoke=agentenv_zeroad.train.smoke

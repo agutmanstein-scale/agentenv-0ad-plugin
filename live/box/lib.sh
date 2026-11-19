@@ -45,3 +45,36 @@ require_engine_image() {
     esac
   done
 }
+
+# The vLLM and box-time steps pilot-bootstrap.sh and showcase-bootstrap.sh both do. A bootstrap uses them after it has
+# unpacked the payload (this file comes with it); a dry run prints the same plan lines either way.
+
+# make_vllm_key ETC: the vLLM API key, made once in ETC/vllm.env (0600, root only) and never printed.
+make_vllm_key() {
+  local etc=$1
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "+ make $etc/vllm.env (0600): VLLM_API_KEY=<random>, unless it exists"
+  elif [ ! -s "$etc/vllm.env" ]; then
+    (umask 077; printf 'VLLM_API_KEY=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$etc/vllm.env")
+  fi
+}
+
+# wait_vllm_up BRIDGE PORT...: waits (30 min at most) until each port's /health answers; dumps the container's log if not.
+wait_vllm_up() {
+  local bridge=$1 port i
+  shift
+  for port in "$@"; do
+    for i in $(seq 1 180); do
+      curl -fsS "http://$bridge:$port/health" >/dev/null 2>&1 && break
+      [ "$i" = 180 ] && { docker logs --tail 40 "$(docker ps -a --filter "publish=$port" --format '{{.Names}}' | head -1)" >&2; echo "vLLM on $port never came up" >&2; exit 1; }
+      sleep 10
+    done
+  done
+}
+
+# enable_boxtime_timer: the timer the budget guard reads box hours from.
+enable_boxtime_timer() {
+  run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
+  run systemctl daemon-reload
+  run systemctl enable --now zeroad-boxtime.timer
+}

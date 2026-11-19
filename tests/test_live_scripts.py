@@ -166,6 +166,7 @@ CHANGE_SCRIPTS = [
     ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "--play-only"),
     ("train.sh", ID, "stop"),
     ("bootstrap.sh", ID, "--cpu"),
+    ("bootstrap.sh", ID, "--showcase"),
     ("bootstrap.sh", ID, "--cpu", "--images", "build"),
     ("s1.sh", ID, "start"),
     ("s1.sh", ID, "start", "--n", "10", "--replays", "5", "--wall-hours", "1.5", "--engines", "20"),
@@ -2679,3 +2680,115 @@ def test_the_actor_scripts_run_with_the_train_extra(stubs):
         text = (BOX / script).read_text()
         assert "--no-dev python" not in text, script
         assert "--extra train python" in text, script
+
+
+SHOWCASE_ENV = LIVE / "showcase.env.example"
+VLLM_IMAGE = "vllm/vllm-openai:v0.11.0"
+
+
+def showcase_stubs(stubs):
+    env_file = stubs["tmp"] / "showcase.env"
+    env_file.write_text(
+        f"source {SHOWCASE_ENV}\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+        "LIVE_SUBNETS='subnet-a subnet-b'\nLIVE_SECURITY_GROUP=sg-1\n"
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    return stubs
+
+
+def vllm_flags(out: str, name: str) -> dict[str, str]:
+    """The engine flags of the `docker run` that starts container `name`: everything after the vLLM image."""
+    [line] = [x for x in out.replace("\\", "").splitlines() if x.startswith(f"+ docker run -d --name {name} ")]
+    tokens = line.split(f"{VLLM_IMAGE} ")[1].split()
+    flags: dict[str, str] = {}
+    for i, tok in enumerate(tokens):
+        if tok.startswith("--"):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            flags[tok] = "" if nxt.startswith("--") or not nxt else nxt
+    return flags
+
+
+def test_the_showcase_env_is_the_trainings_instance_profile_on_one_l40s_with_a_60_dollar_budget(stubs):
+    text = SHOWCASE_ENV.read_text()
+    assert 'source "$_showcase_env_dir/live.env"' in text  # the site settings are live.env's
+    out = run(showcase_stubs(stubs), "launch.sh", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "g6e.2xlarge" in plan and "g6e.12xlarge" not in plan and "bucket-1" not in plan
+    for setting in ('LIVE_GPU_RATES="g6e.2xlarge=2.24"', "LIVE_MAX_HOURS=10", "LIVE_BUDGET_USD=60"):
+        assert setting in text, setting
+    assert "LIVE_SHUTDOWN_BEHAVIOR=stop" in text and "LIVE_INSTANCE_PROFILE=zeroad-train-box" in text
+
+
+def test_showcase_bootstrap_dry_run_prints_the_plan(stubs):
+    out = run(showcase_stubs(stubs), "bootstrap.sh", ID, "--showcase", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "box/showcase-bootstrap.sh https://PRESIGNED-payload-url https://PRESIGNED-repo-url" in plan
+    text = plan.replace("\\", "")
+    for flag in (
+        "--dtype bfloat16",
+        "--generation-config vllm",
+        "--enable-lora",
+        "--max-lora-rank 32",
+        "--max-model-len 8192",
+        "--max-loras 1",
+        "--gpu-memory-utilization 0.55",
+    ):
+        assert flag in text, flag
+    assert VLLM_IMAGE in text and "scripts/build-engine.sh show" in text and "zeroad-engine:0.28-show" in text
+    assert "ENGINE_IMAGE=zeroad-engine:0.28-show" in text and "-t zeroad-showcase" in text
+    assert "zeroad-train/run/s2-run1/adapters/v50/" in text and "showcase/adapters/v1" in text
+    assert "local/policy-v1" in text and "pilot.smoke" in text and "--model local/policy-v1" in text
+    assert "-m engine tests/engine/test_paced_engine.py" in text
+    assert "bucket-1" not in plan and "bucket-1" not in out.stdout  # the bucket is redacted everywhere
+    assert "s3://<bucket>/zeroad-train/run/s2-run1/adapters/v50/" in text
+    assert text.index("build-engine.sh show") < text.index("docker run -d --name zeroad-vllm")
+    assert text.index("load_lora_adapter") < text.index("pilot.smoke") < text.index("test_paced_engine")
+    assert not aws_calls(stubs)  # nothing was called: forbid_aws would have made the stub exit 99
+
+
+def test_showcase_bootstrap_refuses_a_small_gpu(stubs):
+    write_exe(
+        stubs["bin"] / "nvidia-smi",
+        "#!/bin/sh\ncase $1 in -L) echo 'GPU 0: NVIDIA L4 (UUID: x)' ;; *) echo 23034 ;; esac\n",
+    )
+    touched = stubs["tmp"] / "touched"
+    for cmd in ("apt-get", "systemctl", "docker", "curl", "fuser"):
+        write_exe(stubs["bin"] / cmd, f"#!/bin/sh\necho {cmd} >> {touched}\n")
+    out = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo")
+    assert out.returncode == 1 and "40 GB" in out.stderr
+    assert not touched.exists()  # refused before it changed anything
+    write_exe(
+        stubs["bin"] / "nvidia-smi",
+        "#!/bin/sh\ncase $1 in -L) printf 'GPU 0: NVIDIA L40S (UUID: x)\\nGPU 1: NVIDIA L40S (UUID: y)\\n' ;;"
+        " *) echo 46068 ;; esac\n",
+    )
+    out = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo")
+    assert out.returncode == 1 and "one GPU" in out.stderr and not touched.exists()
+
+
+@pytest.mark.parametrize("other", ["--pilot", "--train", "--cpu"])
+def test_showcase_and_train_are_exclusive(stubs, other):
+    out = run(showcase_stubs(stubs), "bootstrap.sh", ID, "--showcase", other, forbid_aws=True)
+    assert out.returncode != 0 and "--showcase is not combined" in out.stderr
+    assert "Next:" not in out.stderr
+
+
+def test_showcase_vllm_flags_match_run1_but_memory(stubs):
+    train = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    show = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert train.returncode == 0 and show.returncode == 0, show.stderr
+    run1 = vllm_flags(train.stdout, "zeroad-vllm-0")
+    shown = vllm_flags(show.stdout, "zeroad-vllm")
+    assert (run1["--gpu-memory-utilization"], run1["--max-loras"]) == ("0.9", "8")
+    assert (shown["--gpu-memory-utilization"], shown["--max-loras"]) == ("0.55", "1")
+    for flags in (run1, shown):
+        del flags["--gpu-memory-utilization"], flags["--max-loras"]
+    assert shown == run1 and shown["--max-model-len"] == "8192" and shown["--dtype"] == "bfloat16"
+
+
+def test_the_showcase_bootstrap_keeps_the_key_in_a_root_only_file_and_never_prints_the_bucket(stubs):
+    text = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1").stdout
+    assert "vllm.env (0600)" in text and "VLLM_API_KEY=<random>" in text
+    assert "docker run" in text and "--env-file" in text and "sk-" not in text

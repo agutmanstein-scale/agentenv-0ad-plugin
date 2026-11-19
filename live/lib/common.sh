@@ -71,11 +71,17 @@ parse_mode() {
 }
 
 # aws_run PLACEHOLDER ARGS...: runs `aws ARGS`; in a dry run prints it and writes PLACEHOLDER as its output instead.
+# With LIVE_REDACT_BUCKET=1 (bootstrap.sh --showcase) the printed plan shows <bucket> in place of the bucket's name.
 AWS_CHECKED=0
 aws_run() {
   local placeholder=$1; shift
   if [ "$DRY_RUN" = 1 ]; then
-    plan "aws $*"
+    if [ "${LIVE_REDACT_BUCKET:-0}" = 1 ] && [ -n "${LIVE_BUCKET:-}" ]; then
+      local shown="$*"
+      plan "aws ${shown//"$LIVE_BUCKET"/<bucket>}"
+    else
+      plan "aws $*"
+    fi
     [ -z "$placeholder" ] || printf '%s\n' "$placeholder"
     return 0
   fi
@@ -114,6 +120,10 @@ ZEROAD_BOX_USD_PER_HOUR=$RATE
 ZEROAD_MIN_FREE_GB=${LIVE_MIN_FREE_GB:-8}
 ZEROAD_MATCH_CAP_USD=${LIVE_MATCH_CAP_USD:-9}
 EOF
+  # The showcase box reads Run 1's adapter from this bucket with its instance profile (no presigned URL).
+  if [ "${BOX_CONF_S3:-0}" = 1 ]; then
+    printf 'ZEROAD_S3_BUCKET=%s\nZEROAD_S3_PREFIX=%s\n' "${LIVE_BUCKET:-}" "$PREFIX"
+  fi
 }
 
 # ssm_box ID TIMEOUT_S BOX_SCRIPT [ARGS...]: runs live/box/BOX_SCRIPT as root on the box through SSM and prints its
