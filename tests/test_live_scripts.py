@@ -1927,8 +1927,8 @@ def test_the_s2_env_example_is_a_g6e_box_whose_deadline_budget_and_rate_fit_the_
     assert int(env["LIVE_MAX_HOURS"]) >= numbers["expected_hours"] + 2  # the bootstrap's hour and an hour of margin
     box = numbers["expected_hours"] * numbers["rate"]
     assert (
-        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 480
-    )  # box, two frontier panels, calibration, labels
+        box + 46 + 15 + 63 <= float(env["LIVE_BUDGET_USD"]) <= box + 540
+    )  # box, two frontier panels, calibration, labels; the top also covers the model spend and reruns so far
 
 
 def test_the_s2_launch_plan_prices_a_g6e_box_for_the_whole_sequence_and_stops_it_rather_than_terminates(stubs):
