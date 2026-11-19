@@ -203,8 +203,8 @@ class EngineOptions:
     (`zeroad-engine:0.28-rt`, patches/rl-realtime.patch): the frame loop then advances the game in real time once the
     first `/step` arrives, and `/step` only posts commands and returns the state. `paced` needs the showcase engine
     (`zeroad-engine:0.28-show`, patches/rl-paced-render.patch) and `visual`, and excludes `realtime`: every `/step` then
-    allows exactly one 200 ms turn, which the frame loop runs and renders before `/step` answers, and sim time does
-    not move between steps."""
+    runs exactly one 200 ms turn, as in training; the frame loop only renders (the view blends over the turn, then
+    holds at its end), and sim time does not move between steps."""
 
     port: int = 6000
     host: str = "127.0.0.1"

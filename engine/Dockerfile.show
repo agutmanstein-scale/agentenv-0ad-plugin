@@ -1,8 +1,8 @@
 # The showcase engine, zeroad-engine:0.28-show: the rt engine plus patches/rl-paced-render.patch, layered onto
 # zeroad-engine:0.28. With -rl-paced (visual mode only) a reset game waits at turn 0 and every /step allows exactly one
-# 200 ms turn, which the frame loop runs and renders before /step answers; with no /step pending sim time does not move,
-# while the frame loop keeps rendering. That makes a rendered match follow training's lockstep rules turn for turn, at
-# the pace the caller steps it. Without -rl-paced the binary behaves as the rt image's. Training's image
+# 200 ms turn, run at once (as in training); the frame loop only renders, blending the view over the turn and then
+# holding at its end, so sim time does not move between steps. That makes a rendered match follow training's lockstep
+# rules turn for turn, at the pace the caller steps it. Without -rl-paced the binary behaves as the rt image's. Training's image
 # (zeroad-engine:0.28-rt) is never rebuilt with this patch.
 # Build with `scripts/build-engine.sh show` (context: patches/). The build stage's lines up to the COPY match
 # Dockerfile.rt's, so the build-dep layer is reused from the docker cache; the package build takes ~15 min.

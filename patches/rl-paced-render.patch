@@ -15,7 +15,15 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  		g_Game->GetView()->Update(float(realTimeSinceLastFrame));
 --- a/source/rlinterface/RLInterface.cpp
 +++ b/source/rlinterface/RLInterface.cpp
-@@ -62,6 +62,7 @@
+@@ -42,6 +42,7 @@
+ #include "simulation2/system/LocalTurnManager.h"
+ #include "simulation2/system/TurnManager.h"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <js/RootingAPI.h>
+@@ -62,6 +63,7 @@
  		nullptr
  	};
  	m_RealTime = g_CmdLineArgs.Has("rl-realtime");
@@ -23,60 +31,45 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  	m_Context = mg_start(MgCallback, this, options);
  	if (!m_Context)
  		throw SetupError{};
-@@ -342,8 +343,40 @@
+@@ -342,6 +344,16 @@
  	return false;
  }
  
-+bool Interface::IsPaced() const
-+{
-+	return m_Paced && g_GUI;
-+}
-+
 +void Interface::PacedUpdate(double realFrameLength)
 +{
-+	if (!m_TurnPending)
-+	{
-+		// No /step is waiting: sim time stays put, but the view keeps interpolating (units hold at the end of the
-+		// last turn, CTurnManager::Interpolate clamps its offset) and the camera and the director keep working.
-+		g_Game->Interpolate(0.f, static_cast<float>(realFrameLength));
-+		return;
-+	}
-+
-+	const u32 turnBefore = g_Game->GetTurnManager()->GetCurrentTurn();
-+	g_Game->Update(realFrameLength);
-+	if (g_Game->GetTurnManager()->GetCurrentTurn() == turnBefore)
-+		return;
-+
-+	// The one turn this /step allowed has run: answer it (the HTTP thread is waiting on m_MsgLock, held since the
-+	// step was applied) and stop feeding sim time until the next /step.
-+	m_TurnPending = false;
-+	m_ReturnValue = m_WantState ? GetGameState() : std::string("{}");
-+	m_MsgApplied.notify_one();
-+	m_MsgLock.unlock();
++	// No sim time is fed here: only a /step runs a turn. The view blends from the previous turn's state to the
++	// newest one over one turn length of real time, then holds at the end of the last turn.
++	const bool blending = m_PacedBlend < 1.f;
++	m_PacedBlend = std::min(1.f, m_PacedBlend + static_cast<float>(realFrameLength * 1000.0 / DEFAULT_TURN_LENGTH));
++	g_Game->GetSimulation2()->Interpolate(blending ? static_cast<float>(realFrameLength) : 0.f, m_PacedBlend,
++		static_cast<float>(realFrameLength));
 +}
 +
  void Interface::TryApplyMessage()
  {
-+	// A paced /step is mid-turn and still holds m_MsgLock; nothing else can be posted behind it (m_Lock).
-+	if (m_TurnPending)
-+		return;
-+
  	const bool isGameStarted = g_Game && g_Game->IsGameStarted();
- 	if (m_NeedsGameState && isGameStarted)
- 	{
-@@ -433,6 +466,12 @@
- 			}
+@@ -378,6 +390,7 @@
+ 			if (isGameStarted)
+ 				EndGame();
+ 			m_Stepped = false;
++			m_PacedBlend = 1.f;
  
- 			const u32 deltaRealTime = DEFAULT_TURN_LENGTH;
-+			if (m_Paced && !nonVisual)
-+			{
-+				// Allow exactly one more turn, run by the frame loop (PacedUpdate); the reply and m_MsgLock wait for it.
-+				m_TurnPending = true;
-+				break;
-+			}
- 			if (nonVisual)
- 			{
+ 			g_Game = new CGame(m_ScenarioConfig.saveReplay);
+ 			ScriptInterface& scriptInterface = g_Game->GetSimulation2()->GetScriptInterface();
+@@ -438,6 +451,13 @@
  				const double deltaSimTime = deltaRealTime * g_Game->GetSimRate();
+ 				const size_t maxTurns = static_cast<size_t>(g_Game->GetSimRate());
+ 				g_Game->GetTurnManager()->Update(deltaSimTime, maxTurns);
++			}
++			else if (m_Paced)
++			{
++				// Exactly one turn, as in training (a feed of a full turn always runs one), without the
++				// interpolation: PacedUpdate blends the view from this turn's start to its end on the frame loop.
++				g_Game->Update(deltaRealTime / 1000.0, false);
++				m_PacedBlend = 0.f;
+ 			}
+ 			else if (!m_RealTime)
+ 				g_Game->Update(deltaRealTime);
 --- a/source/rlinterface/RLInterface.h
 +++ b/source/rlinterface/RLInterface.h
 @@ -119,6 +119,14 @@
@@ -84,11 +77,11 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  	bool AdvancesInRealTime() const { return m_RealTime && m_Stepped; }
  
 +	/**
-+	 * With -rl-paced in visual mode every /step allows exactly one more 200 ms turn, which the frame loop runs
-+	 * (smooth, interpolated) before /step answers; with no /step pending sim time does not move.
++	 * With -rl-paced in visual mode every /step runs exactly one 200 ms turn at once and the frame loop only
++	 * renders: sim time does not move between steps, and the view holds at the end of the last turn.
 +	 * The visual frame calls PacedUpdate in place of g_Game->Update when IsPaced().
 +	 */
-+	bool IsPaced() const;
++	bool IsPaced() const { return m_Paced; }
 +	void PacedUpdate(double realFrameLength);
 +
  private:
@@ -99,7 +92,7 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  	bool m_RealTime{false};
  	bool m_Stepped{false};
 +	bool m_Paced{false};
-+	bool m_TurnPending{false};
++	float m_PacedBlend{1.f};
  };
  
  }

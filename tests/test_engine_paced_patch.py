@@ -43,10 +43,11 @@ def test_the_patched_frame_loop_runs_one_turn_per_step_and_replies_after_it(tmp_
     cpp = (tree / "source/rlinterface/RLInterface.cpp").read_text()
     assert 'g_CmdLineArgs.Has("rl-paced")' in cpp
     update = cpp.split("void Interface::PacedUpdate")[1].split("\n}\n")[0]
-    assert "g_Game->Interpolate(0.f" in update.split("m_TurnPending")[1], "the idle frame must keep interpolating"
-    assert "GetCurrentTurn() == turnBefore" in update and "m_MsgLock.unlock()" in update
+    assert "GetSimulation2()->Interpolate(" in update, "the idle frame must keep interpolating"
+    assert "Update(" not in update.replace("Interpolate(", ""), "the frame loop must not feed sim time"
     step = cpp.split("case GameMessageType::Commands")[1].split("case GameMessageType::Evaluate")[0]
-    assert step.index("m_Paced && !nonVisual") < step.index("g_Game->Update(deltaRealTime)")
+    assert "g_Game->Update(deltaRealTime / 1000.0, false)" in step
+    assert step.index("else if (m_Paced)") < step.index("g_Game->Update(deltaRealTime);")
     main = (tree / "source/main.cpp").read_text()
     assert main.index("rlInterface->PacedUpdate(") < main.index("rlInterface->AdvancesInRealTime()")
 
