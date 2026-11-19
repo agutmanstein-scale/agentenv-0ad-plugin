@@ -71,7 +71,7 @@ case $CMD in
       say "+ the newest session's state.json (the game in play) and session.json (the table); journalctl -u zeroad-showcase -n $N; budget.sh show; poweroff.sh status; nvidia-smi memory; vLLM health"
       exit 0
     fi
-    session=$(ls -d "$SHOW"/showcase-* 2>/dev/null | sort | tail -1 || true)
+    session=$(ls -d "$SHOW"/[0-9]*-[0-9]* 2>/dev/null | sort | tail -1 || true)
     if [ -n "$session" ]; then
       echo "--- session ${session##*/}"
       echo "--- game in play"; jq -c . "$session/state.json" 2>/dev/null | cut -c1-1500 || echo "(none yet)"

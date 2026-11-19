@@ -2956,7 +2956,7 @@ def test_showcase_run_uploads_before_shutdown(stubs):
     prefix = "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
     calls = aws_calls(stubs)
     cps = [c["argv"] for c in calls if c["argv"][:2] == ["s3", "cp"]]
-    session = stubs["tmp"] / "state" / "showcase" / "showcase-20261119-120000"
+    session = stubs["tmp"] / "state" / "showcase" / "20261119-120000"
     assert (session / "stamp").read_text().strip() == "20261119-120000"
     assert any(a[-2:] == [str(session), prefix] and "--recursive" in a for a in cps)
     videos = sorted(a[-2].rsplit("/", 1)[1] for a in cps if a[-1].startswith(prefix + "video/"))
@@ -2964,7 +2964,7 @@ def test_showcase_run_uploads_before_shutdown(stubs):
     assert calls[-1]["argv"] == ["shutdown", "-h now"], calls[-1]  # the last thing, after every upload
     docker = (stubs["tmp"] / "docker.log").read_text()
     assert (
-        "--entrypoint python zeroad-showcase -m agentenv_zeroad.showcase run --out /out" in docker
+        f"--entrypoint python zeroad-showcase -m agentenv_zeroad.showcase run --out {session} --config" in docker
         and "--hours 2" in docker
     )
     assert "--config live/showcase/showcase.toml" in docker and "--name zeroad-showcase" in docker
@@ -2975,6 +2975,18 @@ def test_showcase_run_uploads_before_shutdown(stubs):
     assert SECRET not in docker and "vllm-secret-value" not in docker  # the keys travel in the environment only
     assert f"key={SECRET}" in (stubs["tmp"] / "docker.env").read_text()  # with-model.sh gave the child the key
     assert "bucket-1" not in out.stdout + out.stderr
+
+
+def test_showcase_session_folders_are_siblings_under_one_parent_and_never_reused(stubs):
+    first = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--no-shutdown")
+    assert first.returncode == 0, first.stderr
+    parent = stubs["tmp"] / "state" / "showcase"
+    assert [p.name for p in parent.iterdir()] == ["20261119-120000"]
+    again = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--no-shutdown")
+    assert again.returncode != 0 and "never reused" in again.stderr
+    later = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-150000", "--no-shutdown")
+    assert later.returncode == 0, later.stderr
+    assert sorted(p.name for p in parent.iterdir()) == ["20261119-120000", "20261119-150000"]  # the first is untouched
 
 
 @pytest.mark.parametrize("how", ["upload fails", "--no-shutdown"])

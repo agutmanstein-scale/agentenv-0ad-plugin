@@ -32,7 +32,7 @@ ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 DEADLINE_FILE=${ZEROAD_DEADLINE_FILE:-$ETC/deadline}
 BUCKET=${ZEROAD_S3_BUCKET:-}
 PREFIX=${ZEROAD_S3_PREFIX:-zeroad-train}
-SESSION=$STATE/showcase/showcase-$STAMP
+SESSION=$STATE/showcase/$STAMP
 DEST=s3://${BUCKET:-<bucket>}/$PREFIX/run/showcase-$STAMP/
 NAME=zeroad-showcase
 VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || echo http://127.0.0.1:8000)  # showcase-bootstrap.sh writes it
@@ -65,6 +65,7 @@ upload() {
 }
 
 say "showcase session $STAMP: ${PASS[*]-} (budget \$$BUDGET), folder $SESSION"
+[ "$DRY_RUN" = 1 ] || [ ! -e "$SESSION" ] || die "the session folder $SESSION exists: a session folder is never reused"
 run mkdir -p "$SESSION"
 [ "$DRY_RUN" = 1 ] || printf '%s\n' "$STAMP" > "$SESSION/stamp"
 run docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -76,9 +77,9 @@ container=(docker run --rm --init --name "$NAME" --network host --gpus all
   -e "LIVE_BUDGET_USD=$BUDGET" -e "ZEROAD_BOX_USD_PER_HOUR=$ZEROAD_BOX_USD_PER_HOUR"
   -e "ZEROAD_SPEND_LEDGER=$LEDGER" -e "ZEROAD_LIVE_HOME=$BOX_HOME" -e "ZEROAD_LIVE_STATE=$STATE" -e "ZEROAD_DEADLINE_FILE=$DEADLINE_FILE"
   -v "$BOX_HOME:$BOX_HOME:ro" -v "$STATE:$STATE" -v "$DEADLINE_FILE:$DEADLINE_FILE:ro"
-  -v "$REPO/live:/work/live:ro" -v "$SESSION:/out" -w /work
+  -v "$REPO/live:/work/live:ro" -w /work
   --entrypoint python zeroad-showcase
-  -m agentenv_zeroad.showcase run --out /out --config live/showcase/showcase.toml "${PASS[@]+"${PASS[@]}"}")
+  -m agentenv_zeroad.showcase run --out "$SESSION" --config live/showcase/showcase.toml "${PASS[@]+"${PASS[@]}"}")
 cmd=("$BOX_HOME/box/with-model.sh" "${container[@]}")
 
 rc=0 STOPPED=0
