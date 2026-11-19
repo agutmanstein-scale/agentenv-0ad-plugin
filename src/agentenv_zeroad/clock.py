@@ -31,6 +31,10 @@ A decision therefore always spans exactly `latency_ms` of game time (a multiple 
 takes, and the game never advances past `T + L` before the seat's reply is in. Seats' decisions overlap freely (one
 pending decision per seat). Game logic reads only game time; wall time is used for the missed-reply guard and the
 metrics.
+
+`pace_s` (showcase streams only; training never sets it) adds a wall-time floor: steps are never closer than `pace_s`,
+and the schedule restarts from now after a hold, so a slow reply is never followed by a burst. It delays wall time
+only. `holding` names the seat the clock is blocked on while it waits.
 """
 
 from __future__ import annotations
@@ -255,14 +259,21 @@ class LockstepClock(GameClock):
         latency_ms: int = DEFAULT_LATENCY_MS,
         tick_turns: int = TICK_TURNS,
         brain_timeout_s: float = BRAIN_TIMEOUT_S,
+        pace_s: float | None = None,
     ):
         super().__init__(engine)
+        if pace_s is not None and pace_s <= 0:
+            raise ValueError(f"pace_s must be None or above 0, got {pace_s}")
         tick_ms = tick_turns * TURN_MS
         if tick_turns < 1 or latency_ms < tick_ms or latency_ms % tick_ms:
             raise ValueError(f"latency_ms must be a positive multiple of the {tick_ms} ms tick, got {latency_ms}")
         self.latency_ms = latency_ms
         self.tick_turns = tick_turns
         self.brain_timeout_s = brain_timeout_s
+        self.pace_s = pace_s
+        self.paced_wait_s = 0.0
+        self.holding: dict[str, Any] | None = None
+        self._next_due: float | None = None
         self._observe, self._act, self._done = observe, act, done
         self._brains = list(brains)
         self._inflight: list[_InFlight] = []
@@ -289,6 +300,8 @@ class LockstepClock(GameClock):
             "missed": self.counts["missed"],
             "blocked": self.counts["blocked"],
             "blocked_wall_s": round(self.blocked_wall_s, 3),
+            "pace_s": self.pace_s,
+            "paced_wait_s": round(self.paced_wait_s, 3),
         }
 
     async def run(self, max_steps: int | None = None) -> None:
@@ -300,10 +313,25 @@ class LockstepClock(GameClock):
                     await self._boundary()
                     if self._stopping or self._done():
                         break
+                await self._pace()
                 await self.step_once()
         finally:
             self._stopping = False
             await self._abandon()
+
+    async def _pace(self) -> None:
+        """With `pace_s` set, wait until the next step is due, then schedule the one after it `pace_s` later. The next
+        slot counts from now when a hold ran past it, so steps are never closer than `pace_s` and never burst to catch
+        up. Pacing only delays wall time; the game sees nothing different."""
+        if self.pace_s is None:
+            return
+        now = self._now()
+        due = now if self._next_due is None else self._next_due
+        if due > now:
+            await self._sleep(due - now)
+            self.paced_wait_s += due - now
+            now = due
+        self._next_due = now + self.pace_s
 
     async def step_once(self) -> dict[str, Any] | None:
         """Send every queued command in one `/step`; the state is decoded only if something subscribed to it."""
@@ -362,7 +390,11 @@ class LockstepClock(GameClock):
         if not pending.task.done():
             self.counts["blocked"] += 1
             remaining = max(0.0, self.brain_timeout_s - (waited_from - pending.started))
-            await asyncio.wait({pending.task}, timeout=remaining)
+            self.holding = {"slot": pending.brain.slot, "since": waited_from}
+            try:
+                await asyncio.wait({pending.task}, timeout=remaining)
+            finally:
+                self.holding = None
             self.blocked_wall_s += loop.time() - waited_from
         row = {"slot": pending.brain.slot, "frozen_ms": pending.frozen_ms, "due_ms": pending.due_ms}
         if self._stopping:
