@@ -290,6 +290,18 @@ class Launcher(Protocol):
         ...
 
 
+async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float = 5.0) -> None:
+    """Terminate `proc`, and kill it if it has not exited after `timeout` seconds; nothing if it is gone."""
+    if proc is None or proc.returncode is not None:
+        return
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
 @dataclass
 class LocalLauncher:
     """Runs pyrogenesis from PATH (inside the env container). `home` gives this engine its own HOME (and so its own
@@ -321,14 +333,7 @@ class LocalLauncher:
 
     async def stop(self) -> None:
         proc, self._proc = self._proc, None
-        if proc is None or proc.returncode is not None:
-            return
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), self.stop_timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
+        await stop_process(proc, self.stop_timeout)
 
     def _replays(self) -> Path:
         home = self.home if self.home is not None else Path(os.environ.get("HOME", "~")).expanduser()

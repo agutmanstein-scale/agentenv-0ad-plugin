@@ -14,11 +14,8 @@ never a reply that came too late (the clock cancels that call and misses the dec
 SIGTERM stops the game in play as no result ("stopped by hand"), saves `session.json` and returns, so the script that
 runs the session can upload and power the box off.
 
-Replay mode (`SessionOptions.mode == "replay"`, the fallback when a live render can't run) shares all of that. One
-producer task plays the games headless (`replay.start_headless_engine`, unpaced, as training does) one after another,
-and one consumer renders their replays in the order played, at most one game ahead of the one on screen. A game's row
-is claimed, classified and booked as in live mode, and written to `session.json` when the *game* finishes; the overlay's
-table gets it only when its *replay* ends, so it never shows a result before the picture does.
+Replay mode (`SessionOptions.mode == "replay"`, the fallback when a live render can't run) is `_ReplayRunner` in
+`replay_session.py`, a subclass of this runner that shares all of the above.
 """
 
 from __future__ import annotations
@@ -39,15 +36,7 @@ from agentenv_zeroad.engine import RunningEngine
 from agentenv_zeroad.live import Broadcast
 from agentenv_zeroad.llm import StrategistModel
 from agentenv_zeroad.showcase.overlay import OverlayServer, hold_of, showcase_state
-from agentenv_zeroad.showcase.replay import (
-    EARLY_EXIT_SLACK_MS,
-    REPLAY_TAIL_S,
-    ReplayClock,
-    ReplayHandle,
-    ReplayTimeline,
-    WallReplayClock,
-    et_clock,
-)
+from agentenv_zeroad.showcase.replay import ReplayClock, ReplayHandle
 from agentenv_zeroad.showcase.results import FAILURES_IN_A_ROW, GameRow, Session, classify
 from agentenv_zeroad.showcase.specs import ShowcaseConfig, next_starts, used_seeds
 from agentenv_zeroad.train.config import PanelConfig, RunConfig
@@ -147,36 +136,6 @@ class _Live:
     watch: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
-@dataclass
-class _OnScreen:
-    """The replay being shown: its overlay data and the clock its game time is read from."""
-
-    timeline: ReplayTimeline
-    clock: ReplayClock
-
-
-@dataclass
-class _Screen:
-    """What the overlay shows in replay mode (the producer's own `_Live` is the game being played, not this)."""
-
-    phase: str = "starting"
-    opponent: str = "…"
-    game_no: int = 1
-    round_no: int = 1
-    played_at: str | None = None
-    replay: _OnScreen | None = None
-    intermission: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class _Played:
-    """A finished headless game waiting for its replay: its row, its results and where its replay is, if it has one."""
-
-    row: GameRow
-    results: dict[str, Any]
-    commands: Path | None
-
-
 def display_name(opponent: str) -> str:
     """The name on the board: `opus` is Opus, `petra-3` is Petra-3."""
     return opponent.capitalize()
@@ -204,8 +163,10 @@ async def run_session(
     opts: SessionOptions, cfg: ShowcaseConfig, deps: SessionDeps, broadcast: Broadcast | None
 ) -> Session:
     """Play the session and return it (also saved in `opts.out/session.json`)."""
-    if opts.mode == "replay" and (deps.start_headless is None or deps.start_replay is None):
-        raise ValueError("replay mode needs deps.start_headless and deps.start_replay")
+    if opts.mode == "replay":
+        from agentenv_zeroad.showcase.replay_session import _ReplayRunner
+
+        return await _ReplayRunner(opts, cfg, deps, broadcast).run()
     return await _Runner(opts, cfg, deps, broadcast).run()
 
 
@@ -228,10 +189,7 @@ class _Runner:
         self.token = ""
         self.running: RunningEngine | None = None
         self.earlier: set[int] | None = None
-        self.screen = _Screen()  # replay mode: what is on screen
-        self.shown = Session(opts.out / "session.json", rotation=self.names)  # replay mode: the rows the table has
-        self.producing = True  # replay mode: the producer may still play games
-        self.unshown = 0  # replay mode: games finished and not yet shown
+        self.pace_s: float | None = opts.pace_s  # the floor of a step's wall time; training's games have none
 
     async def run(self) -> Session:
         from agentenv_zeroad.server import tool_specs
@@ -255,7 +213,7 @@ class _Runner:
                 handled.append(sig)
         overlay = self._start_overlay()
         try:
-            await (self._run_replay() if self.opts.mode == "replay" else self._run())
+            await self._run()
         finally:
             self.live.phase = "ended"
             self.session.save()
@@ -280,8 +238,6 @@ class _Runner:
             overlay.stop()
 
     def _state(self) -> dict[str, Any]:
-        if self.opts.mode == "replay":
-            return self._replay_state()
         live = self.live
         return showcase_state(
             self.session,
@@ -365,11 +321,12 @@ class _Runner:
         dropped = self.session.dropped()
         return {o for o, name in zip(self.opts.rotation, self.names, strict=True) if name in dropped}
 
-    def _next_opponent(self, after: str | None = None) -> str | None:
-        """The rotation's opponent after the last game's (or after `after`'s), skipping dropped ones (as the rotation's
-        id, not its name)."""
-        names, dropped = self.names, self.session.dropped()
-        last = after if after is not None else self.session.rows[-1].opponent if self.session.rows else None
+    def _next_opponent(self, after: str | None = None, session: Session | None = None) -> str | None:
+        """The rotation's opponent after the last game's (or after `after`'s), skipping the opponents `session`
+        (default: this one) has dropped (as the rotation's id, not its name)."""
+        session = session or self.session
+        names, dropped = self.names, session.dropped()
+        last = after if after is not None else session.rows[-1].opponent if session.rows else None
         first = (names.index(last) + 1) % len(names) if last in names else 0
         for k in range(len(names)):
             i = (first + k) % len(names)
@@ -385,16 +342,21 @@ class _Runner:
             return "max_games", f"{self.played} games played"
         if self.deps.now() - self.started_at >= opts.hours * 3600:
             return "hours", f"{opts.hours:g} hours passed"
-        left = self.deps.poweroff_left_s()
-        if left < opts.min_poweroff_margin_s:
-            return (
-                "poweroff",
-                f"{left / 60:.0f} min to the power-off, a game needs {opts.min_poweroff_margin_s / 60:.0f}",
-            )
+        left, margin_s, hours = self.deps.poweroff_left_s(), self._margin_s(), self._planned_hours()
+        if left < margin_s:
+            return "poweroff", f"{left / 60:.0f} min to the power-off, a game needs {margin_s / 60:.0f}"
         planned = 0.0 if opponent.startswith("petra-") else opts.seat_cap_usd
-        if not await self.deps.budget_ok(planned, PLANNED_GAME_HOURS):
-            return "budget", f"the budget guard refused a game of ${planned:g} and {PLANNED_GAME_HOURS} h"
+        if not await self.deps.budget_ok(planned, hours):
+            return "budget", f"the budget guard refused a game of ${planned:g} and {hours:g} h"
         return None
+
+    def _margin_s(self) -> float:
+        """The time the power-off must still be away for a game to start."""
+        return self.opts.min_poweroff_margin_s
+
+    def _planned_hours(self) -> float:
+        """The box hours the budget check plans for the game about to start."""
+        return PLANNED_GAME_HOURS
 
     def _claim(self, start: int, opponent: str) -> tuple[GameSpec, GameRow]:
         """The game's spec and its pending row, which is added and saved before anything starts: a crash leaves it, so
@@ -454,16 +416,16 @@ class _Runner:
             await self._release(spec, booked)
         return row
 
-    async def _run_game(self, spec: GameSpec, *, headless: bool = False) -> dict[str, Any]:
-        """The game's results; a failure (or a stop before the match began) is a failed game's results. A headless game
-        (replay mode) is played on `deps.start_headless`, with nothing on screen."""
+    async def _open_engine(self) -> None:
+        """Start the engine the game is played on (kept in `self.running`) and put it on screen."""
+        self.running = await self._until_stop(self.deps.start_engine())
+        await self._until_stop(self._show(self.running))
+
+    async def _run_game(self, spec: GameSpec) -> dict[str, Any]:
+        """The game's results; a failure (or a stop before the match began) is a failed game's results."""
         try:
-            if headless:
-                assert self.deps.start_headless is not None
-                self.running = await self._until_stop(self.deps.start_headless())
-            else:
-                self.running = await self._until_stop(self.deps.start_engine())
-                await self._until_stop(self._show(self.running))
+            await self._open_engine()
+            assert self.running is not None
             return await self._play(spec, self.running)
         except _Stopped:
             failure = "stopped"
@@ -519,7 +481,7 @@ class _Runner:
                 self.opts.out / "games" / spec.game_id,
                 tools=self.tools,
                 model_for=self.deps.model_for,
-                pace_s=self.opts.pace_s if self.opts.mode == "live" else None,  # a replay-mode game is training's
+                pace_s=self.pace_s,
                 on_match=self._on_match,
             )
         )
@@ -606,138 +568,3 @@ class _Runner:
             await self._wait_intermission()
         finally:
             self.live.intermission = None
-
-    # ---- replay mode -----------------------------------------------------------------------------------------------
-    async def _run_replay(self) -> None:
-        self.shown.rows = list(self.session.rows)
-        slots = asyncio.Semaphore(2)  # the game on screen and one played ahead of it
-        queue: asyncio.Queue[_Played | None] = asyncio.Queue()
-        producer = asyncio.create_task(self._produce(queue, slots))
-        try:
-            await self._consume(queue, slots)
-        except BaseException:
-            producer.cancel()
-            raise
-        finally:
-            await asyncio.gather(producer, return_exceptions=True)
-            self.screen.phase = "ended"
-        if self.stop.is_set():
-            self._end("stopped", STOPPED_BY_HAND)
-
-    async def _produce(self, queue: asyncio.Queue[_Played | None], slots: asyncio.Semaphore) -> None:
-        """Play the games headless, one after another, until the session ends; `None` tells the consumer it has."""
-        try:
-            while True:
-                try:
-                    await self._until_stop(slots.acquire())
-                except _Stopped:
-                    return self._end("stopped", STOPPED_BY_HAND)
-                next_game = await self._next_game()
-                if next_game is None:
-                    return
-                played = await self._headless_game(*next_game)
-                self.unshown += 1
-                queue.put_nowait(played)
-                if self.stop.is_set():
-                    return self._end("stopped", STOPPED_BY_HAND)
-                if (verdict := self._verdict(played.row)) is not None:
-                    return self._end(*verdict)
-        finally:
-            self.producing = False
-            queue.put_nowait(None)
-
-    async def _headless_game(self, start: int, opponent: str) -> _Played:
-        spec, pending = self._claim(start, opponent)
-        booked = False
-        try:
-            results = await self._run_game(spec, headless=True)
-            row = self._conclude(spec, pending, results)
-            booked = True
-        finally:
-            await self._release(spec, booked)
-        commands = self.opts.out / "games" / spec.game_id / "commands.txt"
-        return _Played(row, results, commands if commands.is_file() else None)
-
-    async def _consume(self, queue: asyncio.Queue[_Played | None], slots: asyncio.Semaphore) -> None:
-        """Show the replays in the order the games were played."""
-        while True:
-            try:
-                played = await self._until_stop(queue.get())
-                if played is None:
-                    return
-                self.unshown -= 1
-                await self._show_replay(played)
-            except _Stopped:
-                return
-            slots.release()
-
-    async def _show_replay(self, played: _Played) -> None:
-        """Render the game's replay, then add its row to the table and hold the intermission card. A render that fails
-        is logged and the game is still counted (there is just no picture of it)."""
-        row, screen = played.row, self.screen
-        clock = self.deps.replay_clock() if self.deps.replay_clock is not None else WallReplayClock(self.deps.now)
-        timeline = ReplayTimeline(played.results)
-        screen.opponent, screen.game_no = row.opponent, len(self.shown.rows) + 1
-        screen.round_no = len(self.shown.rows) // len(self.names) + 1
-        screen.played_at, screen.phase = et_clock(row.played_at), "starting"
-        screen.replay = _OnScreen(timeline, clock)
-        process: ReplayHandle | None = None
-        try:
-            if played.commands is not None:
-                assert self.deps.start_replay is not None
-                process = await self._until_stop(self.deps.start_replay(played.commands))
-                await self._until_stop(self._show())
-                clock.start()
-                screen.phase = "playing"
-                await self._until_stop(self._until_over(process, clock, timeline.end_ms))
-            else:
-                log.error("game %s has no replay to show", row.game_id)
-        except _Stopped:
-            raise
-        except Exception as e:  # noqa: BLE001 - a replay that can't be shown must not end the session
-            log.error("the replay of %s failed: %s", row.game_id, type(e).__name__)
-        finally:
-            if process is not None:
-                with contextlib.suppress(Exception):
-                    await process.stop()
-        self.shown.rows.append(row)
-        screen.replay = None
-        screen.phase = "intermission"
-        upcoming = self._next_opponent(after=row.opponent)
-        done = not self.producing and self.unshown == 0
-        screen.intermission = self._card(
-            row, "end of session" if done or upcoming is None else display_name(upcoming), self.shown.table()
-        )
-        try:
-            await self._wait_intermission()
-        finally:
-            screen.intermission = None
-            screen.phase = "starting"
-
-    async def _until_over(self, process: ReplayHandle, clock: ReplayClock, end_ms: int) -> None:
-        """Wait for the replay's game time to pass the game's end (and the tail), or for its engine to exit."""
-        last_ms = end_ms + int(REPLAY_TAIL_S * 1000)
-        while clock.game_ms() < last_ms:
-            if process.exited():
-                if clock.game_ms() < end_ms - EARLY_EXIT_SLACK_MS:
-                    log.warning("the replay engine exited at %d ms of a %d ms game", clock.game_ms(), end_ms)
-                return
-            await self.deps.sleep(min(WATCH_EVERY_S, (last_ms - clock.game_ms()) / 1000))
-
-    def _replay_state(self) -> dict[str, Any]:
-        screen = self.screen
-        on_screen = screen.replay if screen.phase == "playing" else None
-        return showcase_state(
-            self.shown,
-            None,
-            phase=screen.phase,
-            opponent=screen.opponent,
-            game_no=screen.game_no,
-            round_no=screen.round_no,
-            hold=None,
-            mode="replay",
-            played_at=screen.played_at,
-            intermission=screen.intermission,
-            dropped=sorted(self.shown.dropped()),
-            base=on_screen.timeline.state_at(on_screen.clock.game_ms()) if on_screen is not None else None,
-        )

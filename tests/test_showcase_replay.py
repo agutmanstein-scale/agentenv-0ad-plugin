@@ -5,6 +5,7 @@ The session tests reuse the session runner's fake world; the replay engine is a 
 fake that only advances once the game one ahead has been played, so the order of events does not depend on timing."""
 
 import asyncio
+import itertools
 import json
 import os
 import signal
@@ -26,6 +27,7 @@ from agentenv_zeroad.showcase.replay import (
     replay_args,
     start_headless_engine,
 )
+from agentenv_zeroad.showcase.replay_session import _Shown
 from agentenv_zeroad.showcase.results import Session
 from agentenv_zeroad.showcase.session import run_session
 from tests.test_showcase_session import CFG, FakeBroadcast, FakeOverlay, World
@@ -174,11 +176,14 @@ def test_headless_games_use_the_training_image_unpaced(tmp_path: Path, monkeypat
 
 # ---- the session -----------------------------------------------------------------------------------------------------
 class FakeReplay:
-    def __init__(self, commands: Path, log: list[str]) -> None:
-        self.commands, self.log = commands, log
+    def __init__(self, commands: Path, log: list[str], *, exits: bool = False) -> None:
+        self.commands, self.log, self.exits = commands, log, exits
 
     def exited(self) -> bool:
-        return False
+        return self.exits
+
+    async def first_frame(self, timeout_s: float) -> bool:
+        return True
 
     async def stop(self) -> None:
         self.log.append(self.commands.parent.name)
@@ -212,6 +217,8 @@ class Rig:
         self.clocks = 0
         self.total = 0
         self.limit = 3
+        self.render_error: Exception | None = None
+        self.early_exit = False
         real_play = session_mod.play_game
 
         async def play(*args: Any, **kwargs: Any):
@@ -260,7 +267,9 @@ class Rig:
 
         async def start_replay(commands: Path) -> FakeReplay:
             self.shown_starts.append(commands.parent.name)
-            return FakeReplay(commands, self.stopped)
+            if self.render_error is not None:
+                raise self.render_error
+            return FakeReplay(commands, self.stopped, exits=self.early_exit)
 
         def make_clock() -> HeldClock:
             k = self.clocks
@@ -276,10 +285,10 @@ class Rig:
             replay_clock=make_clock,
         )
 
-    def run(self, **over: Any) -> Session:
-        opts = self.world.opts(mode="replay", max_games=3, **over)
+    def run(self, *, broadcast: Any = None, deps: Any = None, **over: Any) -> Session:
+        opts = self.world.opts(mode="replay", **{"max_games": 3, **over})
         self.limit = opts.max_games or 3
-        return asyncio.run(run_session(opts, CFG, self.deps(), FakeBroadcast()))  # type: ignore[arg-type]
+        return asyncio.run(run_session(opts, CFG, deps or self.deps(), broadcast or FakeBroadcast()))
 
 
 @pytest.fixture
@@ -361,7 +370,7 @@ def test_refusals_are_checked_before_each_headless_game(rig: Rig) -> None:
     rig.world.budget = False
     session = rig.run()
     assert session.rows == [] and rig.world.handles == [] and session.ended == "budget"
-    assert rig.world.budget_calls == [(9.0, 0.75)]
+    assert rig.world.budget_calls == [(9.0, pytest.approx(0.75 + (1800 + 5) / 3600))]
 
 
 def test_the_pending_row_is_claimed_before_the_headless_engine_starts(rig: Rig) -> None:
@@ -395,3 +404,142 @@ def test_the_intermission_names_the_next_game_and_the_last_one_ends_the_session(
     rig.run()
     nexts = [s["next"] for s in rig.samples if s["phase"] == "intermission"]
     assert list(dict.fromkeys(nexts)) == ["Astra", "Petra-3", "end of session"]
+
+
+def test_the_next_game_named_never_gives_away_a_game_played_ahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(tmp_path, monkeypatch, cap_minutes=3.0)
+    world.failing = {"astra"}  # game 4 is Astra's second no result in a row: she is dropped, but not yet on screen
+    rig = Rig(world, monkeypatch)
+    session = rig.run(rotation=("opus", "astra"), max_games=4)
+    assert [r.opponent for r in session.rows] == ["Opus", "Astra", "Opus", "Astra"]
+    assert session.dropped() == {"Astra"}
+    nexts = [k for k, _ in itertools.groupby(s["next"] for s in rig.samples if s["phase"] == "intermission")]
+    assert nexts == ["Astra", "Opus", "Astra", "end of session"]
+
+
+def test_a_failing_ledger_write_in_replay_mode_propagates_as_in_live_mode(rig: Rig) -> None:
+    def boom(what: str, usd: float) -> None:
+        raise OSError("ledger full")
+
+    with pytest.raises(OSError, match="ledger full"):
+        rig.run(deps=replace(rig.deps(), record_spend=boom))
+
+
+def test_the_clock_starts_at_the_first_frame_not_at_the_window(rig: Rig) -> None:
+    events: list[str] = []
+
+    class Broadcast(FakeBroadcast):
+        async def start(self, url: str) -> None:
+            events.append("window")
+
+        async def attach_game(self) -> None:
+            events.append("window")
+
+    class Late(FakeReplay):
+        async def first_frame(self, timeout_s: float) -> bool:
+            await asyncio.sleep(0.05)  # the map is still loading after the window is placed
+            events.append("first_frame")
+            return True
+
+    class Clock(HeldClock):
+        def start(self) -> None:
+            events.append("clock")
+            super().start()
+
+    base = rig.deps()
+
+    async def start_replay(commands: Path) -> Late:
+        return Late(commands, rig.stopped)
+
+    deps = replace(base, start_replay=start_replay, replay_clock=lambda: Clock(lambda: False))
+    rig.run(deps=deps, broadcast=Broadcast(), max_games=1)
+    assert events[:3] == ["window", "first_frame", "clock"]
+
+
+def test_a_missing_first_frame_starts_the_clock_anyway_with_slack(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    class Never(FakeReplay):
+        async def first_frame(self, timeout_s: float) -> bool:
+            return False
+
+    reads: list[int] = []
+
+    class Clock(HeldClock):
+        def game_ms(self) -> int:
+            ms = super().game_ms()
+            reads.append(ms)
+            return ms
+
+    base = rig.deps()
+
+    async def start_replay(commands: Path) -> Never:
+        return Never(commands, rig.stopped)
+
+    deps = replace(base, start_replay=start_replay, replay_clock=lambda: Clock(lambda: False))
+    with caplog.at_level("WARNING"):
+        rig.run(deps=deps, max_games=1)
+    assert "no first frame" in caplog.text
+    # a 60 s game: the end, the tail and the slack for the missing first frame
+    assert max(reads) >= 60_000 + 2 * int(replay_mod.REPLAY_TAIL_S * 1000)
+
+
+@pytest.mark.parametrize("how", ["start fails", "early exit", "no replay file"])
+def test_three_failing_replays_end_the_session_as_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    world = World(tmp_path, monkeypatch)
+    rig = Rig(world, monkeypatch)
+    if how == "start fails":
+        rig.render_error = OSError("no display")
+    elif how == "early exit":
+        rig.early_exit = True
+    base = rig.deps
+
+    def deps() -> session_mod.SessionDeps:
+        d = base()
+        if how != "no replay file":
+            return d
+
+        async def start_headless() -> Handle:
+            engine = await world.deps().start_engine()
+            engine.replay = False
+            return engine
+
+        return replace(d, start_headless=start_headless)
+
+    rig.deps = deps  # type: ignore[method-assign]
+    session = rig.run(max_games=8)
+    assert session.ended == "render" and "3 replays in a row" in (session.ended_why or "")
+    assert 3 <= len(session.rows) <= 4
+
+
+def test_a_whole_replay_resets_the_render_failures(rig: Rig) -> None:
+    fails = iter([True, True, False, True, True, False])
+    base = rig.deps()
+
+    async def start_replay(commands: Path) -> FakeReplay:
+        if next(fails):
+            raise OSError("no display")
+        return FakeReplay(commands, rig.stopped)
+
+    session = rig.run(deps=replace(base, start_replay=start_replay), max_games=6)
+    assert session.ended == "max_games" and len(session.rows) == 6
+
+
+def test_a_deadline_live_mode_admits_is_refused_in_replay_mode(rig: Rig) -> None:
+    rig.world.left_s = 3000.0  # above the 2700 s margin, below it plus a game cap and an intermission
+    session = rig.run()
+    assert session.rows == [] and session.ended == "poweroff"
+    assert rig.world.budget_calls == []
+
+
+def test_the_budget_check_plans_the_replay_owed_too(rig: Rig) -> None:
+    rig.run(max_games=1)
+    assert rig.world.budget_calls == [(9.0, pytest.approx(0.75 + (1800 + 5) / 3600))]
+
+
+def test_the_shown_rows_can_never_write_the_session_file(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError):
+        _Shown(tmp_path / "session.json").save()
+    assert not (tmp_path / "session.json").exists()

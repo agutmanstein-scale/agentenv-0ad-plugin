@@ -8,9 +8,11 @@ The pieces, none of which the live session path uses:
   flag, so the game is the 13-3's engine behaviour.
 - `replay_args` and `start_replay_process`: pyrogenesis showing a finished game's `commands.txt`. The flag is
   `-replay-visual=<path to commands.txt>` (0.28 main.cpp: the path must be a file, not the replay's folder).
-- `ReplayClock`: where the overlay's game time comes from during a replay. `WallReplayClock` counts wall time at 1x
-  from the replay's first frame. It cannot see a stalled or slowed render, a replay that runs faster than 1x, or a
-  frame that arrives late after `start()`; the spike swaps the source without touching anything else.
+- `ReplayClock`: where the overlay's game time comes from during a replay. `start()` is called once the replay's first
+  frame is up: `ReplayHandle.first_frame` waits for the director mod's session-start line in the replay engine's own
+  log, which comes after the map has loaded, not when the window is placed. `WallReplayClock` then counts wall time at
+  1x. It cannot see a stalled or slowed render or a replay that runs faster than 1x, and the log line is only the
+  first frame's proxy; the spike swaps the source without touching anything else.
 - `ReplayTimeline`: the overlay's seats and scoreboard at a game time, from the game's own `results.json`.
 """
 
@@ -28,12 +30,22 @@ from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from agentenv_zeroad.engine import DOCKER_PYROGENESIS, EngineOptions, RunningEngine, free_port, start_engine
-from agentenv_zeroad.live import CIV_NAMES, GAME, RECENT_ORDERS, _model_label, color_hex, engine_args
+from agentenv_zeroad.engine import (
+    DOCKER_PYROGENESIS,
+    EngineOptions,
+    LocalLauncher,
+    RunningEngine,
+    free_port,
+    start_engine,
+    stop_process,
+)
+from agentenv_zeroad.live import CIV_NAMES, ENGINE_LOG, GAME, RECENT_ORDERS, _model_label, color_hex, engine_args
 from agentenv_zeroad.state import clock_text
 
 HEADLESS_READY_TIMEOUT_S = 180.0
-REPLAYS_DIR = ".local/share/0ad/replays"  # under the engine's HOME
+FIRST_FRAME_LINE = "zeroad-director: viewing as player"  # the director mod's line when its session starts
+FIRST_FRAME_TIMEOUT_S = 90.0  # map load and the director's start
+FIRST_FRAME_POLL_S = 0.25
 DEFAULT_LATENCY_MS = 5000
 REPLAY_TAIL_S = 3.0  # the last frame stays up this long, so the result is on screen before the table changes
 EARLY_EXIT_SLACK_MS = 10_000  # a replay engine gone this far before the game's end is a failed render
@@ -49,7 +61,7 @@ def headless_options() -> EngineOptions:
 async def start_headless_engine(home: Path) -> RunningEngine:
     """The engine for one replay-mode game. `home` is its own HOME, kept between games so the engine's caches stay; the
     replays it holds are removed first, so the replay copied out afterwards can only be this game's."""
-    shutil.rmtree(home / REPLAYS_DIR, ignore_errors=True)
+    await LocalLauncher(headless_options(), home=home).clear_replays()
     return await start_engine(
         headless_options(), mode="local", home=home, ready_timeout=HEADLESS_READY_TIMEOUT_S, no_state_step=True
     )
@@ -67,32 +79,47 @@ class ReplayHandle(Protocol):
 
     def exited(self) -> bool: ...
 
+    async def first_frame(self, timeout_s: float) -> bool:
+        """Wait until the replay's first frame is up; False if it is not within `timeout_s`."""
+        ...
+
     async def stop(self) -> None: ...
 
 
 class ReplayProcess:
-    """A running replay engine."""
+    """A running replay engine. Its first frame is when the director mod has logged its session start in the engine's
+    own `mainlog.html` (under its HOME) since this process began."""
 
-    def __init__(self, proc: asyncio.subprocess.Process) -> None:
-        self._proc = proc
+    def __init__(self, proc: asyncio.subprocess.Process, home: Path, started_at: float) -> None:
+        self._proc, self._log, self._started_at = proc, home / ENGINE_LOG, started_at
 
     def exited(self) -> bool:
         return self._proc.returncode is not None
 
-    async def stop(self) -> None:
-        if self._proc.returncode is not None:
-            return
-        self._proc.terminate()
+    def _logged(self) -> bool:
         try:
-            await asyncio.wait_for(self._proc.wait(), 5.0)
-        except TimeoutError:
-            self._proc.kill()
-            await self._proc.wait()
+            if self._log.stat().st_mtime < self._started_at - 1:
+                return False  # an earlier engine's log
+            return FIRST_FRAME_LINE in self._log.read_text(errors="replace")
+        except OSError:
+            return False
+
+    async def first_frame(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while not self._logged():
+            if self.exited() or time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(FIRST_FRAME_POLL_S)
+        return True
+
+    async def stop(self) -> None:
+        await stop_process(self._proc)
 
 
 async def start_replay_process(commands: Path, display: str, binary: str | None = None) -> ReplayHandle:
     """Start pyrogenesis on `display` showing `commands`."""
     binary = binary or shutil.which("pyrogenesis") or DOCKER_PYROGENESIS
+    started_at = time.time()
     proc = await asyncio.create_subprocess_exec(
         binary,
         *replay_args(commands),
@@ -101,11 +128,12 @@ async def start_replay_process(commands: Path, display: str, binary: str | None 
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return ReplayProcess(proc)
+    return ReplayProcess(proc, Path(os.environ.get("HOME", "~")).expanduser(), started_at)
 
 
 class ReplayClock(Protocol):
-    """The game time the replay on screen has reached. `start()` is called when its first frame is up."""
+    """The game time the replay on screen has reached. `start()` is called when its first frame is up (after
+    `ReplayHandle.first_frame`, not when its window is placed)."""
 
     def start(self) -> None: ...
 
