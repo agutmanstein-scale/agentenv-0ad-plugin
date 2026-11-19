@@ -1,0 +1,49 @@
+# A rollout actor's config for a multi-box run (docs/s4-actors.md). Copy, edit, and start it with
+# live/actor.sh ID start my-actor.toml --yes. No secret goes here.
+# An actor plays training games only and ships them to the learner box through the transport prefix: no learner, credit,
+# inbox, panels or hard-state labels. Its games, mix, held_out and seed must be the learner's config's (copy them), so the
+# games it plays are the learner's own stream; the actor_id keeps its draws and its game ids apart from every other box.
+
+run_id = "run1"              # the learner's run_id (game ids are run1-<actor_id>-gNNNNNN)
+# Under /var/lib/zeroad-live/train: what this box's vLLM containers mount at /train for the adapters it pulls.
+root = "/var/lib/zeroad-live/train/run1-a1"
+duration_hours = 10          # the actor also stops when the learner does; the box's LIVE_MAX_HOURS is this + 2
+budget_usd = 100             # this box's hours at box_usd_per_hour + its frontier spend (the learner's budget counts it too)
+box_usd_per_hour = 10.49     # this box's rate; actor.sh start refuses it if the box's own rate differs
+shutdown = true              # `shutdown -h now` once the last game is shipped (a box that could not ship stays up)
+engines = 24
+concurrency = 24
+seed = 1                     # the learner's seed
+
+[servers]
+# One vLLM per GPU, the ports bootstrap.sh --actor made (a 4-GPU box: 8000 to 8003).
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001", "http://172.17.0.1:8002", "http://172.17.0.1:8003"]
+
+[mix]
+bot = 0.10
+petra-1 = 0.35
+petra-2 = 0.35
+petra-3 = 0.10
+base = 0.10
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.15
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = ["mainland_held_out"]
+seeds = [900001, 900002, 900003]
+
+[transport]
+enabled = true
+# The same prefix as the learner's, under s3://LIVE_BUCKET/LIVE_S3_PREFIX/run/ (the role train-iam.sh made reads and
+# writes only there).
+uri = "s3://BUCKET/zeroad-train/run/run1/transport"
+role = "actor"
+actor_id = "a1"              # unique per box: letters, digits, . _ -
+poll_s = 15                  # how often it polls current.json and stop.json and sends its heartbeat
+learner_stale_minutes = 15   # the learner's pulse older than this and the actor stops

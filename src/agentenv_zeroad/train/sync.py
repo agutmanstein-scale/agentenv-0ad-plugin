@@ -36,11 +36,13 @@ SYNC_TIMEOUT_S = 600.0  # train.sh's TimeoutStopSec covers SYNC_ATTEMPTS of thes
 Run = Callable[[list[str]], Awaitable[tuple[int, str]]]
 
 
-def sync_command(root: Path, uri: str, *, adapters: Iterable[int] = (), checkpoint: int | None = None) -> list[str]:
+def sync_command(
+    root: Path, uri: str, *, adapters: Iterable[int] = (), checkpoint: int | None = None, extra: Iterable[str] = ()
+) -> list[str]:
     """`aws s3 sync ROOT URI` limited to the files worth keeping: ALWAYS, `adapters/v{N}` for each version in
     `adapters`, and `checkpoints/ckpt-{checkpoint}.pt`. An include after `--exclude "*"` is what lets a file through."""
     cmd = ["aws", "s3", "sync", str(root), uri.rstrip("/"), "--only-show-errors", "--exclude", "*"]
-    for pattern in ALWAYS:
+    for pattern in (*ALWAYS, *extra):
         cmd += ["--include", pattern]
     for version in sorted(set(adapters)):
         cmd += ["--include", f"adapters/v{version}/*"]
@@ -74,13 +76,17 @@ class Syncer:
         self.last_start_ok: float | None = None  # when it started: what it saw is on S3
         self.failures = 0
 
-    async def sync(self, *, adapters: Iterable[int] = (), checkpoint: int | None = None) -> bool:
+    async def sync(
+        self, *, adapters: Iterable[int] = (), checkpoint: int | None = None, extra: Iterable[str] = ()
+    ) -> bool:
         """Whether the sync succeeded. With no URI configured nothing is uploaded and this is False."""
         if self.uri is None:
             return False
         async with self._lock:
             started = time.time()
-            code, out = await self._run(sync_command(self.root, self.uri, adapters=adapters, checkpoint=checkpoint))
+            code, out = await self._run(
+                sync_command(self.root, self.uri, adapters=adapters, checkpoint=checkpoint, extra=extra)
+            )
         if code != 0:
             self.failures += 1
             log.error("s3 sync failed (%d): %s", code, out.strip()[-500:])

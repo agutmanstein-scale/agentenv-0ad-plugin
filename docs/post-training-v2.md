@@ -123,6 +123,7 @@ First fix the interface so skill can show, freeze it, and re-baseline the base m
 ### 7. Several boxes and the livestream
 
 - **Several boxes.** One learner. Extra boxes become rollout actors only behind a 4-GPU learner (3 boxes), because a 2-GPU learner is already the bottleneck. Otherwise the cheapest honest use of a second box is an independent replicate run on the same rating board. "2 of 2 runs climbed" is a strong claim for a stream.
+- **Actor boxes, as built.** Actors reach the learner only through S3 (adapters out, finished games and heartbeats in), so they need no networking beyond the instance role; `[transport]` in the run config turns it on and single-box mode stays the default. Runbook: `docs/s4-actors.md`.
 - **Livestream (S5).** A $1.32/h render box plays the latest pinned version (champion line overlaid) at 1x against frontier models or Petra rungs, calling the training box's vLLM. If the learner pauses, the stream keeps playing the champion and alerts.
 
 ## Stages, gates and cost
