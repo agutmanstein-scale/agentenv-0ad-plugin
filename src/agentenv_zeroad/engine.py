@@ -201,13 +201,17 @@ class Engine:
 class EngineOptions:
     """How to start pyrogenesis. `visual` needs a `display`; `realtime` needs the patched engine
     (`zeroad-engine:0.28-rt`, patches/rl-realtime.patch): the frame loop then advances the game in real time once the
-    first `/step` arrives, and `/step` only posts commands and returns the state."""
+    first `/step` arrives, and `/step` only posts commands and returns the state. `paced` needs the showcase engine
+    (`zeroad-engine:0.28-show`, patches/rl-paced-render.patch) and `visual`, and excludes `realtime`: every `/step` then
+    allows exactly one 200 ms turn, which the frame loop runs and renders before `/step` answers, and sim time does
+    not move between steps."""
 
     port: int = 6000
     host: str = "127.0.0.1"
     visual: bool = False
     display: str | None = None
     realtime: bool = False
+    paced: bool = False
     extra_args: tuple[str, ...] = ()
 
     @property
@@ -219,12 +223,16 @@ def pyrogenesis_args(options: EngineOptions) -> list[str]:
     """Command-line arguments for pyrogenesis (without the binary)."""
     if options.visual and not options.display:
         raise ValueError("visual mode needs a display (e.g. ':99')")
+    if options.paced and (options.realtime or not options.visual):
+        raise ValueError("paced needs visual mode and cannot be combined with realtime")
     args = [f"--rl-interface={options.host}:{options.port}"]
     if not options.visual:
         args += ["-autostart-nonvisual", "-autostart=random/mainland", "-autostart-size=128"]
     args.append("-mod=public")
     if options.realtime:
         args.append("-rl-realtime")
+    if options.paced:
+        args.append("-rl-paced")
     args += options.extra_args
     return args
 

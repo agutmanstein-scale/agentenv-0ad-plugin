@@ -36,6 +36,19 @@ def test_visual_args_need_a_display_and_can_ask_for_realtime():
     assert args == ["--rl-interface=127.0.0.1:6000", "-mod=public", "-rl-realtime", "-xres=1280"]
 
 
+def test_paced_engine_args():
+    args = pyrogenesis_args(EngineOptions(visual=True, display=":0", paced=True))
+    assert "-rl-paced" in args
+    assert "-rl-realtime" not in args
+
+
+def test_paced_needs_visual_and_not_realtime():
+    with pytest.raises(ValueError, match="paced"):
+        pyrogenesis_args(EngineOptions(paced=True))
+    with pytest.raises(ValueError, match="paced"):
+        pyrogenesis_args(EngineOptions(visual=True, display=":0", realtime=True, paced=True))
+
+
 def test_docker_launcher_runs_image_with_host_network_uid_home_and_init():
     launcher = DockerLauncher(EngineOptions(port=6001), name="zeroad-engine-test")
     cmd = launcher.command()

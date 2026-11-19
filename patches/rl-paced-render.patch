@@ -1,0 +1,105 @@
+SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
+
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -466,7 +466,9 @@
+ 
+ 	if (g_Game && g_Game->IsGameStarted() && needUpdate)
+ 	{
+-		if (!rlInterface || rlInterface->AdvancesInRealTime())
++		if (rlInterface && rlInterface->IsPaced())
++			rlInterface->PacedUpdate(realTimeSinceLastFrame);
++		else if (!rlInterface || rlInterface->AdvancesInRealTime())
+ 			g_Game->Update(realTimeSinceLastFrame);
+ 
+ 		g_Game->GetView()->Update(float(realTimeSinceLastFrame));
+--- a/source/rlinterface/RLInterface.cpp
++++ b/source/rlinterface/RLInterface.cpp
+@@ -62,6 +62,7 @@
+ 		nullptr
+ 	};
+ 	m_RealTime = g_CmdLineArgs.Has("rl-realtime");
++	m_Paced = g_CmdLineArgs.Has("rl-paced");
+ 	m_Context = mg_start(MgCallback, this, options);
+ 	if (!m_Context)
+ 		throw SetupError{};
+@@ -342,8 +343,40 @@
+ 	return false;
+ }
+ 
++bool Interface::IsPaced() const
++{
++	return m_Paced && g_GUI;
++}
++
++void Interface::PacedUpdate(double realFrameLength)
++{
++	if (!m_TurnPending)
++	{
++		// No /step is waiting: sim time stays put, but the view keeps interpolating (units hold at the end of the
++		// last turn, CTurnManager::Interpolate clamps its offset) and the camera and the director keep working.
++		g_Game->Interpolate(0.f, static_cast<float>(realFrameLength));
++		return;
++	}
++
++	const u32 turnBefore = g_Game->GetTurnManager()->GetCurrentTurn();
++	g_Game->Update(realFrameLength);
++	if (g_Game->GetTurnManager()->GetCurrentTurn() == turnBefore)
++		return;
++
++	// The one turn this /step allowed has run: answer it (the HTTP thread is waiting on m_MsgLock, held since the
++	// step was applied) and stop feeding sim time until the next /step.
++	m_TurnPending = false;
++	m_ReturnValue = m_WantState ? GetGameState() : std::string("{}");
++	m_MsgApplied.notify_one();
++	m_MsgLock.unlock();
++}
++
+ void Interface::TryApplyMessage()
+ {
++	// A paced /step is mid-turn and still holds m_MsgLock; nothing else can be posted behind it (m_Lock).
++	if (m_TurnPending)
++		return;
++
+ 	const bool isGameStarted = g_Game && g_Game->IsGameStarted();
+ 	if (m_NeedsGameState && isGameStarted)
+ 	{
+@@ -433,6 +466,12 @@
+ 			}
+ 
+ 			const u32 deltaRealTime = DEFAULT_TURN_LENGTH;
++			if (m_Paced && !nonVisual)
++			{
++				// Allow exactly one more turn, run by the frame loop (PacedUpdate); the reply and m_MsgLock wait for it.
++				m_TurnPending = true;
++				break;
++			}
+ 			if (nonVisual)
+ 			{
+ 				const double deltaSimTime = deltaRealTime * g_Game->GetSimRate();
+--- a/source/rlinterface/RLInterface.h
++++ b/source/rlinterface/RLInterface.h
+@@ -119,6 +119,14 @@
+ 	 */
+ 	bool AdvancesInRealTime() const { return m_RealTime && m_Stepped; }
+ 
++	/**
++	 * With -rl-paced in visual mode every /step allows exactly one more 200 ms turn, which the frame loop runs
++	 * (smooth, interpolated) before /step answers; with no /step pending sim time does not move.
++	 * The visual frame calls PacedUpdate in place of g_Game->Update when IsPaced().
++	 */
++	bool IsPaced() const;
++	void PacedUpdate(double realFrameLength);
++
+ private:
+ 	static void* MgCallback(mg_event event, struct mg_connection *conn, const struct mg_request_info *request_info);
+ 	static std::string GetRequestContent(struct mg_connection *conn);
+@@ -195,6 +203,8 @@
+ 	mg_context* m_Context;
+ 	bool m_RealTime{false};
+ 	bool m_Stepped{false};
++	bool m_Paced{false};
++	bool m_TurnPending{false};
+ };
+ 
+ }
