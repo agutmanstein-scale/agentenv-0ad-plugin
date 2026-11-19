@@ -92,6 +92,12 @@ aws_run() {
         || die "these credentials are not account $LIVE_AWS_ACCOUNT"
     fi
   fi
+  if [ "${LIVE_REDACT_BUCKET:-0}" = 1 ] && [ -n "${LIVE_BUCKET:-}" ]; then
+    # stdout goes through fd 3 untouched; stderr (an error can quote s3://BUCKET/...) is redacted; the exit status is aws's.
+    local rc=0
+    { aws "$@" 2>&1 1>&3 3>&- | sed "s#$LIVE_BUCKET#<bucket>#g" >&2; rc=${PIPESTATUS[0]}; } 3>&1
+    return "$rc"
+  fi
   aws "$@"
 }
 

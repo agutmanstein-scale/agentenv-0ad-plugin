@@ -130,17 +130,7 @@ make_vllm_key "$ETC"
 run docker pull -q "$VLLM_IMAGE"
 for instance in "${INSTANCES[@]}"; do
   IFS='|' read -r NAME DEVICES PORT TPN <<<"$instance"
-  # Recreated when it is not running, or runs with another --max-model-len than this mode's.
-  if [ "$DRY_RUN" = 1 ] || [ -z "$(docker ps -q --filter name="^$NAME\$")" ] \
-      || ! docker inspect --format '{{join .Args " "}}' "$NAME" 2>/dev/null | grep -q -- "--max-model-len $MAX_LEN "; then
-    run docker rm -f "$NAME" >/dev/null 2>&1 || true
-    run docker run -d --name "$NAME" --restart unless-stopped --gpus "\"device=$DEVICES\"" --ipc=host \
-      --env-file "$ETC/vllm.env" -e VLLM_ALLOW_RUNTIME_LORA_UPDATING=True -p "$BRIDGE:$PORT:8000" -p "127.0.0.1:$PORT:8000" \
-      -v "$STATE/hf:/root/.cache/huggingface" -v "$MOUNT" \
-      "$VLLM_IMAGE" --model "$MODEL" --served-model-name local/qwen-base --tensor-parallel-size "$TPN" \
-      --max-model-len $MAX_LEN --gpu-memory-utilization 0.9 --enable-lora --max-lora-rank 32 "${VLLM_FLAGS[@]}" \
-      --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching
-  fi
+  start_vllm "$NAME" "$DEVICES" "$PORT" "$TPN" "$MOUNT" 0.9 "$MAX_LEN" "${VLLM_FLAGS[@]}"
 done
 
 if [ "$ACTOR" = 0 ]; then

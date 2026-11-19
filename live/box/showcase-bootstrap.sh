@@ -78,17 +78,7 @@ run sh -c 'echo "http://$1:8000" > "$2/vllm.url"' _ "$BRIDGE" "$ETC"
 run mkdir -p "$STATE/showcase/adapters" "$STATE/hf"
 make_vllm_key "$ETC"
 run docker pull -q "$VLLM_IMAGE"
-# Recreated when it is not running, or runs with another --max-model-len or memory share.
-if [ "$DRY_RUN" = 1 ] || [ -z "$(docker ps -q --filter name='^zeroad-vllm$')" ] \
-    || ! docker inspect --format '{{join .Args " "}}' zeroad-vllm 2>/dev/null | grep -q -- "--max-model-len $MAX_LEN .*--gpu-memory-utilization $MEM_SHARE "; then
-  run docker rm -f zeroad-vllm >/dev/null 2>&1 || true
-  run docker run -d --name zeroad-vllm --restart unless-stopped --gpus "\"device=0\"" --ipc=host \
-    --env-file "$ETC/vllm.env" -e VLLM_ALLOW_RUNTIME_LORA_UPDATING=True -p "$BRIDGE:8000:8000" -p "127.0.0.1:8000:8000" \
-    -v "$STATE/hf:/root/.cache/huggingface" -v "$STATE/showcase/adapters:/adapters:ro" \
-    "$VLLM_IMAGE" --model "$MODEL" --served-model-name local/qwen-base --tensor-parallel-size 1 \
-    --max-model-len $MAX_LEN --gpu-memory-utilization "$MEM_SHARE" --enable-lora --max-lora-rank 32 "${VLLM_FLAGS[@]}" \
-    --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching
-fi
+start_vllm zeroad-vllm 0 8000 1 "$STATE/showcase/adapters:/adapters:ro" "$MEM_SHARE" "$MAX_LEN" "${VLLM_FLAGS[@]}"
 
 # verify_adapter: every object under Run 1's v50 is in ADAPTER_DIR with the size S3 holds and a matching checksum. S3's
 # ETag is the MD5 of an object uploaded in one part, and for a multipart one (the CLI's parts of 8 MiB and up) the MD5 of
@@ -165,8 +155,9 @@ else
   [ -n "$BUCKET" ] || die "no ZEROAD_S3_BUCKET in $CONF: bootstrap.sh --showcase writes it from LIVE_BUCKET"
   if ! verify_adapter >/dev/null 2>&1; then
     mkdir -p "$ADAPTER_DIR"
-    aws s3 cp --recursive --only-show-errors "s3://$BUCKET/$PREFIX/$RUN1_ADAPTER/" "$ADAPTER_DIR" 2>&1 | hide
-    [ "${PIPESTATUS[0]}" = 0 ] || die "the copy of the adapter from S3 failed"
+    if ! aws s3 cp --recursive --only-show-errors "s3://$BUCKET/$PREFIX/$RUN1_ADAPTER/" "$ADAPTER_DIR" 2>&1 | hide; then
+      die "the copy of the adapter from S3 failed"
+    fi
   fi
   verify_adapter || die "the adapter on this box does not match S3: $ADAPTER_DIR"
 fi
@@ -193,7 +184,7 @@ fi
 step "the paced engine's test, on $SHOW_ENGINE with the repo's code (pytest -m engine tests/engine/test_paced_engine.py)"
 # The test launches engine containers through Docker, so it runs here with the repo's dev environment, as the engine
 # tests do; the engine container it starts is the image built above.
-run uv run --project "$REPO" --frozen --group dev pytest -m engine tests/engine/test_paced_engine.py -q
+run_engine_test "$REPO" tests/engine/test_paced_engine.py
 
 step "box time and the power-off"
 enable_boxtime_timer

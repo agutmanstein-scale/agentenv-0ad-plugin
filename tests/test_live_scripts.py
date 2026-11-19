@@ -2741,6 +2741,9 @@ def test_showcase_bootstrap_dry_run_prints_the_plan(stubs):
     assert "zeroad-train/run/s2-run1/adapters/v50/" in text and "showcase/adapters/v1" in text
     assert "local/policy-v1" in text and "pilot.smoke" in text and "--model local/policy-v1" in text
     assert "-m engine tests/engine/test_paced_engine.py" in text
+    [engine_test] = [x for x in text.splitlines() if "pytest -m engine" in x and x.lstrip().startswith("box| +")]
+    assert "uv run --directory " in engine_test and " --project" not in engine_test  # the tests path is relative to it
+    assert engine_test.rstrip().endswith("-q -rs")
     assert "bucket-1" not in plan and "bucket-1" not in out.stdout  # the bucket is redacted everywhere
     assert "s3://<bucket>/zeroad-train/run/s2-run1/adapters/v50/" in text
     assert text.index("build-engine.sh show") < text.index("docker run -d --name zeroad-vllm")
@@ -2792,3 +2795,67 @@ def test_the_showcase_bootstrap_keeps_the_key_in_a_root_only_file_and_never_prin
     text = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1").stdout
     assert "vllm.env (0600)" in text and "VLLM_API_KEY=<random>" in text
     assert "docker run" in text and "--env-file" in text and "sk-" not in text
+
+
+def vllm_run_lines(out: str) -> list[str]:
+    return [x for x in out.splitlines() if x.startswith("+ docker run -d --name zeroad-vllm")]
+
+
+def expected_vllm_run(state, name, devices, port, tp, mount, max_len, rest):
+    return (
+        f'+ docker run -d --name {name} --restart unless-stopped --gpus \\"device={devices}\\" --ipc=host '
+        f"--env-file /etc/zeroad-live/vllm.env -e VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
+        f"-p 172.17.0.1:{port}:8000 -p 127.0.0.1:{port}:8000 -v {state}/hf:/root/.cache/huggingface -v {state}/{mount} "
+        f"{VLLM_IMAGE} --model Qwen/Qwen3-8B --served-model-name local/qwen-base --tensor-parallel-size {tp} "
+        f"--max-model-len {max_len} --gpu-memory-utilization 0.9 --enable-lora --max-lora-rank 32 {rest} "
+        "--enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching"
+    )
+
+
+def test_the_train_and_pilot_bootstraps_start_vllm_with_these_exact_docker_run_lines(stubs):
+    state = str(stubs["tmp"] / "state")
+    train = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    rest = "--dtype bfloat16 --generation-config vllm --max-loras 8 --max-cpu-loras 32"
+    assert vllm_run_lines(train.stdout) == [
+        expected_vllm_run(state, "zeroad-vllm-0", "0", 8000, 1, "train:/train:ro", 8192, rest),
+        expected_vllm_run(state, "zeroad-vllm-1", "1", 8001, 1, "train:/train:ro", 8192, rest),
+    ]
+    plain = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert vllm_run_lines(plain.stdout) == [
+        expected_vllm_run(
+            state, "zeroad-vllm", "0\\,1", 8000, 2, "pilot/adapters:/adapters:ro", 12288, "--max-loras 4 --max-cpu-loras 16"
+        )
+    ]
+
+
+def test_a_laptop_aws_error_that_quotes_the_bucket_is_redacted_for_the_showcase(stubs):
+    write_exe(
+        stubs["bin"] / "aws",
+        "#!/bin/sh\necho 'upload failed: x to s3://bucket-1/zeroad-train/box/payload.tgz' >&2\necho out-1\nexit 7\n",
+    )
+    script = f'source {LIVE}/lib/common.sh; DRY_RUN=0; AWS_CHECKED=1; aws_run "" s3 cp a b || echo "rc=$?"'
+    env = {**stubs["env"], "LIVE_REDACT_BUCKET": "1", "LIVE_BUCKET": "bucket-1"}
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+    assert "bucket-1" not in out.stderr and "s3://<bucket>/zeroad-train/box/payload.tgz" in out.stderr
+    assert out.stdout.splitlines() == ["out-1", "rc=7"]  # stdout and aws's exit status are untouched
+    env.pop("LIVE_REDACT_BUCKET")
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+    assert "s3://bucket-1/" in out.stderr  # other modes print it as before
+
+
+@pytest.mark.parametrize(
+    ("output", "rc", "ok"),
+    [
+        ("1 passed in 40s", 0, True),
+        ("2 skipped in 1s", 0, False),
+        ("1 passed, 1 skipped in 40s", 0, False),
+        ("no tests ran in 1s", 0, False),
+        ("1 failed in 3s", 1, False),
+    ],
+)
+def test_the_engine_test_must_pass_with_nothing_skipped_or_the_bootstrap_dies(stubs, output, rc, ok):
+    write_exe(stubs["bin"] / "uv", f"#!/bin/sh\necho '{output}'\nexit {rc}\n")
+    script = f"source {BOX}/lib.sh; run_engine_test {ROOT} tests/engine/test_paced_engine.py; echo reached"
+    out = subprocess.run(["bash", "-c", script], env=box_env(stubs), capture_output=True, text=True, timeout=30)
+    assert (out.returncode == 0 and "reached" in out.stdout) == ok, (out.stdout, out.stderr)
+    assert ok or "ERROR:" in out.stderr

@@ -72,6 +72,45 @@ wait_vllm_up() {
   done
 }
 
+# start_vllm NAME DEVICES PORT TP MOUNT MEM MAX_LEN [EXTRA_FLAG...]: one vLLM container, as Run 1 serves it (the extra
+# flags are the mode's dtype, LoRA and generation-config flags). Needs BRIDGE, ETC, STATE, VLLM_IMAGE and MODEL from the
+# caller. Recreated when it is not running or runs with another --max-model-len or memory share; a dry run always
+# prints the commands.
+start_vllm() {
+  local name=$1 devices=$2 port=$3 tp=$4 mount=$5 mem=$6 max_len=$7
+  shift 7
+  if [ "$DRY_RUN" = 1 ] || [ -z "$(docker ps -q --filter name="^$name\$")" ] \
+      || ! docker inspect --format '{{join .Args " "}}' "$name" 2>/dev/null \
+        | grep -q -- "--max-model-len $max_len --gpu-memory-utilization $mem "; then
+    run docker rm -f "$name" >/dev/null 2>&1 || true
+    run docker run -d --name "$name" --restart unless-stopped --gpus "\"device=$devices\"" --ipc=host \
+      --env-file "$ETC/vllm.env" -e VLLM_ALLOW_RUNTIME_LORA_UPDATING=True -p "$BRIDGE:$port:8000" -p "127.0.0.1:$port:8000" \
+      -v "$STATE/hf:/root/.cache/huggingface" -v "$mount" \
+      "$VLLM_IMAGE" --model "$MODEL" --served-model-name local/qwen-base --tensor-parallel-size "$tp" \
+      --max-model-len "$max_len" --gpu-memory-utilization "$mem" --enable-lora --max-lora-rank 32 "$@" \
+      --enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching
+  fi
+}
+
+# run_engine_test REPO PYTEST_ARG...: runs the engine tests (`pytest -m engine`) from REPO and dies unless at least one
+# passed and none were skipped: pytest exits 0 when every test skips (no engine image, no Docker), which proves nothing.
+run_engine_test() {
+  local repo=$1 out
+  shift
+  if [ "$DRY_RUN" = 1 ]; then
+    run uv run --directory "$repo" --frozen --group dev pytest -m engine "$@" -q -rs
+    return 0
+  fi
+  out=$(mktemp)
+  uv run --directory "$repo" --frozen --group dev pytest -m engine "$@" -q -rs 2>&1 | tee "$out" \
+    || { rm -f "$out"; die "the engine test failed: $*"; }
+  if ! grep -Eq '[0-9]+ passed' "$out" || grep -Eq '[0-9]+ skipped' "$out"; then
+    rm -f "$out"
+    die "the engine test did not pass in full (nothing passed or some tests skipped): $*"
+  fi
+  rm -f "$out"
+}
+
 # enable_boxtime_timer: the timer the budget guard reads box hours from.
 enable_boxtime_timer() {
   run sh -c 'cp "$1"/box/units/zeroad-boxtime.service "$1"/box/units/zeroad-boxtime.timer /etc/systemd/system/' _ "$BOX_HOME"
