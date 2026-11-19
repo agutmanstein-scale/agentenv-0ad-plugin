@@ -33,7 +33,7 @@ EXCEPTION_TYPE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):")
 RESULTS = {"won": "win", "lost": "loss", "drawn": "draw"}
 HOW = {"conquest": "conquest", "time_cap": "net_worth", "safety_cap": "net_worth"}
 
-Result = Literal["win", "loss", "draw", "no_result"]
+Result = Literal["win", "loss", "draw", "no_result", "pending"]
 How = Literal["conquest", "net_worth"]
 Blame = Literal["policy", "opponent", "engine"]
 

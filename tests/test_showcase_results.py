@@ -275,3 +275,14 @@ def test_table_uses_rotation_order_and_lists_unplayed_opponents(tmp_path: Path) 
         {"opponent": "astra", "w": 1, "l": 0, "d": 0, "nr": 0},
         {"opponent": "petra-3", "w": 0, "l": 0, "d": 0, "nr": 0},
     ]
+
+
+def test_a_pending_row_round_trips_and_is_not_counted() -> None:
+    row = GameRow(
+        0, "g", "Opus", 1, "1", "pending", None, None, {"policy": 0, "opponent": 0}, {"policy": 0, "opponent": 0}, 0.0
+    )
+    assert GameRow.from_json(row.to_json()) == row
+    session = Session(Path("unused.json"), rotation=("Opus",))
+    session.add(row)
+    assert session.table() == [{"opponent": "Opus", "w": 0, "l": 0, "d": 0, "nr": 0}]
+    assert session.dropped() == set()

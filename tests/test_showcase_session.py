@@ -16,7 +16,7 @@ import httpx
 import pytest
 
 from agentenv_zeroad.showcase import session as session_mod
-from agentenv_zeroad.showcase.__main__ import _check, main
+from agentenv_zeroad.showcase.__main__ import _check, budget_ok, check_with_retries, main, unwritable
 from agentenv_zeroad.showcase.results import GameRow, Session
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
@@ -83,6 +83,7 @@ class World:
         self.left_s = 1e9
         self.preflight: list[str] = []
         self.preflights = 0
+        self.skipped: list[set[str]] = []
         self.policy_fails = False
         self.spend: list[tuple[str, float]] = []
         self.on_call: Any = None
@@ -132,8 +133,9 @@ class World:
             self.budget_calls.append((usd, hours))
             return self.budget
 
-        async def preflight() -> list[str]:
+        async def preflight(skip) -> list[str]:
             self.preflights += 1
+            self.skipped.append(set(skip))
             return self.preflight
 
         def model_for(seat, slot):
@@ -533,3 +535,128 @@ def test_run_refuses_without_a_spend_ledger(
     monkeypatch.delenv("ZEROAD_SPEND_LEDGER", raising=False)
     assert main(["run", "--out", str(tmp_path / "s")]) == 2
     assert "ZEROAD_SPEND_LEDGER" in capsys.readouterr().err
+
+
+def test_a_natural_end_is_never_recorded_as_a_preflight_failure(world: World) -> None:
+    world.preflight = ["anthropic/claude-opus-5-5: HTTP 401"]
+    session = world.run(world.opts(max_games=0))
+    assert session.ended == "max_games" and world.preflights == 0
+    world.preflight = []
+    session = world.run(world.opts(max_games=1))
+    assert session.ended == "max_games" and world.preflights == 1
+
+
+def test_preflight_skips_dropped_opponents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    world = World(tmp_path, monkeypatch, cap_minutes=3.0)
+    world.failing = {"astra"}
+    world.run(world.opts(max_games=6))
+    assert world.skipped[0] == set() and world.skipped[-1] == {"astra"}
+
+
+def test_sigterm_interrupts_a_preflight_in_progress(world: World) -> None:
+    async def hangs(skip) -> list[str]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.Event().wait()
+        return []
+
+    deps = replace(world.deps(), preflight=hangs)
+    session = asyncio.run(run_session(world.opts(), CFG, deps, None))
+    assert session.rows == [] and session.ended == "stopped"
+
+
+def test_sigint_is_a_stop_by_hand_too(world: World) -> None:
+    before = signal.getsignal(signal.SIGINT)
+    world.on_call = lambda: os.kill(os.getpid(), signal.SIGINT)
+    session = world.run(world.opts())
+    (row,) = session.rows
+    assert (row.result, row.reason) == ("no_result", "stopped by hand") and session.ended == "stopped"
+    assert signal.getsignal(signal.SIGINT) == before
+
+
+def test_a_stop_during_the_broadcast_start_still_stops_the_broadcast(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(session_mod, "OverlayServer", FakeOverlay)
+
+    class Hanging(FakeBroadcast):
+        async def start(self, url: str) -> None:
+            self.calls.append("start")
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.Event().wait()
+
+    broadcast = Hanging()
+    session = world.run(world.opts(), broadcast)
+    assert broadcast.calls == ["open", "start", "stop"]
+    assert session.ended == "stopped" and session.rows[0].reason == "stopped by hand"
+
+
+def test_preflight_retries_each_model_three_times_ten_seconds_apart() -> None:
+    seat = SeatSpec(kind="llm", civ="rome", model="m", base_url="http://v.invalid/v1", api_key_env="K")
+    answers = iter([503, 503, 200])
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handler(request):
+        code = next(answers)
+        return httpx.Response(code, json={"data": [{"id": "m"}]})
+
+    async def go(h):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as http:
+            return await check_with_retries(seat, {"K": "k"}, http, sleep)
+
+    assert asyncio.run(go(handler)) is None and sleeps == [10.0, 10.0]
+    sleeps.clear()
+    assert asyncio.run(go(lambda request: httpx.Response(503))) == "m: HTTP 503" and sleeps == [10.0, 10.0]
+
+
+def test_budget_check_is_called_without_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[Any, ...]] = []
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def fake_exec(*args, **kwargs):
+        seen.append(args)
+        return Proc()
+
+    monkeypatch.setenv("LIVE_BUDGET_USD", "60")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert asyncio.run(budget_ok(9.0, 0.75)) is True
+    args = seen[0]
+    assert args[0].endswith("box/budget.sh") and args[1:3] == ("check", "--no-record")
+    assert "--planned-usd" in args and "--budget" in args
+
+
+def test_unwritable_ledger_or_out_is_refused_with_a_message(tmp_path: Path) -> None:
+    assert unwritable(tmp_path / "ledger.jsonl", tmp_path / "out") is None
+    assert "spend ledger" in unwritable(tmp_path / "nope" / "ledger.jsonl", tmp_path / "out")
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    assert "output folder" in unwritable(tmp_path / "ledger.jsonl", blocker / "out")
+
+
+def test_a_pending_row_is_a_verify_problem(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    session = Session(tmp_path / "session.json")
+    session.add(
+        GameRow(
+            0,
+            "g-pending",
+            "Opus",
+            1,
+            "1",
+            "pending",
+            None,
+            None,
+            {"policy": 0, "opponent": 0},
+            {"policy": 0, "opponent": 0},
+            0.0,
+        )
+    )
+    session.save()
+    assert main(["verify", str(tmp_path)]) == 1
+    assert "g-pending: the game never finished (pending)" in capsys.readouterr().out

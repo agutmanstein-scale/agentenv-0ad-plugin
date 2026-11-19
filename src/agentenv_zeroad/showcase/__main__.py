@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from pathlib import Path
 
 import httpx
@@ -45,6 +45,8 @@ VLLM_URL_ENV = "ZEROAD_VLLM_URL"
 LEDGER_ENV = "ZEROAD_SPEND_LEDGER"
 DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
 READY_TIMEOUT_S = 180.0
+PREFLIGHT_TRIES = 3
+PREFLIGHT_RETRY_S = 10.0
 
 log = logging.getLogger("agentenv_zeroad.showcase")
 
@@ -76,6 +78,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     return asyncio.run(run_command(args))
 
 
+def unwritable(ledger: Path, out: Path) -> str | None:
+    """Why the session can't write what it must (the spend ledger, its own folder), or None. The container runs as
+    another user against a read-only state folder, so this is checked before a game costs anything."""
+    try:
+        with ledger.open("a"):
+            pass
+    except OSError as e:
+        return f"cannot append to the spend ledger {ledger.name} ({type(e).__name__}): its spend would be lost"
+    probe = out / ".write-check"
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe.write_text("")
+        probe.unlink()
+    except OSError as e:
+        return f"cannot write to the output folder {out.name} ({type(e).__name__})"
+    return None
+
+
 def verify_dir(directory: Path) -> int:
     """Print each game's problems (the row's, and a fresh check of its results.json); exit 1 if there are any."""
     data = json.loads((directory / "session.json").read_text())
@@ -84,7 +104,9 @@ def verify_dir(directory: Path) -> int:
         row = GameRow.from_json(raw)
         problems = list(row.problems)
         results = directory / "games" / row.game_id / "results.json"
-        if results.is_file() and row.blame != "engine":
+        if row.result == "pending":
+            problems.append("the game never finished (pending)")
+        elif results.is_file() and row.blame != "engine":
             problems += [p for p in verify_lockstep(json.loads(results.read_text())) if p not in problems]
         for problem in problems:
             print(f"{row.game_id}: {problem}")
@@ -96,6 +118,9 @@ async def run_command(args: argparse.Namespace) -> int:
     ledger = os.environ.get(LEDGER_ENV)
     if not ledger:
         print(f"{LEDGER_ENV} is not set: the session's spend would never reach the box ledger", file=sys.stderr)
+        return 2
+    if problem := unwritable(Path(ledger), args.out):
+        print(problem, file=sys.stderr)
         return 2
     cfg = ShowcaseConfig.load(args.config)
     rotation = tuple(args.rotation.split(",")) if args.rotation else cfg.rotation
@@ -123,7 +148,7 @@ async def run_command(args: argparse.Namespace) -> int:
             budget_ok=budget_ok,
             poweroff_left_s=poweroff_left_s,
             model_for=lambda seat, slot: build_model(seat, slot, http=http, cap_usd=opts.seat_cap_usd),
-            preflight=lambda: preflight_problems(cfg, opts, http),
+            preflight=lambda skip: preflight_problems(cfg, opts, http, skip),
             record_spend=lambda what, usd: append_ledger(Path(ledger), what, usd),
             now=time.monotonic,
             sleep=asyncio.sleep,
@@ -151,6 +176,7 @@ async def budget_ok(planned_usd: float, planned_hours: float) -> bool:
     proc = await asyncio.create_subprocess_exec(
         str(script),
         "check",
+        "--no-record",  # the container's state folder is read-only: skip boxtime.json
         "--planned-usd",
         f"{planned_usd:g}",
         "--planned-hours",
@@ -175,17 +201,40 @@ def poweroff_left_s() -> float:
         return 0.0
 
 
-async def preflight_problems(cfg: ShowcaseConfig, opts: SessionOptions, http: httpx.AsyncClient) -> list[str]:
+async def preflight_problems(
+    cfg: ShowcaseConfig,
+    opts: SessionOptions,
+    http: httpx.AsyncClient,
+    skip: Collection[str] = (),
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> list[str]:
     """One check per model in the rotation (and the policy's): `GET /v1/models` with the seat's key lists the model.
     A model call would spend, and the first game's own calls find anything this misses."""
     seats: dict[str, SeatSpec] = {}
     run_cfg = cfg.run_config()
     panel = next(p for p in run_cfg.panels if p.name == cfg.panel)
-    for opponent in opts.rotation:
+    for opponent in (o for o in opts.rotation if o not in skip):
         for seat in game_spec(cfg, run_cfg, panel, opts, cfg.first_index, opponent).seats:
             if seat.kind == "llm" and seat.model:
                 seats[seat.model] = seat
-    return [p for p in [await _check(seat, os.environ, http) for seat in seats.values()] if p]
+    found = [await check_with_retries(seat, os.environ, http, sleep) for seat in seats.values()]
+    return [p for p in found if p]
+
+
+async def check_with_retries(
+    seat: SeatSpec,
+    environ: Mapping[str, str],
+    http: httpx.AsyncClient,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> str | None:
+    """`_check`, up to PREFLIGHT_TRIES times PREFLIGHT_RETRY_S apart: a model is reported only if every try fails."""
+    problem = await _check(seat, environ, http)
+    for _ in range(PREFLIGHT_TRIES - 1):
+        if problem is None:
+            break
+        await sleep(PREFLIGHT_RETRY_S)
+        problem = await _check(seat, environ, http)
+    return problem
 
 
 async def _check(seat: SeatSpec, environ: Mapping[str, str], http: httpx.AsyncClient) -> str | None:

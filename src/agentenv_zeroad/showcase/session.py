@@ -24,7 +24,7 @@ import re
 import secrets
 import signal
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -51,6 +51,7 @@ ENGINE_FAILURES_IN_A_ROW = 3
 WATCH_EVERY_S = 1.0
 POLICY_FAILURES_IN_A_ROW = 2
 STOPPED_BY_HAND = "stopped by hand"
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)  # a Ctrl-C is a stop by hand too
 CRASHED = "the box or the runner failed"
 NON_RUN_CONFIGS = frozenset({"sequence.toml", "sft-panels.toml"})  # settings and a template, not run configs
 NO_FAILURES = {"policy": 0, "opponent": 0}
@@ -80,14 +81,15 @@ class SessionOptions:
 @dataclass(frozen=True)
 class SessionDeps:
     """What the session needs from the box; tests fake them. `budget_ok` is `budget.sh check`, `preflight` returns
-    the problems found (one check per model in the rotation, run before every game), `record_spend(what, usd)` books a
+    the problems found (one check per model of the rotation but the dropped opponents' ids it is given, run before
+    every game), `record_spend(what, usd)` books a
     game's spend estimate in the box ledger `budget.sh check` reads."""
 
     start_engine: Callable[[], Awaitable[RunningEngine]]
     budget_ok: Callable[[float, float], Awaitable[bool]]
     poweroff_left_s: Callable[[], float]
     model_for: ModelFor
-    preflight: Callable[[], Awaitable[list[str]]]
+    preflight: Callable[[Collection[str]], Awaitable[list[str]]]
     record_spend: Callable[[str, float], None]
     now: Callable[[], float]
     sleep: Callable[[float], Awaitable[None]]
@@ -192,10 +194,11 @@ class _Runner:
         self.session.ended = self.session.ended_why = None
         self.started_at = self.deps.now()
         loop = asyncio.get_running_loop()
-        handled = False
-        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
-            loop.add_signal_handler(signal.SIGTERM, self.stop.set)
-            handled = True
+        handled: list[signal.Signals] = []
+        for sig in STOP_SIGNALS:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, self.stop.set)
+                handled.append(sig)
         overlay = self._start_overlay()
         try:
             await self._run()
@@ -213,9 +216,9 @@ class _Runner:
         server.start()
         return server
 
-    async def _shutdown(self, overlay: OverlayServer | None, handled: bool) -> None:
-        if handled:
-            asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+    async def _shutdown(self, overlay: OverlayServer | None, handled: list[signal.Signals]) -> None:
+        for sig in handled:
+            asyncio.get_running_loop().remove_signal_handler(sig)
         if self.broadcast is not None and self.broadcast_started:
             with contextlib.suppress(Exception):
                 await self.broadcast.stop()
@@ -247,10 +250,14 @@ class _Runner:
             opponent = self._next_opponent()
             if opponent is None:
                 return self._end("opponents", "every opponent in the rotation was dropped")
-            if problems := await self.deps.preflight():
-                return self._end("preflight", "; ".join(problems))
             if (refusal := await self._refusal(opponent)) is not None:
                 return self._end(*refusal)
+            try:
+                problems = await self._until_stop(self.deps.preflight(self._dropped_ids()))
+            except _Stopped:
+                return self._end("stopped", STOPPED_BY_HAND)
+            if problems:
+                return self._end("preflight", "; ".join(problems))
             try:
                 start = next_starts(self.run_cfg, self.cfg.first_index, self._used(), 1)[0]
             except ValueError as e:
@@ -278,6 +285,10 @@ class _Runner:
             if match := re.match(rf"{re.escape(self.panel.name)}-(\d+)-", folder.name):
                 found.add(position(self.run_cfg, "held_out", int(match.group(1))).seed)
         return found
+
+    def _dropped_ids(self) -> set[str]:
+        dropped = self.session.dropped()
+        return {o for o, name in zip(self.opts.rotation, self.names, strict=True) if name in dropped}
 
     def _next_opponent(self) -> str | None:
         """The rotation's opponent after the last game's, skipping dropped ones (as the rotation's id, not its name)."""
@@ -321,7 +332,7 @@ class _Runner:
             opponent=name,
             seed=spec.seed,
             policy_slot=slot,
-            result="pending",  # type: ignore[arg-type]
+            result="pending",
             how=None,
             reason=None,
             failed=dict(NO_FAILURES),
@@ -397,8 +408,14 @@ class _Runner:
             await self.broadcast.attach_game()
             return
         await self.broadcast.open_display()
-        await self.broadcast.start(f"http://127.0.0.1:{OVERLAY_PORT}/live?stream&token={self.token}")
-        self.broadcast_started = True
+        self.broadcast_started = True  # so a stop or a failure part-way still stops Chrome and ffmpeg
+        try:
+            await self.broadcast.start(f"http://127.0.0.1:{OVERLAY_PORT}/live?stream&token={self.token}")
+        except BaseException:
+            self.broadcast_started = False
+            with contextlib.suppress(Exception):
+                await self.broadcast.stop()
+            raise
 
     async def _play(self, spec: GameSpec, running: RunningEngine) -> dict[str, Any]:
         game = asyncio.create_task(
