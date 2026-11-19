@@ -26,6 +26,7 @@ import httpx
 from agentenv_zeroad import live
 from agentenv_zeroad.engine import EngineOptions, RunningEngine, free_port, start_engine
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, base_of
+from agentenv_zeroad.showcase.replay import start_headless_engine, start_replay_process
 from agentenv_zeroad.showcase.results import GameRow, verify_lockstep
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, game_spec, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
@@ -70,9 +71,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "verify":
         return verify_dir(args.dir)
-    if args.mode == "replay":
-        print("replay mode is not built yet", file=sys.stderr)
-        return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request URL at INFO
     return asyncio.run(run_command(args))
@@ -152,6 +150,8 @@ async def run_command(args: argparse.Namespace) -> int:
             record_spend=lambda what, usd: append_ledger(Path(ledger), what, usd),
             now=time.monotonic,
             sleep=asyncio.sleep,
+            start_headless=lambda: start_headless_engine(args.out / "headless-home"),
+            start_replay=lambda commands: start_replay_process(commands, DISPLAY),
         )
         session = await run_session(opts, cfg, deps, broadcast)
     print(f"session ended: {session.ended} ({session.ended_why}); {len(session.rows)} games in {opts.out}")

@@ -76,9 +76,11 @@ def showcase_state(
     played_at: str | None,
     intermission: dict | None,
     dropped: Sequence[str] = (),
+    base: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """`overlay_state(match)` (or nothing without a match) plus the showcase's blocks. Never holds a secret."""
-    state: dict[str, Any] = overlay_state(match) if match is not None else {}
+    """`overlay_state(match)` (or `base`, a replay's game block, or nothing) plus the showcase's blocks. Never holds a
+    secret."""
+    state: dict[str, Any] = overlay_state(match) if match is not None else dict(base or {})
     table = session.table()
     state["phase"] = phase
     state["series"] = {

@@ -315,13 +315,6 @@ def test_games_are_paced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     assert clock["pace_s"] == 0.2 and clock["paced_wait_s"] > 2
 
 
-def test_replay_mode_is_not_built_yet(world: World, capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(NotImplementedError, match="replay mode is not built yet"):
-        world.run(world.opts(mode="replay"))
-    assert main(["run", "--out", str(world.out), "--mode", "replay"]) == 2
-    assert "replay mode is not built yet" in capsys.readouterr().err
-
-
 class FakeBroadcast:
     def __init__(self) -> None:
         self.calls: list[str] = []
