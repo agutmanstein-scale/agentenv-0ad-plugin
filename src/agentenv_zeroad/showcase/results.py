@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -28,6 +29,7 @@ INTERFACE = "v2"
 MAX_FAILED_SHARE = 0.1
 FAILURES_IN_A_ROW = 5
 POLICY_NAME = "Qwen"
+EXCEPTION_TYPE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):")
 RESULTS = {"won": "win", "lost": "loss", "drawn": "draw"}
 HOW = {"conquest": "conquest", "time_cap": "net_worth", "safety_cap": "net_worth"}
 
@@ -97,11 +99,16 @@ def classify(results: Mapping[str, Any], *, index: int, opponent: str, policy_sl
         role for role in ("policy", "opponent") if decisions[role] and failed[role] / decisions[role] > MAX_FAILED_SHARE
     ]
     if engine:
-        result, reason, blame = "no_result", str(engine), "engine"
+        result, reason, blame = "no_result", _engine_reason(str(engine)), "engine"
     elif early:
         result = "no_result"
-        blame = _worse(failed)
-        reason = f"{names[blame]}, {FAILURES_IN_A_ROW} failed calls in a row" if blame else str(early)
+        slot = str(early.get("slot")) if isinstance(early, Mapping) else None
+        blame = "policy" if slot == policy_slot else "opponent" if slot is not None else None
+        reason = (
+            f"{names[blame]}, {FAILURES_IN_A_ROW} failed calls in a row"
+            if blame
+            else f"a seat failed {FAILURES_IN_A_ROW} calls in a row"
+        )
     elif over:
         blame = max(over, key=lambda role: failed[role] / decisions[role])
         result, reason = "no_result", f"{names[blame]}, {failed[blame]} failed calls"
@@ -129,10 +136,10 @@ def classify(results: Mapping[str, Any], *, index: int, opponent: str, policy_sl
     )
 
 
-def _worse(failed: Mapping[str, int]) -> Blame | None:
-    if failed["policy"] == failed["opponent"]:
-        return None
-    return "policy" if failed["policy"] > failed["opponent"] else "opponent"
+def _engine_reason(detail: str) -> str:
+    """A fixed phrase and the exception's type name only: the text of an exception can carry hosts and bucket names."""
+    named = EXCEPTION_TYPE.match(detail)
+    return f"engine failed ({named.group(1)})" if named else "engine failed"
 
 
 def verify_lockstep(results: Mapping[str, Any]) -> list[str]:

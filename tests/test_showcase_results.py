@@ -70,7 +70,7 @@ def test_engine_failure_is_no_result() -> None:
     row = classified(results(failed=None, status="failed", detail="the engine stopped stepping", ended_by="failed"))
     assert row.result == "no_result"
     assert row.how is None
-    assert "engine stopped stepping" in (row.reason or "")
+    assert row.reason == "engine failed"
     assert row.blame == "engine"
 
 
@@ -78,7 +78,14 @@ def test_failed_key_is_no_result() -> None:
     res = results()
     res["failed"] = "the box went away"
     row = classified(res)
-    assert (row.result, row.reason) == ("no_result", "the box went away")
+    assert (row.result, row.reason) == ("no_result", "engine failed")
+
+
+def test_engine_failure_reason_carries_no_url() -> None:
+    detail = "ConnectError: http://10.0.0.5:8000/v1 ... s3://some-bucket/x"
+    row = classified(results(status="failed", detail=detail, ended_by="failed"))
+    assert row.reason == "engine failed (ConnectError)"
+    assert "://" not in row.reason and "some-bucket" not in row.reason
 
 
 def test_ten_percent_failed_calls_is_no_result_either_side() -> None:
@@ -124,11 +131,23 @@ def test_petra_has_no_calls() -> None:
 
 
 def test_ended_early_is_no_result_with_reason() -> None:
-    res = results(failed={"2": 5}, decisions={"1": 60, "2": 60}, showcase={"ended_early": "5 failures in a row"})
+    ended = {"slot": "2", "failures": 5}
+    res = results(failed={"2": 5}, decisions={"1": 60, "2": 60}, showcase={"ended_early": ended})
     row = classified(res, opponent="Opus")
     assert row.result == "no_result"
     assert row.reason == "Opus, 5 failed calls in a row"
     assert row.blame == "opponent"
+
+
+def test_ended_early_blames_the_slot_that_failed() -> None:
+    res = results(
+        failed={"1": 9, "2": 5},
+        decisions={"1": 200, "2": 200},
+        showcase={"ended_early": {"slot": "2", "failures": 5}},
+    )
+    assert classified(res).blame == "opponent"
+    res["showcase"]["ended_early"]["slot"] = "1"
+    assert classified(res).blame == "policy"
 
 
 def test_verify_lockstep_passes_a_13_3_game() -> None:
@@ -246,3 +265,13 @@ def test_load_of_a_missing_file_is_empty(tmp_path: Path) -> None:
     session.load()
     assert session.rows == []
     assert session.ended is None
+
+
+def test_table_uses_rotation_order_and_lists_unplayed_opponents(tmp_path: Path) -> None:
+    session = Session(tmp_path / "session.json", rotation=("opus", "astra", "petra-3"))
+    session.add(row(0, "astra", "win"))
+    assert session.table() == [
+        {"opponent": "opus", "w": 0, "l": 0, "d": 0, "nr": 0},
+        {"opponent": "astra", "w": 1, "l": 0, "d": 0, "nr": 0},
+        {"opponent": "petra-3", "w": 0, "l": 0, "d": 0, "nr": 0},
+    ]
