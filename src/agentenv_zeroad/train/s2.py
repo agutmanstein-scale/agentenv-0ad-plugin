@@ -38,6 +38,9 @@ if the gates of the one before passed:
               else the base model
   run1        the RL run, panels at its end; then the report, the final S3 upload and (unless --no-shutdown) the box's
               own `shutdown -h now`, which stops it (it is never terminated from here)
+  run1_frontier  play-only: Run 1's final adapter (copied into this step's own root as version 1) plays 16 games each
+              against Opus and Astra at equal latency, on the starts of the baselines' frontier panel, so its game j
+              pairs with v0's game j; counts per teacher from the policy seat's side
 
 A failed gate, a step cap, a budget refusal or a tripwire pause stops the sequence with the reason in gates.json and
 status.json; the report and the final upload still run. Every step is a subprocess (a stuck one gets SIGTERM at its cap,
@@ -84,7 +87,7 @@ log = logging.getLogger("s2")
 STOPPED_BY_HAND = "stopped by hand (SIGTERM)"
 STEPS = (
     "e1", "baselines", "calibration", "tripwire", "e2", "e3_check", "e3", "e4_check", "e4", "labels", "sft",
-    "sft_panels", "init", "run1"
+    "sft_panels", "init", "run1", "run1_frontier"
 )  # fmt: skip
 GRACE_S = 2400.0  # an orchestrator told to stop uploads for up to 3 x 10 minutes (sync.SYNC_TIMEOUT_S)
 SFT_PREFIX = "sft-epoch"
@@ -104,6 +107,8 @@ E4_END_PANELS = (
     "end-final",
 )  # e4.toml's end panels: the start adapter, then the adapter current at the end
 RUN1_END_PANELS = ("end-base", "end-final")  # run1.toml's end panels: v0, then the adapter current at the end
+RUN1_FRONTIER_PANEL = "frontier-final"  # run1-frontier.toml's one panel: Run 1's final adapter against the teachers
+RUN1_FRONTIER_VERSION = 1  # Run 1's final adapter is published as this version in the root of the frontier check
 RUN1_INIT_VERSION = 1  # the SFT adapter, when Run 1 starts from it, is published as this version in Run 1's root
 E4_INIT_VERSION = 1  # E3's adapter is published as this version in the root of E4's check and of E4
 E4_MIN_CAP_GAMES = 30  # the margin scale is measured on at least this many of v0's cap-ended games
@@ -166,6 +171,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "whole_groups": True,
     },
     "e4_check": {"config": "e4-check.toml", "cap_hours": 3.0, "expected_hours": 2.0},
+    "run1_frontier": {"config": "run1-frontier.toml", "cap_hours": 2.0, "expected_hours": 1.2, "planned_usd": 100.0},
     "e4": {
         "config": "e4.toml",
         "cap_hours": 7.5,
@@ -396,7 +402,19 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     settings = load_settings(path / "sequence.toml")
     configs = ConfigDir(path, settings)
     rates, frontier = set(), False
-    for step in ("e1", "e2", "e3_check", "e3", "e4_check", "e4", "baselines", "sft", "sft_panels", "run1"):
+    for step in (
+        "e1",
+        "e2",
+        "e3_check",
+        "e3",
+        "e4_check",
+        "e4",
+        "baselines",
+        "sft",
+        "sft_panels",
+        "run1",
+        "run1_frontier",
+    ):
         cfg = configs.load(step)
         keys = check_run(cfg)
         frontier = frontier or bool(keys)
@@ -441,6 +459,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
     _check_e3(configs, settings)
     _check_e4(configs, settings)
     _check_run1(configs, settings)
+    _check_run1_frontier(configs, settings)
     sp = settings["sft_panels"]
     if not 0 < int(sp["panel_games"]) < int(sp["heldout_games"]):
         raise ValueError(
@@ -583,6 +602,46 @@ def _check_run1(configs: ConfigDir, settings: Settings) -> None:
         )
     if not run1.stop_when_done:
         raise ValueError("run1: stop_when_done must be set, so the run ends when the end panels are played")
+
+
+def teacher_specs(cfg: RunConfig, panel: Any) -> dict[str, list[Any]]:
+    """A frontier panel's game specs by teacher, in game order (game j of a teacher is its j-th)."""
+    from agentenv_zeroad.train.calibration import panel_specs
+
+    specs, start, out = panel_specs(cfg, panel), 0, {}
+    for teacher in panel.teachers:
+        out[teacher.name] = specs[start : start + teacher.games]
+        start += teacher.games
+    return out
+
+
+def _check_run1_frontier(configs: ConfigDir, settings: Settings) -> None:
+    """What the frontier check relies on: its one panel plays Run 1's final adapter as version 1, the run plays panels
+    only, and each teacher, set as in the baselines' frontier panel, plays game j on that panel's game j start (specs
+    equal but for the game id)."""
+    check, base = configs.load("run1_frontier"), configs.load("baselines")
+    if [p.name for p in check.panels] != [RUN1_FRONTIER_PANEL] or check.panels[0].kind != "frontier":
+        raise ValueError(f"{check.run_id}: its one panel is a frontier panel named {RUN1_FRONTIER_PANEL}")
+    mine = check.panels[0]
+    if mine.version != RUN1_FRONTIER_VERSION:
+        raise ValueError(f"run1_frontier: {mine.name} plays v{RUN1_FRONTIER_VERSION}, Run 1's final adapter")
+    if not check.panels_only or not check.stop_when_done:
+        raise ValueError("run1_frontier: the check plays panels only and ends when they are done")
+    theirs = next(p for p in base.panels if p.name == settings["baselines"]["frontier_panel"])
+    old = {t.name: t for t in theirs.teachers}
+    before, after = teacher_specs(base, theirs), teacher_specs(check, mine)
+    for teacher in mine.teachers:
+        other = old.get(teacher.name)
+        same = other is not None and all(
+            getattr(teacher, k) == getattr(other, k) for k in ("model", "effort", "max_tokens")
+        )
+        if not same:
+            raise ValueError(f"run1_frontier: teacher {teacher.name} is not set as in the baselines' frontier panel")
+        if any(
+            dataclasses.replace(x, game_id="x") != dataclasses.replace(y, game_id="x")
+            for x, y in zip(before[teacher.name], after[teacher.name], strict=False)
+        ):
+            raise ValueError(f"run1_frontier: {teacher.name}'s games are not on the baselines' frontier starts")
 
 
 def _check_panel_names(configs: ConfigDir, settings: Settings) -> None:
@@ -1637,6 +1696,131 @@ def step_run1(ctx: Ctx) -> Outcome:
     return Outcome(gates, detail)
 
 
+# ---- Run 1's frontier check -----------------------------------------------------------------------
+def run1_adapter(ctx: Ctx) -> tuple[int, Path]:
+    """Run 1's final adapter: the version its end-final panel played (else the highest adapter in its root) and that
+    version's folder in Run 1's root."""
+    root = ctx.cfg("run1").root
+    version = int((read_json(root / "panels" / RUN1_END_PANELS[1] / "summary.json") or {}).get("version") or 0)
+    if not version:
+        found = [int(p.name[1:]) for p in (root / "adapters").glob("v[0-9]*") if p.name[1:].isdigit()]
+        version = max(found, default=0)
+    if not version:
+        raise StepFailed(f"Run 1 left no end-final summary with an adapter version and no adapters/vN in {root}")
+    return version, root / "adapters" / f"v{version}"
+
+
+def frontier_rows(folder: Path) -> list[dict[str, Any]]:
+    """The finished games of a frontier panel folder from the policy seat's side: the teacher, the game's index j in its
+    teacher's run (from the game id), the policy's outcome, how the game ended, the teacher's failed calls and spend."""
+    rows = []
+    for path in sorted(folder.glob("*/results.json")):
+        res = read_json(path) or {}
+        slot = (
+            rs.policy_slot(res, None) if res.get("status") == "finished" and len(res.get("seats") or {}) == 2 else None
+        )
+        opp = rs.other_slot(res, slot) if slot is not None else None
+        found = re.search(r"-(\d+)(?:-r\d+)?$", str((res.get("spec") or {}).get("game_id") or ""))
+        if slot is None or opp is None or found is None:
+            continue
+        seat = res["seats"][opp] or {}
+        rows.append(
+            {
+                "teacher": rs.player_id(res, opp),
+                "j": int(found.group(1)),
+                "outcome": str((res["seats"][slot] or {}).get("outcome") or ""),
+                "ended_by": str(res.get("ended_by") or ""),
+                "failed_calls": sum(1 for c in seat.get("brain_calls") or [] if c.get("error")),
+                "usd": float(((seat.get("spend") or {}).get("brain") or {}).get("usd_est") or 0.0),
+            }
+        )
+    return rows
+
+
+def frontier_detail(
+    final: Sequence[Mapping[str, Any]], v0: Sequence[Mapping[str, Any]], teachers: Sequence[str]
+) -> dict[str, Any]:
+    """Per teacher, plain counts from the Qwen seat's side (games, wins and losses, each by conquest or at a cap, the
+    teacher's failed calls per game and spend) and, by game index, v0's result on the games both panels have."""
+
+    def tally(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        count = {"games": len(rows), "won": 0, "lost": 0, "won_by_conquest": 0, "won_at_cap": 0}
+        count |= {"lost_by_conquest": 0, "lost_at_cap": 0}
+        for r in rows:
+            if r["outcome"] in ("won", "lost"):
+                count[r["outcome"]] += 1
+                kind = (
+                    "by_conquest" if r["ended_by"] == "conquest" else "at_cap" if r["ended_by"] in rs.CAP_ENDS else ""
+                )
+                if kind:
+                    count[f"{r['outcome']}_{kind}"] += 1
+        return count
+
+    out: dict[str, Any] = {}
+    for teacher in (n for n in teachers if any(r["teacher"] == n for r in final)):
+        mine = sorted((r for r in final if r["teacher"] == teacher), key=lambda r: r["j"])
+        theirs = {r["j"]: r for r in v0 if r["teacher"] == teacher}
+        shared = [(r, theirs[r["j"]]) for r in mine if r["j"] in theirs]
+        count = tally(mine)
+        out[teacher] = {
+            **count,
+            "failed_calls_per_game": sum(r["failed_calls"] for r in mine) / len(mine),
+            "spend_usd": round(sum(r["usd"] for r in mine), 4),
+            "paired_with_v0": {
+                "shared": len(shared),
+                "qwen_won": sum(a["outcome"] == "won" for a, _ in shared),
+                "qwen_lost": sum(a["outcome"] == "lost" for a, _ in shared),
+                "v0_won": sum(b["outcome"] == "won" for _, b in shared),
+                "v0_lost": sum(b["outcome"] == "lost" for _, b in shared),
+                "games": [{"j": a["j"], "run1": a["outcome"], "v0": b["outcome"]} for a, b in shared],
+            },
+        }
+    return out
+
+
+def frontier_lines(detail: Mapping[str, Any]) -> list[str]:
+    """One line per teacher: "opus: Qwen 11-5 (v0 4-4 on the shared 8)"."""
+    lines = []
+    for teacher, d in detail.items():
+        p = d["paired_with_v0"]
+        shared = f"v0 {p['v0_won']}-{p['v0_lost']} on the shared {p['shared']}" if p["shared"] else "no v0 game to pair"
+        lines.append(
+            f"{teacher}: Qwen {d['won']}-{d['lost']} ({d['won_by_conquest']} won by conquest, {d['won_at_cap']} at the"
+            f" cap; {d['lost_by_conquest']}/{d['lost_at_cap']} lost), {d['failed_calls_per_game']:.1f} failed calls"
+            f" a game, ${d['spend_usd']:.2f} ({shared})"
+        )
+    return lines
+
+
+def step_run1_frontier(ctx: Ctx) -> Outcome:
+    """Run 1's final adapter against Opus and Astra: it is copied into this root as version 1 and plays the frontier
+    panel on the baselines' frontier starts. Gates: the panel finishes and the run ended normally. The detail counts
+    each teacher's games from the Qwen seat's side, paired by game index with v0's frontier panel."""
+    cfg, base = ctx.cfg("run1_frontier"), ctx.cfg("baselines")
+    version, source = run1_adapter(ctx)
+    copy = seed_adapter(source, cfg.root, RUN1_FRONTIER_VERSION)
+    ctx.say(f"run1_frontier: Run 1's v{version} ({source}) is v{RUN1_FRONTIER_VERSION} in {cfg.root}")
+    ctx.train_run(ctx.configs.file("run1_frontier"), ["--play-only"], label="play-only run")
+    v0_panel = base.root / "panels" / str(ctx.settings["baselines"]["frontier_panel"])
+    teachers = frontier_detail(
+        frontier_rows(cfg.root / "panels" / RUN1_FRONTIER_PANEL),
+        frontier_rows(v0_panel),
+        [t.name for t in cfg.panels[0].teachers],
+    )
+    for line in frontier_lines(teachers):
+        ctx.say(f"run1_frontier: {line}")
+    gates = [
+        *panel_gates(cfg.root, (RUN1_FRONTIER_PANEL,), PANEL_FINISHED_SHARE),
+        ended_normally(cfg.root, ("complete",)),
+    ]
+    detail = {
+        "adapter": {"source": str(source), "source_version": version, "copy": str(copy)},
+        "teachers": teachers,
+        "lines": frontier_lines(teachers),
+    }
+    return Outcome(gates, detail)
+
+
 STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
     "e1": step_e1,
     "baselines": step_baselines,
@@ -1652,6 +1836,7 @@ STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
     "sft_panels": step_sft_panels,
     "init": step_init,
     "run1": step_run1,
+    "run1_frontier": step_run1_frontier,
 }
 QUICK = ("calibration", "init")  # reading files only: a few minutes, no box hours worth pricing
 CAP_TABLE = {"labels": "distill"}

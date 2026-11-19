@@ -398,7 +398,7 @@ def test_the_example_config_directory_passes_its_own_check_and_prices_the_day(tm
     S.check_dir(LIVE_S2, 920)  # as shipped, with this run's [sequence] calls
     numbers = S.check_dir(make_config_dir(tmp_path), 920)  # the whole plan
     assert numbers["frontier"] is True and numbers["rate"] == 10.49 and numbers["run1_hours"] == 12.3
-    assert 38 <= numbers["expected_hours"] <= 39 and numbers["cap_hours"] > numbers["expected_hours"]
+    assert 39 <= numbers["expected_hours"] <= 40 and numbers["cap_hours"] > numbers["expected_hours"]
     cost = (
         numbers["expected_hours"] * numbers["rate"] + 46 + 15 + 63
     )  # box + two frontier panels + calibration + labels
@@ -522,6 +522,7 @@ def test_the_budget_guard_is_asked_before_every_step_with_its_hours_and_its_fron
         (4.0, 0),
         (0.1, 0),
         (13.5, 0),
+        (2.0, 170.0),
     ]
 
 
@@ -532,7 +533,7 @@ def test_a_budget_refusal_stops_the_sequence_before_the_step_with_the_guards_wor
         tmp_path, FakeRunner(), refuse=lambda h, u: "REFUSED: $340.00 would pass the $350 budget" if h > 10 else None
     )
     verdict, reason = S.sequence(ctx)
-    assert verdict == "stopped" and order == list(S.STEPS)[:-1]
+    assert verdict == "stopped" and order == list(S.STEPS)[:-2]
     assert reason == "run1: the budget guard refuses it: REFUSED: $340.00 would pass the $350 budget"
 
 
@@ -548,7 +549,7 @@ def test_a_resumed_sequence_skips_the_steps_that_passed_and_retries_the_one_that
     )
     again.budget_ok = lambda hours, usd=0.0: None  # type: ignore[method-assign]
     assert S.sequence(again) == ("complete", None)
-    assert order == ["sft", "sft_panels", "init", "run1"]
+    assert order == ["sft", "sft_panels", "init", "run1", "run1_frontier"]
 
 
 def resumed(ctx, **calls):
@@ -578,6 +579,7 @@ def test_a_failure_accepted_by_hand_stays_on_record_and_the_sequence_goes_on_pas
         "sft_panels",
         "init",
         "run1",
+        "run1_frontier",
     ]  # e2 would fail again: not run
     entry = json.loads((ctx.s2 / "gates.json").read_text())["steps"]["e2"]
     assert entry["status"] == "accepted" and entry["accepted"] == ctx.now()
@@ -674,15 +676,21 @@ def test_stop_after_ends_the_sequence_after_that_step_on_every_resume_until_it_i
     assert order == list(S.STEPS)[: S.STEPS.index("sft_panels") + 1]
     order.clear()
     assert S.sequence(resumed(ctx)) == ("stopped", stop) and order == []  # sft_panels passed: still the stop
-    assert S.sequence(resumed(ctx, stop_after="")) == ("complete", None) and order == ["init", "run1"]
+    assert S.sequence(resumed(ctx, stop_after="")) == ("complete", None) and order == ["init", "run1", "run1_frontier"]
 
 
 def test_only_the_steps_up_to_stop_after_count_in_the_expected_and_capped_hours(tmp_path):
     whole = S.check_dir(make_config_dir(tmp_path / "a"), 920)
     cdir = make_config_dir(tmp_path / "b", 'stop_after = "sft_panels"')
     part, settings = S.check_dir(cdir, 920), S.load_settings(cdir / "sequence.toml")
-    assert part["expected_hours"] == pytest.approx(whole["expected_hours"] - float(settings["run1"]["expected_hours"]))
-    assert part["cap_hours"] == pytest.approx(whole["cap_hours"] - settings.cap_h("run1"))
+    assert part["expected_hours"] == pytest.approx(
+        whole["expected_hours"]
+        - float(settings["run1"]["expected_hours"])
+        - float(settings["run1_frontier"]["expected_hours"]),
+    )
+    assert part["cap_hours"] == pytest.approx(
+        whole["cap_hours"] - settings.cap_h("run1") - settings.cap_h("run1_frontier")
+    )
 
 
 def test_a_resume_expects_only_the_hours_of_the_steps_it_still_runs(tmp_path):
@@ -1866,7 +1874,9 @@ def test_the_new_steps_follow_e2_and_the_shipped_sequence_runs_them_without_reru
     assert steps[steps.index("e2") + 1 : steps.index("e2") + 5] == ["e3_check", "e3", "e4_check", "e4"]
     assert "labels" in steps[5:]
     settings = S.load_settings(LIVE_S2 / "sequence.toml")
-    assert settings.accept_failed == ("e2", "e3", "e4") and settings.rerun == () and settings.stop_after == "run1"
+    assert (
+        settings.accept_failed == ("e2", "e3", "e4") and settings.rerun == () and settings.stop_after == "run1_frontier"
+    )
     assert settings["e3"]["decisions_per_update"] == 512 and settings["e3"]["whole_groups"] is True
 
 
@@ -2072,6 +2082,173 @@ def test_the_e4_check_reuses_a_copy_it_made_and_refuses_an_adapter_that_is_gone(
         S.e3_adapter(empty)
 
 
+# ---- Run 1's frontier check ----------------------------------------------------------------------------
+def run1_leaves_its_final_adapter(ctx, version=31, summary=True):
+    """What Run 1 leaves: its end-final panel's summary with the version it played, and adapters v1..vN."""
+    root = ctx.cfg("run1").root
+    if summary:
+        (root / "panels" / "end-final").mkdir(parents=True, exist_ok=True)
+        (root / "panels" / "end-final" / "summary.json").write_text(json.dumps({"version": version, "games": 768}))
+    for v in sorted({version, version + 2} if not summary else {version}):
+        folder = root / "adapters" / f"v{v}"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "adapter_config.json").write_text("{}")
+        (folder / "adapter_model.safetensors").write_bytes(f"weights-{v}".encode())
+    return root / "adapters" / f"v{version}"
+
+
+MODELS = {"opus": "anthropic/claude-opus-5-5", "astra": "openai/gpt-6-astra"}
+
+
+def written_frontier_game(folder, teacher, j, qwen, *, ended_by="conquest", errors=0, usd=0.0, qwen_seat=None):
+    """A finished frontier game: Qwen (the trainable seat, seat 1 when j is even unless `qwen_seat` says) `won` or
+    `lost` against `teacher`; the teacher's seat carries `errors` failed calls and `usd` of spend."""
+    seat = qwen_seat or (1 if j % 2 == 0 else 2)
+    other = "lost" if qwen == "won" else "won"
+    outcomes = (qwen, other) if seat == 1 else (other, qwen)
+    out = results(f"{folder.name}-{teacher}-{j:02d}", ended_by=ended_by, outcomes=outcomes,
+                  trainable=(seat == 1, seat == 2),
+                  model_1="local/qwen-base" if seat == 1 else MODELS[teacher],
+                  model_2=MODELS[teacher] if seat == 1 else "local/qwen-base", opponent={"kind": "llm"})  # fmt: skip
+    mine, theirs = str(seat), str(3 - seat)
+    out["spec"]["seats"][seat - 1].pop("trainable", None)
+    out["spec"]["seats"][seat - 1]["trainable"] = True
+    out["spec"]["seats"][2 - seat]["name"] = out["seats"][theirs]["name"] = teacher
+    out["seats"][theirs]["brain_calls"] = [{"seconds": 1.0, "error": "boom"}] * errors + [{"seconds": 2.0}]
+    out["seats"][theirs]["spend"] = {"brain": {"usd_est": usd}}
+    path = folder / out["spec"]["game_id"] / "results.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(out))
+    return mine
+
+
+def run1_frontier_world(ctx, results_for=None, *, reason="complete", finished=32):
+    """The play-only run: `results_for(folder)` writes the panel's games, then its summary and final.json."""
+    cfg = ctx.cfg("run1_frontier")
+
+    def play(argv):
+        folder = cfg.root / "panels" / "frontier-final"
+        folder.mkdir(parents=True, exist_ok=True)
+        (results_for or default_frontier_games)(folder)
+        (folder / "summary.json").write_text(json.dumps({"games": 32, "finished": finished, "version": 1}))
+        (cfg.root / "orchestrator").mkdir(parents=True, exist_ok=True)
+        (cfg.root / "orchestrator" / "final.json").write_text(json.dumps({"reason": reason}))
+        return 0
+
+    return {"run1-frontier.toml --play-only": play}
+
+
+def default_frontier_games(folder):
+    for teacher, n in (("opus", 16), ("astra", 16)):
+        for j in range(n):
+            written_frontier_game(folder, teacher, j, "won" if j % 2 == 0 else "lost")
+
+
+def test_the_run1_frontier_config_renders_and_its_panel_is_32_games_on_the_baselines_frontier_starts(tmp_path):
+    ctx, _ = make_ctx(tmp_path, FakeRunner())
+    mine, base = ctx.cfg("run1_frontier"), ctx.cfg("baselines")
+    assert check_run(mine) is not None and mine.panels_only and mine.stop_when_done and mine.seed == base.seed == 1
+    (panel,) = mine.panels
+    assert (panel.name, panel.kind, panel.version, panel.at_hours) == ("frontier-final", "frontier", 1, 0)
+    specs = panel_specs(mine, panel, {"LITELLM_BASE_URL": "https://litellm.example"})
+    assert len(specs) == 32 and S.step_hours(ctx.settings, "run1_frontier") == 2.0
+    assert [t.games for t in panel.teachers] == [16, 16] and [t.name for t in panel.teachers] == ["opus", "astra"]
+    theirs = next(p for p in base.panels if p.name == "frontier")
+    old = {n: s for n, s in S.teacher_specs(base, theirs).items()}
+    new = S.teacher_specs(mine, panel)
+    for name, count in (("opus", 8), ("astra", 4)):
+        for j in range(count):
+            assert position(mine, panel.positions, j) == position(base, theirs.positions, j)
+            a, b = old[name][j], new[name][j]
+            assert dataclasses.replace(a, game_id="x") == dataclasses.replace(b, game_id="x")
+    for name in ("opus", "astra"):
+        assert [s.seats[0].trainable for s in new[name]] == [j % 2 == 0 for j in range(16)]  # seats alternate
+        assert {s.seats[1 - j % 2].model for j, s in enumerate(new[name])} == {MODELS[name]}
+    S.check_dir(make_config_dir(tmp_path / "again"), 920)
+
+
+def test_the_run1_frontier_refuses_a_config_that_drifts_from_the_baselines_frontier_starts(tmp_path):
+    cdir = make_config_dir(tmp_path)
+    path = cdir / "run1-frontier.toml"
+    path.write_text(path.read_text().replace("seed = 1 ", "seed = 2 "))
+    with pytest.raises(ValueError, match="not on the baselines' frontier starts"):
+        S.check_dir(cdir, 920)
+
+
+def test_the_run1_frontier_copies_run1s_final_adapter_as_version_one_and_leaves_run1_alone(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    source = run1_leaves_its_final_adapter(ctx)
+    before = tree(ctx.cfg("run1").root)
+    runner.effects = run1_frontier_world(ctx)
+    out = run_step(ctx, "run1_frontier")
+    assert out.passed, out.why()
+    assert tree(ctx.cfg("run1").root) == before
+    copy = ctx.cfg("run1_frontier").root / "adapters" / "v1"
+    assert (copy / "adapter_model.safetensors").read_bytes() == b"weights-31"
+    manifest = json.loads((copy / "manifest.json").read_text())
+    assert manifest["version"] == 1 and manifest["copied_from"] == str(source) and manifest["source_version"] is None
+    assert runner.lines()[0].endswith("run1-frontier.toml --play-only")
+    assert out.detail["adapter"] == {"source": str(source), "source_version": 31, "copy": str(copy)}
+
+
+def test_the_run1_frontier_takes_the_highest_adapter_without_a_summary_and_refuses_when_there_is_none(tmp_path):
+    ctx, _ = make_ctx(tmp_path, FakeRunner())
+    run1_leaves_its_final_adapter(ctx, version=7, summary=False)
+    version, folder = S.run1_adapter(ctx)
+    assert version == 9 and folder == ctx.cfg("run1").root / "adapters" / "v9"
+    empty, _ = make_ctx(tmp_path / "empty", FakeRunner())
+    with pytest.raises(S.StepFailed, match="Run 1 left no end-final summary"):
+        S.run1_adapter(empty)
+    empty.cfg("run1").root.joinpath("panels", "end-final").mkdir(parents=True)
+    empty.cfg("run1").root.joinpath("panels", "end-final", "summary.json").write_text(json.dumps({"version": 4}))
+    with pytest.raises(S.StepFailed, match="not an adapter folder"):
+        S.seed_adapter(S.run1_adapter(empty)[1], empty.cfg("run1_frontier").root, 1)
+
+
+def test_the_run1_frontier_counts_wins_from_the_qwen_seat_and_pairs_each_game_with_v0s_by_index(tmp_path):
+    runner = FakeRunner()
+    ctx, _ = make_ctx(tmp_path, runner)
+    run1_leaves_its_final_adapter(ctx)
+    v0 = ctx.cfg("baselines").root / "panels" / "frontier"
+    for j in range(8):  # v0: opus won games 0 and 1 (Qwen in seat 1, then in seat 2), lost the other six
+        written_frontier_game(v0, "opus", j, "won" if j < 2 else "lost", ended_by="time_cap")
+    for j in range(4):
+        written_frontier_game(v0, "astra", j, "lost")
+
+    def games(folder):
+        for j in range(16):  # opus: Qwen wins j = 0..10, loses 11..15; j=1 is a Qwen seat-2 win by conquest
+            written_frontier_game(folder, "opus", j, "won" if j <= 10 else "lost",
+                                  ended_by="conquest" if j < 4 else "time_cap", errors=j % 3, usd=1.0)  # fmt: skip
+        for j in range(16):
+            written_frontier_game(folder, "astra", j, "lost" if j < 12 else "won", ended_by="time_cap", usd=2.0)
+
+    runner.effects = run1_frontier_world(ctx, games)
+    out = run_step(ctx, "run1_frontier")
+    assert out.passed and len(out.gates) == 2, out.why()
+    opus, astra = out.detail["teachers"]["opus"], out.detail["teachers"]["astra"]
+    assert (opus["games"], opus["won"], opus["lost"]) == (16, 11, 5)
+    assert (opus["won_by_conquest"], opus["won_at_cap"], opus["lost_by_conquest"], opus["lost_at_cap"]) == (4, 7, 0, 5)
+    assert opus["failed_calls_per_game"] == pytest.approx(sum(j % 3 for j in range(16)) / 16)
+    assert opus["spend_usd"] == 16.0 and astra["spend_usd"] == 32.0
+    pair = opus["paired_with_v0"]
+    assert (pair["shared"], pair["qwen_won"], pair["qwen_lost"], pair["v0_won"], pair["v0_lost"]) == (8, 8, 0, 2, 6)
+    assert pair["games"][1] == {"j": 1, "run1": "won", "v0": "won"}  # Qwen sits in seat 2 in odd games
+    assert astra["paired_with_v0"]["shared"] == 4 and astra["paired_with_v0"]["v0_won"] == 0
+    assert (astra["won"], astra["lost"]) == (4, 12)
+    assert out.detail["lines"][0].startswith("opus: Qwen 11-5 ") and "v0 2-6 on the shared 8" in out.detail["lines"][0]
+
+
+def test_the_run1_frontier_fails_on_an_unfinished_panel_or_a_run_that_did_not_end_normally(tmp_path):
+    for i, kw in enumerate(({"finished": 20}, {"reason": "budget"})):
+        runner = FakeRunner()
+        ctx, _ = make_ctx(tmp_path / str(i), runner)
+        run1_leaves_its_final_adapter(ctx)
+        runner.effects = run1_frontier_world(ctx, **kw)
+        out = run_step(ctx, "run1_frontier")
+        assert not out.passed and ("share of its games finished" in out.why() or "ended normally" in out.why())
+
+
 E4_FLAGS_TAIL = [
     "--lr", "3e-05", "--drift", "alarm", "--grad-norm", "alarm",
     "--anchor-beta0", "0", "--warmup-updates", "2", "--decisions-per-update", "512",
@@ -2229,7 +2406,7 @@ def test_the_shipped_sequence_accepts_e2_e3_and_e4_and_runs_init_then_run1_and_s
     shipped = (LIVE_S2 / "sequence.toml").read_text()
     calls = re.search(r"^\[sequence\](.*?)(?=^\[)", shipped, flags=re.M | re.S).group(1)
     ctx, _ = make_ctx(tmp_path / "x", FakeRunner(), calls=calls.strip())
-    assert ctx.settings.accept_failed == ("e2", "e3", "e4") and ctx.settings.stop_after == "run1"
+    assert ctx.settings.accept_failed == ("e2", "e3", "e4") and ctx.settings.stop_after == "run1_frontier"
     for step in ("e1", "baselines", "calibration", "tripwire", "e3_check", "e4_check"):
         ctx.record.begin(step)
         ctx.record.end(step, S.Outcome(detail={}))
@@ -2237,7 +2414,10 @@ def test_the_shipped_sequence_accepts_e2_e3_and_e4_and_runs_init_then_run1_and_s
         ctx.record.begin(step)
         ctx.record.end(step, S.Outcome(reason="missed"))
     verdict, _ = S.sequence(ctx)
-    assert order == ["labels", "sft", "sft_panels", "init", "run1"] and verdict in ("stopped", "complete")
+    assert order == ["labels", "sft", "sft_panels", "init", "run1", "run1_frontier"] and verdict in (
+        "stopped",
+        "complete",
+    )
     assert ctx.record.status("e2") == ctx.record.status("e3") == ctx.record.status("e4") == "accepted"
 
 

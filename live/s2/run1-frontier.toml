@@ -1,0 +1,50 @@
+# Run 1's frontier check: play-only, Run 1's final adapter (the version its `end-final` panel played, which the step
+# copies into this root as version 1; Run 1's root is only read) against Opus (16 games) and Astra (16 games) at equal
+# latency. The positions are the baselines' `frontier` panel's: same seed, [games], [held_out] and panel positions, and
+# frontier_specs deals the same position j to every teacher, so game j here (opus j < 8, astra j < 4) is game j of
+# v0's panel with the same seats and the same teacher settings, and the step pairs them by index. Sonnet is not played.
+run_id = "s2-run1-frontier"
+root = "/var/lib/zeroad-live/train/s2/run1-frontier"
+duration_hours = 1.5         # 32 games of 7 to 12 minutes on 24 engines; stop_when_done ends it sooner
+budget_usd = 920             # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49     # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false             # the sequence powers the box off itself, once, after the final upload
+panels_only = true
+stop_when_done = true
+engines = 24
+concurrency = 24
+seed = 1                     # the baselines': the panel's positions depend on it
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+bot = 0.05
+petra-1 = 0.10
+petra-2 = 0.50
+petra-3 = 0.35
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.0
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[[panels]]
+name = "frontier-final"
+kind = "frontier"
+at_hours = 0
+version = 1                  # Run 1's final adapter, copied here as ROOT/adapters/v1 by the step
+teachers = [
+  { name = "opus", model = "anthropic/claude-opus-5-5", games = 16 },
+  { name = "astra", model = "openai/gpt-6-astra", games = 16 },
+]
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-run1-frontier"

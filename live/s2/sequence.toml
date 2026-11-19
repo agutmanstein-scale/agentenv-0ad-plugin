@@ -16,7 +16,7 @@ uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json
 accept_failed = ["e2", "e3", "e4"]   # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
                                # 18 Nov: E3's in-run slope gate missed narrowly; its paired held-out gate passed (73.3% vs 54.2%, p 2e-5): accepted
                                # 18 Nov: E4 (30-minute games from base, 12 updates) did not beat base, 21 vs 25 wins of 100: accepted, Run 1 follows
-stop_after = "run1"        # 18 Nov: train to win: init, then Run 1
+stop_after = "run1_frontier"   # 19 Nov: Run 1 is done; its final adapter plays Opus and Astra (run1_frontier), then stop
 
 [e1]                       # GPU gates
 config = "e1.toml"
@@ -155,3 +155,9 @@ decisions_per_update = 512  # must equal run1.toml's [credit] decisions_per_upda
 kl_check_fraction = 0.25
 probe_rows = 64
 whole_groups = true        # the learner batches whole same-start groups
+
+[run1_frontier]            # 19 Nov: Run 1's final adapter against Opus and Astra on the baselines' frontier starts (run1-frontier.toml)
+config = "run1-frontier.toml"
+cap_hours = 2.0            # 32 games of 7 to 12 minutes on 24 engines, plus the adapter's copy and load
+expected_hours = 1.2
+planned_usd = 170.0        # frontier spend the guard counts ahead: 16 Opus games at about $2.5-4.6 and 16 Astra at about $7.3-8.8 (6 Nov)

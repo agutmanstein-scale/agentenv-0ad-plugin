@@ -31,6 +31,7 @@ config and nothing else. The configs are in `live/s2/`, one per step, with `sequ
 | sft_panels | Each epoch's adapter plays the first 192 games of the held-out panel; `stats.select_sft_checkpoint` picks one by held-out win rate with the entropy floor 0.7 and at least 20 games. The chosen epoch then plays the other 192 configs of the held-out panel (the `sft-rest` panel, `start = 192`), so it has the same 384 configs v0 has | every panel at least 90% finished, the epoch panels and the rest | 2.1 h | 3.0 h |
 | init | Run 1's start: the chosen epoch if `stats.panel_test` (opponent-stratified margin, on all 384 configs: the epoch's 192 and its 192 more against v0's games on the same configs) says it beats v0 at one-sided p under 0.05, else the base model. This is a decision, not a gate: it always passes and writes its reason | none | minutes | |
 | run1 | Train to win: RL from the init step's model (the base model, or the SFT epoch published as version 1 in Run 1's root) on Run 1's fixed mix and the documented reward (`run1.toml`), `--baseline s2/baseline.json` and E4's learner flags, 8 hours of training, then the end panels `end-base` (v0) and `end-final`, 384 games each on the baselines' held-out starts. Then the report, the final upload and `shutdown -h now` | at least 5 updates; `end-final` beats `end-base` on the paired R (one-sided Wilcoxon p under 0.05); no tripwire trip; the run ended "complete"; a missing or short tripwire baseline or e4_check margin scale stops the step before it starts | 12.5 h | 13.5 h |
+| run1_frontier | Run 1's frontier check, play-only (`run1-frontier.toml`): Run 1's final adapter (the version its `end-final` panel played; copied into this step's own root as version 1, Run 1's root only read) plays the panel `frontier-final`, 16 games against Opus and 16 against Astra at equal latency, on the starts of the baselines' `frontier` panel | the panel at least 90% finished; the run ended "complete". Reported, not gated: per teacher, from the Qwen seat's side, the games, Qwen's wins and losses (each by conquest or at the cap), the teacher's failed calls per game and spend, and v0's result on the same game index of the baselines' frontier panel | 1.2 h | 2.0 h |
 
 A failed gate, a step that reaches its cap, a budget refusal, two tripwire trips (the orchestrator's own rule: the
 second within 3 hours pauses and stops the run) or an error stops the sequence. The reason goes into
@@ -168,6 +169,13 @@ up to 30 minutes at about 200 an hour (24 concurrent games, about 430 s each: 3.
 50% and 65%, Petra-2 15%, 30%, 45% and 50%, Petra-3 15%) with each opponent's won share and its 97.5% Wilson lower bound
 (`lower_bonferroni` is the bound at the level `stats.milestones` shares across the seven), the paired net-worth margin test and the in-run
 slope.
+
+**The frontier check** (`run1_frontier`, 19 Nov; the sequence now stops after it, `stop_after = "run1_frontier"`). Once Run 1
+is done, its final adapter plays Opus (16 games) and Astra (16) at equal latency. The panel has the baselines' seed, `[games]`,
+`[held_out]` and positions, and `frontier_specs` deals every teacher the same position j, so game j of a teacher here is game
+j of v0's `frontier` panel (8 Opus, 4 Astra shared; same seats, since seats alternate with j). `check_dir` refuses a config where
+a teacher's settings or any of those starts differ. The step prints one line per teacher ("opus: Qwen 11-5 (v0 4-4 on the shared 8)") and
+the detail holds plain counts; there is no test, as 4 to 8 shared games cannot carry one. Cost about $2.5 to $3.5 a game.
 
 ### Why the tripwire baseline sits between the baselines and E2
 
