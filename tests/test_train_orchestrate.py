@@ -1902,6 +1902,8 @@ async def test_a_run_whose_init_adapter_is_not_published_stops_before_playing(tm
 def test_init_version_is_not_negative(tmp_path):
     with pytest.raises(ValueError, match="init_version"):
         config(tmp_path, init_version=-1)
+
+
 # ---- the multi-box transport is off unless asked for -------------------------------------------------------------
 async def test_with_the_transport_off_a_run_is_the_single_box_run_it_was(tmp_path, monkeypatch):
     t = make(tmp_path, monkeypatch, concurrency=2)
