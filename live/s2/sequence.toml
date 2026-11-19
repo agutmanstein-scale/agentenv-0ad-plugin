@@ -1,0 +1,163 @@
+# The S2 + Run 1 sequence (src/agentenv_zeroad/train/s2.py, docs/s2-box-day.md): where it keeps its files, where its own
+# files go on S3, and each step's wall-clock cap and expected duration. `live/s2.sh ID start live/s2 --yes` sends this
+# directory to the box. A key that is not in the tables below is an error. No secret goes here.
+#
+# cap_hours is a hard stop (SIGTERM, so an orchestrator uploads, then SIGKILL 40 minutes later); expected_hours is what
+# the box's start check and the plan add up (the box's power-off deadline must leave their sum plus half an hour).
+# The step configs name their own roots, which must all be under `root`, and every s3.uri; the s3://BUCKET/ in them
+# becomes s3://LIVE_BUCKET/ when live/s2.sh sends them.
+
+root = "/var/lib/zeroad-live/train/s2"
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
+
+[sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
+accept_failed = ["e2", "e3", "e4"]   # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
+                               # 18 Nov: E3's in-run slope gate missed narrowly; its paired held-out gate passed (73.3% vs 54.2%, p 2e-5): accepted
+                               # 18 Nov: E4 (30-minute games from base, 12 updates) did not beat base, 21 vs 25 wins of 100: accepted, Run 1 follows
+stop_after = "run1_frontier"   # 19 Nov: Run 1 is done; its final adapter plays Opus and Astra (run1_frontier), then stop
+
+[e1]                       # GPU gates
+config = "e1.toml"
+cap_hours = 0.75
+expected_hours = 0.5
+levels = [16, 32, 48, 64]  # calls in flight per vLLM server
+window_s = 60              # seconds each level is held
+rows = 48                  # sampled decisions kept for the learner's probe
+min_decisions_per_s_per_gpu = 3.0
+max_learner_s_per_decision = 2.0
+max_logprob_gap = 0.05
+
+[tripwire]                 # v0's health records (no training) on the baseline games' decisions: the tripwire baseline
+cap_hours = 0.5            # the learner's start-up, then 10 or more forward-only batches of 256 on 2 GPUs
+expected_hours = 0.3
+min_records = 10           # the baseline file must come from at least this many records of 256 decisions; E2 and Run 1 refuse to start without it
+
+[e2]                       # positive control; runs after the baselines so it can be given the baseline
+config = "e2.toml"
+cap_hours = 3.8            # e2.toml's 3 h + the critic's warm start + drains and uploads; its baseline (baseline-e2.json) is on disk and reused
+expected_hours = 3.4       # 17 Nov: +0.1 h for the warm start (about 2,000 results files read, then one fit)
+drift = "alarm"            # 14 Nov: the second attempt was rolled back, then stopped, for drifting (calls per decision 2.35,
+                           # then 2.42, against v0's band of 2.03..2.32) while its army rose; breakage still trips
+grad_norm = "alarm"        # 17 Nov: E2c's only rollback was a grad-norm spike of 0.30 (5x the median, under the 1.0 clip)
+baseline_config = "e2-baseline.toml"   # 9 Nov: band E2's tripwires on its own kind of games (see that file)
+lr = 3e-5                  # 9 Nov: at the default 1e-5 the policy moved little (KL to base at most 0.0008, the alarm 0.10)
+control_panel = "control-v0"   # the frozen-v0 arm, a panel in e2.toml
+window_games = 40          # the policy's last games that are compared with the control
+min_games = 30             # in the smaller arm
+min_median_army = 6.0
+max_p = 0.01               # Mann-Whitney, one-sided
+min_updates = 5
+minute = 10.0
+
+[e3_check]                 # 17 Nov: E3's check, play-only v0 on three panels, then the learner bench twice
+config = "e3-check.toml"
+cap_hours = 1.5            # 180 panel games (about 0.4 h) and two benches of a few learner updates each, with their model loads
+expected_hours = 1.0
+bench_rows = "/var/lib/zeroad-live/train/s2/e2d/inbox/consumed"   # E2d's rows the learner consumed: the bench's fixed input
+bench_updates = 3
+
+[e3]                       # 17 Nov: RL on the game outcome with same-start credit, then paired end panels (e3.toml)
+config = "e3.toml"
+cap_hours = 5.0            # e3.toml's duration_hours (4.8) + the final upload
+expected_hours = 4.4       # 3 h of training, then 480 panel games (about 1.2 h) at about 490 an hour
+lr = 3e-5                  # as E2
+drift = "alarm"            # as E2
+grad_norm = "alarm"        # as E2
+baseline_config = "e2-baseline.toml"   # the tripwire bands E2 used, on the same kind of games (already on disk)
+min_updates = 5
+max_p = 0.05               # the paired margin test (final vs v0, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor
+warmup_updates = 2
+decisions_per_update = 512  # must equal e3.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups
+
+[e4_check]                 # 18 Nov: E4's check, play-only v0 and E3's final adapter on 200 30-minute games (e4-check.toml)
+config = "e4-check.toml"
+cap_hours = 3.0            # 200 games at about a third of the 12-minute rate (about 160 an hour), plus the adapter's copy and load
+expected_hours = 2.0
+
+[e4]                       # 18 Nov: RL from E3's adapter on 30-minute games, a cap weight of 0.5, paired end panels (e4.toml)
+config = "e4.toml"
+cap_hours = 7.5            # e4.toml's duration_hours (6.2) + the final upload
+expected_hours = 6.0       # 3.5 h of training, then 200 panel games of 30 minutes (about 2 h)
+lr = 3e-5                  # as E3
+drift = "alarm"            # as E3
+grad_norm = "alarm"        # as E3
+baseline_config = "e2-baseline.toml"   # the tripwire bands E2 used (already on disk)
+min_updates = 5
+max_p = 0.05               # the paired R test (final vs the start adapter, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor (the learner then loads none, so no --anchor is passed)
+warmup_updates = 2
+decisions_per_update = 512  # must equal e4.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups
+
+[baselines]                # play-only v0: panels, calibration, briefs
+config = "baselines.toml"
+cap_hours = 6.0            # 6 Nov: one orchestrator loop held games to ~216 an hour (a saturated core)
+expected_hours = 3.9
+min_finished_share = 0.9   # of each panel's games that must have finished
+planned_usd = 110.0        # frontier spend the guard counts ahead: 20 baseline + 16 calibration games at about $2.5-3.5 each (6 Nov)
+heldout_panel = "heldout"
+v1_panel = "heldout-v1"
+frontier_panel = "frontier"
+calibration_panel = "teacher-calibration"
+
+[distill]                  # the labels (the SFT and its panels are the next two tables)
+cap_hours = 1.0
+expected_hours = 0.4
+n = 3000
+min_labels = 2400
+cap_usd = 120.0            # the first teacher's SpendGuard cap: 3,000 labels at about $0.036 (Opus, 6 Nov)
+second_cap_usd = 12.0      # the label-noise check's: 200 labels
+check = 200
+per_game = 8
+tokenizer = "Qwen/Qwen3-8B"
+weights = "losing=0.6,late=0.2,rejected=0.2"
+
+[sft]
+config = "sft.toml"
+cap_hours = 2.0            # 10 Nov: an epoch of 2,999 labels took 38 min (with the model load), so 2 epochs need about 1.3 h
+expected_hours = 1.3
+epochs = 2
+lr = 1e-4
+
+[sft_panels]               # each epoch's adapter on the first panel_games of the held-out panel; the chosen one then plays the rest
+config = "sft-panels.toml"
+cap_hours = 4.0            # two play-only runs: the epochs (2 x panel_games games), then the chosen epoch's other games;
+                           # 10 Nov: 2.4 h, then 1.3 h at 147 games/h. The guard charges all of it before the step starts
+expected_hours = 2.8
+panel_games = 192          # per epoch: enough to choose between epochs
+heldout_games = 384        # the held-out panel's size (baselines.toml): the chosen epoch plays heldout_games - panel_games more,
+                           # so the init decision is on the same 384 configs v0 played
+min_entropy_ratio = 0.7
+min_games = 20
+max_p = 0.05               # Run 1 starts from the chosen epoch only if it beats v0 at this one-sided level
+
+[run1]                     # 18 Nov: train to win: RL on the documented objective from the init step's model, paired end panels (run1.toml)
+config = "run1.toml"
+cap_hours = 13.5           # run1.toml's duration_hours (12.3) + the final upload
+expected_hours = 12.5      # 8 h of training, then 768 panel games of 30 minutes (about 3.9 h at about 200 an hour)
+lr = 3e-5                  # as E4
+drift = "alarm"            # as E4
+grad_norm = "alarm"        # as E4
+baseline_config = ""       # Run 1 uses the tripwire baseline.json made from the 30-minute baseline games (the tripwire step)
+min_updates = 5
+max_p = 0.05               # the paired R test (end-final vs end-base, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor
+warmup_updates = 2
+decisions_per_update = 512  # must equal run1.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups
+
+[run1_frontier]            # 19 Nov: Run 1's final adapter against Opus and Astra on the baselines' frontier starts (run1-frontier.toml)
+config = "run1-frontier.toml"
+cap_hours = 2.0            # 32 games of 7 to 12 minutes on 24 engines, plus the adapter's copy and load
+expected_hours = 1.2
+planned_usd = 170.0        # frontier spend the guard counts ahead: 16 Opus games at about $2.5-4.6 and 16 Astra at about $7.3-8.8 (6 Nov)

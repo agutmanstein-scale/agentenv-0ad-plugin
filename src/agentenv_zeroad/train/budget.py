@@ -9,6 +9,10 @@ counted by the clock, whichever is larger. Model spend is the ledger's (`$STATE/
 one `{"what", "usd_est"}` per line, `agentenv_zeroad.spend`'s format): the orchestrator appends every game's frontier
 spend to it, and other box tools append their own.
 
+`budget.sh reset` starts the counter again from $0 without deleting history (it archives the ledger and boxtime.json and
+appends `{"at", ...}` to `budget-resets.jsonl` beside boxtime.json): box hours then count only from the last reset's
+`at`, an earlier boot for what is left of it after `at`, and the run clock is clipped to the time since `at` as well.
+
 There is no default rate. The guard once priced a g6e.12xlarge at the 1.32 $/h of a stream box, which is why the run
 config requires it.
 """
@@ -74,10 +78,20 @@ class BoxTime:
         except (OSError, ValueError):
             boots = {}
         current = str(int(self.boot))
+        floor = self.reset_at or 0
         earlier = sum(
-            max(0, last - start) for key, (start, last) in boots.items() if key != current
+            max(0, last - max(start, floor)) for key, (start, last) in boots.items() if key != current
         )  # the timer's own record of the earlier boots
-        return (earlier + max(0.0, now - self.boot)) / 3600
+        return (earlier + max(0.0, now - max(self.boot, floor))) / 3600
+
+    @property
+    def reset_at(self) -> int | None:
+        """The last `budget.sh reset`'s time, or None when the counter was never reset."""
+        try:
+            rows = [x for x in (self.path.parent / "budget-resets.jsonl").read_text().splitlines() if x.strip()]
+            return int(json.loads(rows[-1])["at"]) if rows else None
+        except (OSError, ValueError, KeyError):
+            return None
 
 
 def _boot_epoch() -> float:
@@ -94,5 +108,8 @@ def _boot_epoch() -> float:
 def spend(clock: RunClock, now: float, rate_usd_per_hour: float, ledger: Path, boxtime: BoxTime | None = None) -> Spend:
     hours = clock.hours(now)
     if boxtime is not None:
+        at = boxtime.reset_at
+        if at is not None:
+            hours = min(hours, max(0.0, now - at) / 3600)
         hours = max(hours, boxtime.hours(now))
     return Spend(hours, hours * rate_usd_per_hour, ledger_total(ledger))

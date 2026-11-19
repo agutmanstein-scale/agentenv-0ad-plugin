@@ -1312,6 +1312,89 @@ async def test_a_stop_records_the_games_in_flight_as_stopped_and_the_panels_and_
     assert not (t.root / "voided").exists()
 
 
+async def test_a_restart_after_a_stop_replays_the_panel_games_the_stop_cancelled_once(tmp_path, monkeypatch):
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "mid", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels, budget_usd=5)
+    publish(t.root, 1)
+    t.play.hold()
+    run = asyncio.create_task(t.orch.run())
+    await until(lambda: len(t.play.specs) == 1)
+    t.clock.t += 3600
+    assert (await asyncio.wait_for(run, 5)).startswith("budget")
+    second = reborn(t)
+    assert [p.game_id for p in second.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert second.counts["panel_replayed_after_stop"] == 1 and second.panels["mid"].remaining == 3
+    second.save_state()
+    third = reborn(t)
+    assert [p.game_id for p in third.panel_queue] == ["mid-v1-p0-r1", "mid-v1-p1", "mid-v1-p2"]
+    assert third.counts["panel_replayed_after_stop"] == 1
+    t.play.release()
+
+
+def ledger(root: Path, panel: str, *lines: tuple[str, str]) -> None:
+    folder = root / "panels" / panel
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "games.jsonl").open("a") as f:
+        f.writelines(json.dumps({"game_id": g, "status": status, "kind": "panel"}) + "\n" for g, status in lines)
+
+
+async def test_a_restart_plays_no_panel_game_again_that_its_record_finished_nor_a_panel_it_does_not_have(
+    tmp_path, monkeypatch
+):
+    """10 Nov: the SFT epoch panels and then the rest share one root. Restarted for its epoch panels, the run took the
+    rest's queue and a state that had lost the epoch panel it had finished, and dropped all of them at once."""
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels)
+    publish(t.root, 1)
+    t.orch.start_due_panels()  # queued, as the stale state had it
+    spec = t.orch.panel_queue[0].spec
+    t.orch.panel_queue.append(orchestrate.Pending(spec, "panel", "rest-v1-p9", "rest", 1))
+    t.orch.save_state()
+    ledger(t.root, "a", *[(f"a-v1-p{i}", "finished") for i in range(3)], *[(f"a-v1-p{i}", "dropped") for i in range(3)])
+    second = reborn(t)
+    assert list(second.panel_queue) == [] and second.counts["panel_already_finished"] == 3
+    assert (second.panels["a"].remaining, second.panels["a"].finished, second.panels["a"].games) == (0, 3, 3)
+    summary = json.loads((t.root / "panels" / "a" / "summary.json").read_text())
+    assert (summary["finished"], summary["games"]) == (3, 3) and second.panels_finished()
+
+
+async def test_a_panel_started_afresh_where_its_record_has_some_games_plays_only_the_ones_not_finished(
+    tmp_path, monkeypatch
+):
+    """The SFT rest panel, run again after a stop: its record has 1 game finished, 1 a stop cut off, 1 never begun."""
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 3)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 1}]
+    t = make(tmp_path, monkeypatch, concurrency=2, panels=panels)
+    publish(t.root, 1)
+    ledger(t.root, "a", ("a-v1-p0", "finished"), ("a-v1-p1", "stopped"), ("a-v1-p2", "dropped"))
+    t.orch.start_due_panels()
+    assert [p.game_id for p in t.orch.panel_queue] == ["a-v1-p1-r1", "a-v1-p2-r1"]
+    assert (t.orch.panels["a"].remaining, t.orch.panels["a"].finished, t.orch.panels["a"].games) == (2, 1, 3)
+    await t.orch.refresh_serving()
+    t.orch.fill()
+    await until(lambda: t.orch.panels["a"].remaining == 0)
+    assert [s.game_id for s in t.play.specs] == ["a-v1-p1-r1", "a-v1-p2-r1"]
+    summary = json.loads((t.root / "panels" / "a" / "summary.json").read_text())
+    assert (summary["finished"], summary["games"]) == (3, 3)
+    await settle(t.orch)
+
+
+async def test_a_panel_whose_record_has_every_game_finished_is_done_without_its_adapter(tmp_path, monkeypatch):
+    panel = tmp_path / "panel.jsonl"
+    write_panel(panel, 2)
+    panels = [{"name": "a", "at_hours": 0, "specs": str(panel), "version": 7}]  # v7 pruned since
+    t = make(tmp_path, monkeypatch, concurrency=1, panels=panels)
+    ledger(t.root, "a", ("a-v7-p0", "finished"), ("a-v7-p1-r1", "finished"))
+    t.orch.start_due_panels()
+    assert not t.orch.panel_queue and t.orch.panels_finished() and 7 not in t.orch.adapters.pins
+    assert json.loads((t.root / "panels" / "a" / "summary.json").read_text())["finished"] == 2
+
+
 async def test_a_play_only_run_never_sends_stop_or_waits_for_a_learner(tmp_path, monkeypatch):
     t = make(tmp_path, monkeypatch, budget_usd=1, learner=False)
     t.clock.t += 3600
@@ -1405,6 +1488,26 @@ def test_box_hours_count_every_boot_the_way_budget_sh_does_and_never_less_than_t
     assert budget.spend(clock, 50000 + 1800, 10.0, ledger, None).box_hours == pytest.approx(0.25)
     short = budget.RunClock(tmp_path / "c2.json", now=0.0)
     assert budget.spend(short, 4 * 3600.0, 10.0, ledger, box).box_hours == pytest.approx(4.0)  # the clock is larger
+
+
+def test_box_hours_and_the_run_clock_count_only_from_the_last_reset(tmp_path):
+    at = 100_000
+    boxtime = tmp_path / "boxtime.json"
+    boxtime.write_text(
+        json.dumps({"1000": [1000, 1000 + 7200], "90000": [90000, at + 1800], "120000": [120000, 120000]})
+    )
+    box = budget.BoxTime(boxtime, boot_epoch=120000)
+    assert box.reset_at is None
+    assert box.hours(120000 + 3600) == pytest.approx(2 + (at + 1800 - 90000) / 3600 + 1)
+    (tmp_path / "budget-resets.jsonl").write_text(json.dumps({"at": 5}) + "\n" + json.dumps({"at": at}) + "\n")
+    assert box.reset_at == at
+    assert box.hours(120000 + 3600) == pytest.approx(0.5 + 1.0)  # the old boot ended before at; one spans it
+    started = budget.RunClock(tmp_path / "clock.json", now=0.0)  # a run that began long before the reset
+    spent = budget.spend(started, at + 7200, 10.0, tmp_path / "spend.jsonl", box)
+    assert spent.box_hours == pytest.approx(2.0)  # the run clock clipped to the 2 h since at, not 27.8 h
+    assert budget.spend(started, at + 7200, 10.0, tmp_path / "spend.jsonl", None).box_hours == pytest.approx(
+        (at + 7200) / 3600
+    )
 
 
 # ---- the disk, the learner's pulse, old adapters ---------------------------------------------------------------
@@ -1549,6 +1652,71 @@ def test_the_status_carries_the_sync_outcome_and_the_open_alarms(tmp_path, monke
     assert status["sync"] == {"last_ok": None, "failures": 0} and status["alarms"] == {"disk": "full"}
 
 
+def start_of(spec: GameSpec) -> tuple:
+    policy = next(s for s in spec.seats if s.trainable)
+    other = next(s for s in spec.seats if not s.trainable)
+    return (
+        spec.seats.index(policy), policy.civ, other.kind, other.civ, other.difficulty, other.behaviour, spec.map,
+        spec.seed, spec.ai_seed, spec.time_cap_minutes,
+    )  # fmt: skip
+
+
+def test_seed_groups_deal_each_start_k_times_with_only_the_id_and_the_live_pin_changing(tmp_path):
+    factory = GameFactory(config(tmp_path, games={"seed_group": 4, "maps": ["mainland", "islands"]}))
+    specs = [factory.next(v, HOSTS[v % 2]) for v in range(40)]
+    for first in range(0, 40, 4):
+        group = specs[first : first + 4]
+        assert len({start_of(s) for s in group}) == 1 and len({s.game_id for s in group}) == 4
+        assert [policy_version(s) for s in group] == list(range(first, first + 4))
+    assert len({start_of(s) for s in specs}) == 10
+    alone = GameFactory(config(tmp_path, games={"seed_group": 1}))
+    assert len({start_of(alone.next(1, HOSTS[0])) for _ in range(10)}) == 10
+
+
+def test_a_seed_group_in_progress_survives_a_restart(tmp_path):
+    cfg = config(tmp_path, games={"seed_group": 4})
+    a = GameFactory(cfg)
+    for _ in range(6):
+        a.next(1, HOSTS[0])
+    b = GameFactory(cfg)
+    b.load_state_dict(json.loads(json.dumps(a.state_dict())))
+    assert [a.next(2, HOSTS[1]) for _ in range(6)] == [b.next(2, HOSTS[1]) for _ in range(6)]
+    with pytest.raises(ValueError, match="seed_group"):
+        config(tmp_path, games={"seed_group": 0})
+
+
+class WarmCredit(FakeCredit):
+    def __init__(self, warm_start=("/games",)):
+        super().__init__()
+        self.critic = SimpleNamespace(
+            cfg=SimpleNamespace(warm_start=tuple(warm_start), warm_min_games=7),
+            load_state_dict=lambda state: None,
+            state_dict=lambda: {"observed": 80},
+        )
+        self.warmed: list[tuple] = []
+
+    def warm_start(self, paths, min_games):
+        self.warmed.append((tuple(paths), min_games))
+
+    def state_dict(self):
+        return {}
+
+
+async def test_a_fresh_run_warm_starts_its_critic_before_any_game_and_a_restored_one_does_not(tmp_path, monkeypatch):
+    t = make(tmp_path / "fresh", monkeypatch, credit=WarmCredit())
+    await t.orch._warm_start_critic()
+    assert t.credit.warmed == [(("/games",), 7)] and (t.root / "orchestrator" / "critic.json").exists()
+    saved = tmp_path / "restored" / "run" / "orchestrator"
+    saved.mkdir(parents=True)
+    (saved / "critic.json").write_text('{"observed": 1}')
+    again = make(tmp_path / "restored", monkeypatch, credit=WarmCredit())
+    await again.orch._warm_start_critic()
+    assert again.credit.warmed == []
+    plain = make(tmp_path / "plain", monkeypatch, credit=WarmCredit(warm_start=()))
+    await plain.orch._warm_start_critic()
+    assert plain.credit.warmed == []
+
+
 def test_the_game_stream_carries_its_state_across_a_restart(tmp_path):
     a = GameFactory(config(tmp_path))
     for _ in range(7):
@@ -1556,3 +1724,181 @@ def test_the_game_stream_carries_its_state_across_a_restart(tmp_path):
     b = GameFactory(config(tmp_path))
     b.load_state_dict(json.loads(json.dumps(a.state_dict())))
     assert [a.next(2, HOSTS[1]) for _ in range(5)] == [b.next(2, HOSTS[1]) for _ in range(5)]
+
+
+# ---- same-start groups and the end of training ---------------------------------------------------------------------
+def test_each_start_has_one_group_id_that_the_spec_carries_and_a_restart_keeps(tmp_path):
+    cfg = config(tmp_path, games={"seed_group": 4})
+    factory = GameFactory(cfg)
+    specs = [factory.next(1, HOSTS[0]) for _ in range(10)]
+    groups = [s.group for s in specs]
+    assert groups[:4] == [groups[0]] * 4 and groups[4:8] == [groups[4]] * 4 and len(set(groups)) == 3
+    assert groups[0] == "r1-s000000" and groups[4] == "r1-s000004"
+    assert GameSpec.from_json(json.loads(json.dumps(specs[0].to_json()))) == specs[0]
+    resumed = GameFactory(cfg)
+    resumed.load_state_dict(json.loads(json.dumps(factory.state_dict())))
+    assert resumed.next(1, HOSTS[0]).group == groups[8]  # the group in progress goes on under its own id
+    assert "group" not in GameSpec("x", (SeatSpec(kind="bot", civ="rome"), SeatSpec(kind="bot", civ="pers"))).to_json()
+
+
+class GroupCredit(FakeCredit):
+    """A credit that holds a game's rows and hands both games' rows back with the next game."""
+
+    def rows(self, results: dict) -> list[dict]:
+        game_id = results["spec"]["game_id"]
+        self.games.append(game_id)
+        held = [{"game_id": f"{game_id}:1", "version": 1, "advantage": 0.5}]
+        if len(self.games) % 2:
+            self.held = held
+            return []
+        return [*self.held, *held]
+
+
+async def test_the_rows_of_a_group_flushed_by_one_game_are_written_per_game_under_the_games_own_names(
+    tmp_path, monkeypatch
+):
+    t = make(tmp_path, monkeypatch, concurrency=1, credit=GroupCredit())
+    await t.orch.refresh_serving()
+    await drive(t.orch, lambda: t.orch.counts["train_finished"] == 2)
+    files = sorted(p.name for p in (t.root / "inbox").iterdir())
+    assert files == ["r1-g000000.jsonl", "r1-g000001.jsonl"] and t.orch.counts["rows"] == 2
+
+
+END = {"name": "end-final", "kind": "heldout", "at_hours": 1, "games": 3, "opponents": {"petra-2": 1.0}}
+
+
+async def test_no_training_game_is_dealt_after_train_hours_and_the_learner_is_told_to_stop(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=2, train_hours=1, duration_hours=3, panels=[END])
+    publish(t.root, 1)
+    await t.orch.refresh_serving()
+    await drive(t.orch, lambda: t.orch.counts["train_finished"] >= 2)
+    before = len(t.play.specs)
+    t.clock.t += 3600
+    await t.orch.tick()
+    assert t.orch.training_over and commands(t.root) == [{"op": "stop"}]
+    for _ in range(5):
+        t.clock.t += 1
+        await t.orch.tick()
+        await asyncio.sleep(0.01)
+    assert t.orch.counts["started"] == before and t.orch.panels == {}  # no training game, and the panel waits
+    t.orch.requeue.append(_pending_train(t))
+    t.orch.fill()
+    assert t.orch.counts["started"] == before  # a void training game is not replayed either
+
+
+def _pending_train(t) -> orchestrate.Pending:
+    spec = t.play.specs[0]
+    return orchestrate.Pending(spec, "train", spec.game_id)
+
+
+async def test_the_end_panel_starts_on_the_final_adapter_once_the_learner_has_read_its_stop_and_left(
+    tmp_path, monkeypatch
+):
+    t = make(tmp_path, monkeypatch, concurrency=2, train_hours=1, duration_hours=3, panels=[END])
+    publish(t.root, 1)
+    await t.orch.refresh_serving()
+    t.clock.t += 3600
+    await t.orch.tick()
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels == {}  # the stop is unread: the learner may still publish
+    publish(t.root, 2)  # the update in progress ends with its adapter
+    (stop,) = (t.root / "control").glob("*.json")
+    (t.root / "control" / "done").mkdir()
+    stop.rename(t.root / "control" / "done" / stop.name)
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels == {}  # the learner is gone but v2 is not served yet
+    await t.orch.refresh_serving()
+    t.clock.t += 1
+    await t.orch.tick()
+    assert t.orch.panels["end-final"].version == 2 and t.orch.current == 2
+    assert 2 in t.orch.adapters.pins
+
+
+async def test_a_run_whose_training_is_over_does_not_stall_on_rows_nobody_reads(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, train_hours=1, duration_hours=3, panels=[END])
+    t.clock.t += 3600
+    await t.orch.tick()
+    fill_inbox(t.root, 400)
+    t.clock.t += 3600
+    t.orch.check_learner(t.clock())
+    t.clock.t += 3600
+    t.orch.check_learner(t.clock())
+    assert t.orch.stop_reason is None and not t.orch.alarms
+
+
+async def test_training_over_survives_a_restart(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, train_hours=1, duration_hours=3, panels=[END])
+    t.clock.t += 3600
+    await t.orch.tick()
+    assert reborn(t).training_over
+
+
+@pytest.mark.parametrize("train_hours", [0, -1, 11])
+def test_train_hours_is_inside_the_run(tmp_path, train_hours):
+    with pytest.raises(ValueError, match="train_hours"):
+        config(tmp_path, train_hours=train_hours)
+
+
+def test_end_panels_that_differ_only_by_version_play_identical_starts_game_by_game(tmp_path):
+    from dataclasses import replace
+
+    from agentenv_zeroad.train.calibration import panel_specs
+
+    held = {"civ_pairs": [["rome", "pers"], ["athen", "cart"]], "seed_ranges": [[900000, 900500]]}
+    ends = [
+        {"name": n, "kind": "heldout", "at_hours": 3, "games": 240, "opponents": {"petra-2": 1.0},
+         "positions": "held_out", "time_cap_minutes": 12, **v}
+        for n, v in (("end-v0", {"version": 0}), ("end-final", {}))
+    ]  # fmt: skip
+    cfg = config(tmp_path, seed=1, held_out=held, panels=ends, train_hours=3)
+    v0, final = (panel_specs(cfg, p) for p in cfg.panels)
+    assert len(v0) == len(final) == 240 and cfg.panels[1].version is None
+    for a, b in zip(v0, final, strict=True):
+        assert a.game_id.removeprefix("end-v0-") == b.game_id.removeprefix("end-final-")
+        assert replace(a, game_id="x") == replace(b, game_id="x")
+        assert a.time_cap_minutes == 12 and a.seed in range(900000, 900500)
+    assert len({s.seed for s in v0}) > 200
+
+
+# ---- a run that starts from an adapter ------------------------------------------------------------------------
+async def test_a_run_started_from_an_adapter_deals_no_game_until_the_init_adapter_is_served(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=2, init_version=1)
+    publish(t.root, 1)
+    for host in HOSTS:
+        t.fake.hosts[host]["refuse_loads"] = True
+    await t.orch.refresh_serving()
+    assert t.orch.current == 0
+    t.orch.fill()
+    await asyncio.sleep(0.02)
+    assert t.play.specs == []  # v0 is the base model: it must not play in this run
+    for host in HOSTS:
+        t.fake.hosts[host]["refuse_loads"] = False
+    await t.orch.refresh_serving()
+    t.orch.fill()
+    await until(lambda: len(t.play.specs) == 2)
+    assert {policy_version(s) for s in t.play.specs} == {1}
+
+
+async def test_an_unpinned_panel_waits_for_the_init_adapter_and_a_pinned_one_does_not(tmp_path, monkeypatch):
+    pinned = {"name": "base", "kind": "heldout", "at_hours": 0, "version": 0, "games": 2, "opponents": {"petra-2": 1.0}}
+    free = {"name": "follow", "kind": "heldout", "at_hours": 0, "games": 2, "opponents": {"petra-2": 1.0}}
+    t = make(tmp_path, monkeypatch, panels_only=True, init_version=1, panels=[pinned, free])
+    publish(t.root, 1)
+    t.orch.start_due_panels()
+    assert set(t.orch.panels) == {"base"}
+    await t.orch.refresh_serving()
+    t.orch.start_due_panels()
+    assert t.orch.panels["follow"].version == 1
+
+
+async def test_a_run_whose_init_adapter_is_not_published_stops_before_playing(tmp_path, monkeypatch):
+    t = make(tmp_path, monkeypatch, concurrency=1, init_version=1)
+    assert await t.orch.run() == f"the init adapter v1 is not in {t.orch.adapters.dir}"
+    assert t.play.specs == []
+
+
+def test_init_version_is_not_negative(tmp_path):
+    with pytest.raises(ValueError, match="init_version"):
+        config(tmp_path, init_version=-1)

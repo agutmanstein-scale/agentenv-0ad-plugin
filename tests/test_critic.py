@@ -3,6 +3,7 @@
 import json
 import math
 import random
+import statistics
 
 import pytest
 
@@ -203,3 +204,76 @@ def test_credit_with_a_critic_scores_each_decision_against_the_critics_value_onc
     expected = critic.baseline(g, "1", 60_000, credit.baselines["petra-2|1"][0])
     assert abs(expected) > 0.3  # the critic reads the armies; the running mean would say about 0
     assert credit.rows(g)
+
+
+# --- values and the warm start ---
+
+
+def test_values_are_none_before_a_critic_is_in_use_and_then_match_baseline_turn_by_turn():
+    clock = Clock()
+    critic = C.GBCritic(C.CriticConfig(**{**FAST, "blend_s": 900.0}), clock=clock)
+    g = probe(20, 2)
+    assert critic.values(g, "1", [60_000, 300_000], 0.2) is None
+    feed(critic, 110)
+    clock.now = critic.switched_at + 900
+    values = critic.values(g, "1", [60_000, 300_000], 0.2)
+    assert values == pytest.approx([critic.baseline(g, "1", t, 0.2) for t in (60_000, 300_000)])
+    assert critic.values(g, "1", [], 0.2) == []
+    clock.now = critic.switched_at + 450
+    half = critic.values(g, "1", [300_000], 0.2)[0]
+    assert half == pytest.approx((0.2 + values[1]) / 2)
+
+
+def write_games(folder, n: int, seed: int = 0):
+    rng = random.Random(seed)
+    for i in range(n):
+        g, _ = synth(i, rng)
+        path = folder / f"g{i}" / "results.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(g))
+    return folder
+
+
+def test_a_warm_start_fits_on_the_games_found_and_is_active_at_once(tmp_path):
+    critic = C.GBCritic(C.CriticConfig(**FAST), clock=Clock())
+    credit = Credit(CreditConfig(), critic=critic)
+    credit.warm_start([write_games(tmp_path / "a", 50), write_games(tmp_path / "b", 30, seed=1)], min_games=70)
+    event = critic.history[-1]
+    assert event["event"] == "warm_start" and event["active"] and critic.active is not None
+    assert event["games"] == 80 and event["rows"] == 80 * 10 and event["cv_loss"] < event["baseline_loss"]
+    assert sorted(event["oof_r2_by_2min"]) == ["0-2", "2-4", "4-6", "6-8", "8-10"]
+    assert critic.observed == 80 and not credit.counts and not credit.control
+    assert critic.values(probe(20, 2), "1", [300_000], 0.0)[0] > 0.5
+
+
+def test_a_warm_start_in_positive_control_z_scores_the_army_per_opponent_and_cuts_the_rows(tmp_path):
+    critic = C.GBCritic(C.CriticConfig(**FAST), clock=Clock())
+    credit = Credit(CreditConfig(positive_control=True, gae_lambda=0.8), critic=critic)
+    rng = random.Random(3)
+    for i in range(70):
+        army = rng.uniform(2, 20)
+        g = results(f"z{i}", rows=timeline(minutes=15, army=(army, 5)), turns={"1": turns_every(60, minutes=15)})
+        path = tmp_path / f"g{i}" / "results.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(g))
+    credit.warm_start([tmp_path], min_games=60)
+    assert critic.games[0].x.shape[0] == 10 and critic.games[0].x[:, 0].max() < 10  # turns before minute 10 only
+    rewards = [g.reward for g in critic.games]
+    assert statistics.fmean(rewards) == pytest.approx(0.0, abs=1e-9) and statistics.pstdev(rewards) == pytest.approx(
+        1.0
+    )
+    assert critic.history[-1]["event"] == "warm_start"
+
+
+def test_a_warm_start_refuses_to_run_on_too_few_games(tmp_path):
+    credit = Credit(CreditConfig(), critic=C.GBCritic(C.CriticConfig(**FAST), clock=Clock()))
+    with pytest.raises(SystemExit, match=r"critic warm start: 30 usable games under .*need at least 100"):
+        credit.warm_start([write_games(tmp_path, 30)], min_games=100)
+    assert credit.critic.observed == 0
+
+
+def test_config_fields_warm_start_and_warm_min_games_load_from_lists():
+    from agentenv_zeroad.train.orchestrate import _fields
+
+    cfg = C.CriticConfig(**_fields({"warm_start": ["/a", "/b"], "warm_min_games": 5}))
+    assert cfg.warm_start == ("/a", "/b") and cfg.warm_min_games == 5

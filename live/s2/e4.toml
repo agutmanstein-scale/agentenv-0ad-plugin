@@ -1,0 +1,75 @@
+# E4: RL from base Qwen on 30-minute games where Petra's attacks land (E3's 12-minute games all ended at the cap), against
+# Petra-2 and -3, on a reward where a conquest outweighs any lead at the cap: R = +-1 for a conquest, and at the cap
+# cap_weight (0.5) * (0.5 sign(m) + 0.5 tanh(m / s)). s is not set here: step_e4 renders this file into
+# ROOT/s2/generated/e4.toml with the margin scale e4_check measured on v0's 30-minute games.
+# 18 Nov: it starts from the base model (init_version 0), not E3's adapter: in e4_check's 30-minute games E3's adapter
+# lost 52 of 100 by conquest against base's 34, and won 13 against 26. init_version 1 would start it from E3's adapter,
+# copied into this root as version 1. The first E4 (root e4) was stopped 12 minutes in for this; this root is fresh.
+# Credit is as in E3 (each start dealt 4 times, the start's other games the baseline, whole groups per update). It trains for
+# 3.5 h and then stops. `end-start` (v0, the base model) and `end-final` (the adapter current then) play the same 100
+# starts as e4-check.toml's panels, game by game, so all four pair. Its adapters stay in this root.
+run_id = "s2-e4b"
+root = "/var/lib/zeroad-live/train/s2/e4b"
+duration_hours = 6.2        # train_hours + the two end panels (200 games of 30 minutes, about 2 h) + drains and uploads, under cap_hours 7.5
+train_hours = 3.5
+init_version = 0            # the base model; 1 starts from E3's adapter (see above)
+budget_usd = 920            # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49    # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false            # the sequence powers the box off itself, once, after the final upload
+stop_when_done = true       # the run ends, reason "complete", when both end panels are played
+engines = 24
+concurrency = 24
+seed = 4                    # a stream of its own, and the check's: the end panels' starts are the check's
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+petra-2 = 0.6
+petra-3 = 0.4
+
+[games]
+time_cap_minutes = 30
+no_cap_share = 0.0
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+seed_group = 4               # each start (opponent, civs, slot, map, seeds) is dealt 4 times in a row: credit's baseline group
+
+# None of these appears in a training game; the panels draw from them.
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[credit]
+positive_control = false     # the reward is the game's outcome
+margin_scale = 5000.0        # s in tanh(m / s): a placeholder, replaced by step_e4 with e4_check's measured margin_scale
+cap_weight = 0.5             # a game that reaches the cap is worth at most half a conquest
+baseline = "start_loo"       # A = R - the mean R of the start's other games; every decision of a game shares it
+group_size = 4               # = games.seed_group
+decisions_per_update = 512   # the learner's batch (--decisions-per-update in sequence.toml's [e4] must match)
+
+# The two end panels play identical starts, the check's too: the same positions, civs, sides and seeds, and only the policy
+# differs. They start at train_hours, after the learner has stopped, so `end-final` plays the last adapter it published.
+[[panels]]
+name = "end-start"
+kind = "heldout"
+at_hours = 3.5
+version = 0                  # base Qwen, the model the run starts from
+games = 100
+positions = "held_out"
+time_cap_minutes = 30
+opponents = { "petra-2" = 0.6, "petra-3" = 0.4 }
+
+[[panels]]
+name = "end-final"
+kind = "heldout"
+at_hours = 3.5
+games = 100
+positions = "held_out"
+time_cap_minutes = 30
+opponents = { "petra-2" = 0.6, "petra-3" = 0.4 }
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-e4b"

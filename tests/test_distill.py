@@ -244,6 +244,18 @@ async def test_a_failed_call_is_counted_and_the_other_briefs_go_on(tmp_path):
     assert labels == [] and stats["failed"] == 4 and "HTTPStatusError" in stats["errors"][0]
 
 
+async def test_labelling_stops_once_the_proxy_has_refused_the_teachers_key_with_nothing_answered(tmp_path):
+    for i in range(10):
+        save_game(tmp_path, f"g{i}")
+    briefs = D.candidates(tmp_path)
+    assert len(briefs) > D.REFUSED_STOP
+    fake = FakeLiteLLM(fail=401)
+    model = StrategistModel("anthropic/claude-opus-5-5", "https://p", KEY, SpendGuard("t"), http=fake.http())
+    labels, stats = await D.label(briefs, model, POLICIES, concurrency=1)
+    assert labels == [] and len(fake.requests) == D.REFUSED_STOP == stats["refused"]
+    assert "refused the teacher's key (HTTP 401)" in stats["stopped"] and stats["spend"]["usd_est"] == 0
+
+
 # --- label noise ---
 
 

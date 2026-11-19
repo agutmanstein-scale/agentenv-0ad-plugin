@@ -15,6 +15,13 @@
 - nothing held out ever appears: no civ pair in `held_out.civ_pairs` (in either order), no map in `held_out.maps`
   (the config refuses overlap with the training maps) and no seed in `held_out.seeds`.
 
+- with `games.seed_group` = k above 1, each start is dealt k times in a row (measurement: the games of a group differ
+  only by what the players do): the same opponent and Petra behaviour, civ pair, policy slot, map, seeds and cap, with
+  only the game id and the live versions and urls of the policy seat (and a base-model opponent) current. A group
+  uses one draw of the opponent and uncapped bags, and a restart continues the group in progress. Panels are not
+  grouped. Each start carries a group id (`spec.group`, named for the first game of the group) that credit's
+  same-start baseline and the learner's whole-group batches key on;
+
 `repin` points an existing spec at another version or server, which is how a game voided by a vLLM outage is replayed
 with the same map, civs, opponent and seeds. `GameFactory.state_dict()` / `load_state_dict()` carry the random state,
 the bags and the game counter across an orchestrator restart, so a restarted run continues the same stream.
@@ -27,6 +34,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
+from agentenv_zeroad.interface import Interface
 from agentenv_zeroad.pilot.games import version_model
 from agentenv_zeroad.scenario import AI_BEHAVIORS
 from agentenv_zeroad.spend import LOCAL_PREFIX
@@ -56,30 +64,53 @@ class GameFactory:
         self._opponents: list[str] = []
         self._uncapped: list[bool] = []
         self._pairs = cfg.training_civ_pairs()
-        self._held_seeds = set(cfg.held_out.seeds)
+        self._group: dict[str, Any] | None = None  # the start being repeated and how many more times to deal it
 
     def next(self, version: int, url: str) -> GameSpec:
         """The next training game, its policy seat on adapter `version` served at `url`."""
-        g, opponent = self.cfg.games, self._draw_opponent()
-        policy_civ, opponent_civ = self.rng.choice(self._pairs)
-        policy = self._llm_seat(policy_civ, version, url, trainable=True)
-        other = self._opponent_seat(opponent, opponent_civ, url)
-        seats = (policy, other) if self.rng.random() < 0.5 else (other, policy)
+        g, start = self.cfg.games, self._next_start()
+        policy = self._llm_seat(start["policy_civ"], version, url, trainable=True)
+        other = self._opponent_seat(start["opponent"], start["opponent_civ"], url, start["behaviour"])
+        seats = (policy, other) if start["policy_first"] else (other, policy)
         game_id = f"{self.cfg.run_id}-g{self.index:06d}"
         self.index += 1
         return GameSpec(
             game_id=game_id,
             seats=seats,
-            map=self.rng.choice(g.maps),
-            seed=self._seed(),
-            ai_seed=self._seed(),
+            map=start["map"],
+            seed=start["seed"],
+            ai_seed=start["ai_seed"],
             size=g.size,
             biome=g.biome,
             placement=g.placement,
-            time_cap_minutes=None if self._draw_uncapped() else g.time_cap_minutes,
+            time_cap_minutes=None if start["uncapped"] else g.time_cap_minutes,
             latency_ms=g.latency_ms,
             score_rule=g.score_rule,
+            group=start.get("group"),
         )
+
+    def _next_start(self) -> dict[str, Any]:
+        """What the next game is drawn from: a new start, or the group in progress dealt once more."""
+        if self._group is not None and self._group["left"] > 0:
+            self._group["left"] -= 1
+            return self._group["start"]
+        g, opponent = self.cfg.games, self._draw_opponent()
+        policy_civ, opponent_civ = self.rng.choice(self._pairs)
+        behaviour = self.rng.choice(PETRA_BEHAVIORS) if opponent.startswith("petra-") else None
+        start = {
+            "opponent": opponent,
+            "behaviour": behaviour,
+            "policy_civ": policy_civ,
+            "opponent_civ": opponent_civ,
+            "policy_first": self.rng.random() < 0.5,
+            "map": self.rng.choice(g.maps),
+            "seed": self._seed(),
+            "ai_seed": self._seed(),
+            "uncapped": self._draw_uncapped(),
+            "group": f"{self.cfg.run_id}-s{self.index:06d}",
+        }
+        self._group = {"left": g.seed_group - 1, "start": start}
+        return start
 
     def _draw_opponent(self) -> str:
         if not self._opponents:
@@ -98,7 +129,7 @@ class GameFactory:
         g = self.cfg.games
         for _ in range(10_000):
             seed = self.rng.randrange(g.seed_low, g.seed_high)
-            if seed not in self._held_seeds:
+            if not self.cfg.held_out.is_held_seed(seed):
                 return seed
         raise ValueError("no seed in games.seed_low..seed_high is outside held_out.seeds")
 
@@ -109,6 +140,7 @@ class GameFactory:
             "rng": [version, list(internal), gauss],
             "opponents": list(self._opponents),
             "uncapped": list(self._uncapped),
+            "group": self._group,
         }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -116,28 +148,36 @@ class GameFactory:
         self.rng.setstate((version, tuple(internal), gauss))
         self.index = max(self.index, int(state["index"]))
         self._opponents, self._uncapped = list(state["opponents"]), list(state["uncapped"])
+        group = state.get("group")
+        self._group = {"left": int(group["left"]), "start": dict(group["start"])} if group else None
 
     def _llm_seat(self, civ: str, version: int, url: str, *, trainable: bool = False) -> SeatSpec:
-        return SeatSpec(
-            kind="llm",
-            civ=civ,
-            model=version_model(version),
-            base_url=url,
-            api_key_env=self.cfg.servers.api_key_env,
-            sampling=dict(TRAIN_SAMPLING),
-            extra_body=dict(EXTRA_BODY),
-            max_tokens=DEFAULT_MAX_TOKENS,
-            trainable=trainable,
-            interface=self.cfg.games.interface,
-        )
+        return llm_seat(self.cfg, civ, version, url, trainable=trainable)
 
-    def _opponent_seat(self, opponent: str, civ: str, url: str) -> SeatSpec:
+    def _opponent_seat(self, opponent: str, civ: str, url: str, behaviour: str | None) -> SeatSpec:
         if opponent == "bot":
             return SeatSpec(kind="bot", civ=civ)
         if opponent == "base":
             return self._llm_seat(civ, 0, url)
-        level, behaviour = int(opponent.removeprefix("petra-")), self.rng.choice(PETRA_BEHAVIORS)
-        return SeatSpec(kind="petra", civ=civ, difficulty=level, behaviour=behaviour)
+        return SeatSpec(kind="petra", civ=civ, difficulty=int(opponent.removeprefix("petra-")), behaviour=behaviour)
+
+
+def llm_seat(
+    cfg: RunConfig, civ: str, version: int, url: str, *, trainable: bool = False, interface: Interface | None = None
+) -> SeatSpec:
+    """A seat on this box's vLLM playing adapter `version` (0 is the base model), sampled the way training samples."""
+    return SeatSpec(
+        kind="llm",
+        civ=civ,
+        model=version_model(version),
+        base_url=url,
+        api_key_env=cfg.servers.api_key_env,
+        sampling=dict(TRAIN_SAMPLING),
+        extra_body=dict(EXTRA_BODY),
+        max_tokens=DEFAULT_MAX_TOKENS,
+        trainable=trainable,
+        interface=interface or cfg.games.interface,
+    )
 
 
 def repin(spec: GameSpec, version: int, url: str, *, game_id: str | None = None) -> GameSpec:

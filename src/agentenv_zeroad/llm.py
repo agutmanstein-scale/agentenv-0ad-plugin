@@ -96,6 +96,9 @@ def _sampled_logprobs(choice: dict[str, Any]) -> tuple[list[float] | None, str]:
     return [float(t["logprob"]) for t in content], "aligned"
 
 
+REFUSED_KEY = (401, 403)  # the proxy's answers to a key it does not accept
+
+
 class StrategistModel:
     """Calls one model with the seat's order tools."""
 
@@ -175,9 +178,11 @@ class StrategistModel:
             text, calls, tokens_in, tokens_out = (
                 self._parse_responses(data) if self.route == "responses" else self._parse_chat(data)
             )
-        except Exception:
+        except Exception as e:
             self.stats["failed_calls"] += 1
-            self.guard.record(self.model, None, None, most_usd=most)
+            refused = isinstance(e, httpx.HTTPStatusError) and e.response.status_code in REFUSED_KEY
+            # A proxy that refuses the key runs no model, so that call costs nothing; any other failure may have.
+            self.guard.record(self.model, *((0, 0) if refused else (None, None)), most_usd=most)
             raise
         usd = self.guard.record(self.model, tokens_in, tokens_out, most_usd=most)
         choice = (data.get("choices") or [{}])[0]

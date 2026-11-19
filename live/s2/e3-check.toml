@@ -1,0 +1,68 @@
+# E3's check: play-only v0, no training. Three held-out panels at hour 0: `petra3-cap` (v0 against Petra-3 at the 12-minute
+# cap: how often it leads at the cap there), and `pair-a` and `pair-b`, v0 twice against Petra-2 on the same 60 starts as the
+# first 60 of E3's end panels (same seed, held-out positions, civs and sides). The paired test of E3's end panel must not
+# reject v0 against v0; the step also benches the learner on recorded rows (sequence.toml's [e3_check]).
+run_id = "s2-e3-check"
+root = "/var/lib/zeroad-live/train/s2/e3-check"
+duration_hours = 1.0         # 180 games at about 490 an hour: 0.4 h; stop_when_done ends it sooner
+budget_usd = 920             # LIVE_BUDGET_USD: box hours (the whole box's, counted once) plus frontier spend; every step's stops at it
+box_usd_per_hour = 10.49     # g6e.12xlarge; 15.07 for a g6e.24xlarge. s2.sh start refuses it if the box's own rate differs.
+shutdown = false             # the sequence powers the box off itself, once, after the final upload
+panels_only = true
+stop_when_done = true
+engines = 24
+concurrency = 24
+seed = 3                     # E3's: the panels' positions depend on it, and the pair must be E3's starts
+
+[servers]
+urls = ["http://172.17.0.1:8000", "http://172.17.0.1:8001"]
+
+[mix]
+petra-1 = 0.1
+petra-2 = 0.7
+petra-3 = 0.2
+
+[games]
+time_cap_minutes = 12
+no_cap_share = 0.0
+interface = "v2"
+score_rule = "net_worth"
+maps = ["mainland"]
+
+[held_out]
+civ_pairs = [["rome", "pers"], ["athen", "cart"]]
+maps = []
+seed_ranges = [[900000, 900500]]
+
+[[panels]]
+name = "petra3-cap"
+kind = "heldout"
+at_hours = 0
+version = 0
+games = 60
+positions = "held_out"
+time_cap_minutes = 12
+opponents = { "petra-3" = 1.0 }
+
+[[panels]]
+name = "pair-a"
+kind = "heldout"
+at_hours = 0
+version = 0
+games = 60
+positions = "held_out"
+time_cap_minutes = 12
+opponents = { "petra-2" = 1.0 }
+
+[[panels]]
+name = "pair-b"
+kind = "heldout"
+at_hours = 0
+version = 0
+games = 60
+positions = "held_out"
+time_cap_minutes = 12
+opponents = { "petra-2" = 1.0 }
+
+[s3]
+uri = "s3://BUCKET/zeroad-train/run/s2-e3-check"

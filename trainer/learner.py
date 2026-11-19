@@ -9,7 +9,8 @@ Input. Decision rows, one JSON object per line, in *.jsonl files dropped into RO
 under another name (say x.jsonl.tmp) and renames it to a unique x.jsonl, so the learner never reads half a file. Fields:
 game_id, version (the adapter version that sampled it, 0 = the base model), prompt_token_ids, token_ids, logprobs (the
 sampler's log-prob of each completion token, same length as token_ids), advantage (already centred upstream), and
-optionally loss_mask (one number per completion token) and is_hold. A row that fails validation is counted by reason
+optionally loss_mask (one number per completion token), is_hold and group (a string: the credit's same-start group id,
+shared by all rows of a group's games; used only with --whole-groups). A row that fails validation is counted by reason
 and dropped. Read files move to inbox/consumed/. A row flagged `"sft": true` is a teacher label, not a sample: it needs
 only game_id, prompt_token_ids and token_ids (and optionally loss_mask), carries no advantage, and is trained on by the
 auxiliary cross-entropy term below; with that term off (aux_alpha0 = 0) such rows are dropped and counted.
@@ -17,18 +18,31 @@ auxiliary cross-entropy term below; with that term off (aux_alpha0 = 0) such row
 Updates. 256 decisions per update, in 2 minibatches of 128, one epoch. Rows more than `max_staleness` versions older
 than the learner's current version are dropped. When more than 256 valid rows are waiting the freshest go first: the
 learner is the bottleneck in the design (docs/post-training-v2.md), so queueing oldest-first would train on ever staler
-data.
+data. `--decisions-per-update` sets the 256 and `--warmup-updates` the 10 updates the lr warms up over.
+With `--whole-groups` an update is built from whole start groups instead (the rows' `group`; a row without one is a
+group of one): the freshest group, by its newest row, first, until the batch holds at least decisions_per_update rows,
+so it may overshoot by less than one group. The minibatch split keeps each group inside one minibatch (a group is never
+split; a minibatch may run over its share by less than a group; with fewer groups than minibatches it is a plain split).
+The staleness rules are the same. Without the flag, or on rows with no group, batching is as above.
 
 Loss: decoupled PPO with a truncated importance weight and a constant token divisor.
-  pi_prox  the learner's weights at the start of the update; log pi_prox of every token is computed (no grad) before the
-           first optimizer step, so the trust region is this update's, not the staleness of the data
+  pi_prox  the learner's weights at the start of the update; log pi_prox of every token is fixed before the first
+           optimizer step, so the trust region is this update's, not the staleness of the data. Minibatch 1 needs no
+           forward of its own for it: before any step its training forward's detached log-probs are log pi_prox, so
+           only the later minibatches' rows get a no-grad proximal forward (the lean path, the default). The health
+           measurements are unchanged: the entropy, the KL to the anchor and the KL to base (on `base_kl_fraction` of
+           all the rows) are taken for each row once, from minibatch 1's training forward for its rows and from the
+           proximal forward for the others. `--full-prox` runs the proximal pass on every row instead, as before, so
+           the two can be timed against each other; the loss and gradients are the same.
   r        exp(log pi_theta - log pi_prox), with the PPO pessimistic min of r*A and clip(r, 0.8, 1.28)*A
   w        min(exp(log pi_prox - log mu), 2), mu = the sampler's stored log-prob; it carries no gradient
   L        -(1 / (B x 128)) sum_i sum_t m_it w_it min(...), B the minibatch size and 128 a constant divisor
 The divisor is never the completion's length, which is what made the pilot's short replies win. m is the row's
 loss_mask, or, when it has none, zero on exactly the tokens of say() tool calls. After minibatch 1, if the mean
-KL(pi_after || pi_prox) over minibatch 2's trained tokens is above `kl_stop`, minibatch 2 is skipped. KL is
-estimated on the sampled tokens as r log r - r + 1, which is non-negative and unbiased for data drawn from pi_prox.
+KL(pi_after || pi_prox) over minibatch 2's trained tokens is above `kl_stop`, minibatch 2 is skipped;
+`--kl-check-fraction F` (default 1) measures it on the first F of each rank's minibatch-2 rows instead (at least one
+row). KL is estimated on the sampled tokens as r log r - r + 1, which is non-negative and unbiased for data drawn
+from pi_prox.
 The LM head and log-softmax run in fp32 whatever the model's dtype.
 
 Two terms are added to the minibatch's loss, each over the same trained tokens (the masks) and divided by the same
@@ -41,7 +55,8 @@ B x 128, so a weight reads as "per token, relative to the policy-gradient term":
            weight w. The reference is the adapter given with --anchor (the frozen distilled SFT adapter: RL's pull back
            to the imitation policy, which made imitation pay off in AlphaStar and VPT); without --anchor it is --init,
            so a run started from the SFT adapter is held to it, and `--anchor base` is the base model. beta_t = beta0 x
-           decay^update, beta0 0.1 and decay 0.999 by default, 0 turns it off. The update count is what a checkpoint
+           decay^update, beta0 0.1 and decay 0.999 by default (`--anchor-beta0`), 0 turns it off: the
+           anchor's weights are not even loaded and its no-grad pass is never run. The update count is what a checkpoint
            and a rollback restore, so the schedule comes back with them. The anchor's log-probs are computed once per
            update, with no gradient, before the first step; the health record logs kl_to_anchor (its mean k3 over the
            update's rows), anchor_beta and the anchor in use. kl_to_base, the alarm, stays.
@@ -76,7 +91,18 @@ result into the record as "tripwires": {"trips": [...], "alarms": [...]}. Withou
 none run (hold share, invented tool names, rejected share against its 3% floor, clipped share, gradient norm). A trip
 means roll back, an alarm means look; the learner only reports, the orchestrator acts. A rollback empties the window, so
 the updates it undid cannot trip the restored weights, and a restart refills it from health.jsonl after the last
-rollback.
+rollback. `--drift alarm` reports the banded checks as alarms instead of trips, so behaviour may move away from v0's
+bands without a rollback, and `--grad-norm alarm` does the same for a gradient-norm spike.
+
+Held-out step KL (`--probe-rows N`, default 0 = off). Rows of games picked by a hash of their game_id (one in four),
+from the first rows that arrive, are set aside until N rows are held; every row of a picked game stays out of training
+(rows of a picked game that arrive once the set is full are dropped and counted as probe_dropped). Once full, the set is
+sent to every rank with the next update, and the weights then in place give the first baseline. After every update, one
+no-grad forward of the set gives the mean KL(pi_new || pi_previous version) over its sampled tokens (r log r - r + 1,
+the estimator above), recorded as `kl_step_heldout` in the health record (null while there is no probe); that forward's
+log-probs are the next baseline, and a rollback refreshes it. The tokens were sampled by whatever policy played the
+games, so it is a between-version distance on a fixed set of states, not a trust-region statistic of the sampler. After
+a restart a new set is cut from the new rows.
 
 Control. A command is a JSON object in a file in ROOT/control; the file's name only orders commands, oldest name first,
 so use a sortable one such as 000017-rollback.json. Write it as a hidden or .tmp name and rename it into place: the
@@ -106,10 +132,33 @@ a restart rebuilds the dataset from inbox/consumed/ and carries on from there; a
 is reused when it holds this version's weights and refused otherwise. After the last epoch the learner writes
 ROOT/sft-done.json and exits.
 
+Stats-only mode (--stats-only ROWS), for the tripwire baseline. Reads v0 decision rows (the inbox format), measures them
+in batches of `decisions_per_update` (256) with the same row_stats, entropy and KL-to-base code an update uses, writes
+one health-shaped record per batch to ROOT/baseline-records.jsonl and then baseline_from() of them, in the format
+--baseline reads, to ROOT/baseline.json, and exits. The weights never change (no optimizer step, no publish, no
+checkpoint); a short last batch is dropped, so every record is comparable with a training batch. Run it on the base
+model, without --init.
+
+--start-version N (with --init): the init adapter is version N, already published at ROOT/adapters/v{N} (by the
+sequencer, which copies it there) so the games play it from the start; the learner counts on from N, so its first
+update publishes v{N+1} and never overwrites v{N}. Without it the learner counts from 0, and an init adapter is
+version 0 to the learner while the orchestrator's version 0 is the base model: the games before the first update
+would be played by the base model.
+
+Bench mode (--bench ROWS_DIR [--bench-updates U], default 5), for timing the learner's flags on recorded rows. Reads
+the decision rows in the *.jsonl files of ROWS_DIR (the inbox format; versions are ignored, every batch is stamped with
+the learner's current version so none is stale and the TIS weight treats them as off-policy), runs U real updates with
+the configured flags (--full-prox, --whole-groups, --probe-rows, --anchor-beta0, --kl-check-fraction, ...), reusing the
+rows from the start if it runs out, and writes ROOT/bench.json: each update's seconds, rows and seconds per row, and
+the mean seconds per row and per update without update 1 (its first CUDA calls are slow). Nothing is published, no
+checkpoint or health record is written, and it exits. Start from --init, not a resumed root.
+
 Run in the trainer image (vLLM's image with PEFT), after training starts:
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 [--init ADAPTER] --known-tools a,b,c
       [--baseline baseline.json]
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /sft1 --sft --lr 1e-4 [--sft-epochs 2]
+  torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /bench --known-tools a,b,c --init ADAPTER
+      --bench /rows --bench-updates 5 [--full-prox | --whole-groups --probe-rows 64 --kl-check-fraction 0.25]
   torchrun --nproc_per_node 2 learner.py --base Qwen/Qwen3-8B --root /run1 --init /sft1/epochs/epoch1
       --anchor /sft1/epochs/epoch1 --known-tools a,b,c
 """
@@ -189,6 +238,16 @@ class LearnerConfig:
     sft_epochs: int = 2  # SFT mode: passes over the dataset; a checkpoint is published after each
     sft_entropy_rows: int = 128  # SFT mode: rows the epoch-end entropy is measured on
     sft_holdout: float = 0.1  # SFT mode: the share of the dataset (by a hash of game_id) held out of training for it
+    full_prox: bool = (
+        False  # True: the proximal pass runs on every row (the E2 behaviour); False: minibatch 1 reuses its own forward
+    )
+    kl_check_fraction: float = 1.0  # the share of minibatch 2's rows the KL-after stop check is measured on
+    probe_rows: int = 0  # rows reserved, never trained on, for the held-out between-version KL; 0 turns it off
+    whole_groups: bool = (
+        False  # batch whole start groups (the rows' `group`), freshest first, and keep them in one minibatch
+    )
+    bench: bool = False  # bench mode: updates publish, checkpoint and log nothing
+    start_version: int = 0  # --init's version number: published already, so the first update is start_version + 1
 
     @property
     def inbox(self) -> Path:
@@ -218,6 +277,10 @@ class LearnerConfig:
     def sft_done(self) -> Path:
         return self.root / "sft-done.json"
 
+    @property
+    def bench_result(self) -> Path:
+        return self.root / "bench.json"
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -239,6 +302,7 @@ class Decision:
     mask: list[float] = field(default_factory=list)  # the resolved per-token loss mask (see annotate)
     calls: tuple[ToolCall, ...] = ()
     aux: bool = False  # an sft-flagged row in an RL run: a teacher label, trained on by cross-entropy, no advantage
+    group: str = ""  # the credit's same-start group id, shared by all rows of a group's games; "" = no group
 
 
 class RowRejected(ValueError):
@@ -286,9 +350,11 @@ def parse_row(obj: Any, max_len: int, *, sft: bool = False) -> Decision:
             raise RowRejected("bad_loss_mask") from e
         if len(loss_mask) != len(completion) or not all(math.isfinite(x) for x in loss_mask):
             raise RowRejected("bad_loss_mask")
+    group = obj.get("group")
     return Decision(
-        game_id, version, prompt, completion, logprobs, advantage, loss_mask, bool(obj.get("is_hold")), aux=aux
-    )
+        game_id, version, prompt, completion, logprobs, advantage, loss_mask, bool(obj.get("is_hold")), aux=aux,
+        group=group if isinstance(group, str) else "",
+    )  # fmt: skip
 
 
 _NAME = re.compile(r'"name"\s*:\s*"([^"]*)"')
@@ -340,6 +406,9 @@ class Inbox:
         self.aux: list[Decision] = []  # sft-flagged teacher labels, oldest first
         self.dataset: list[Decision] = []  # SFT mode: every row to train on, replayed by each further epoch
         self.holdout: list[Decision] = []  # SFT mode: rows never trained on, for the epoch-end entropy
+        self.probe: list[Decision] = []  # RL: rows reserved for the held-out between-version KL, never trained on
+        self.probe_games: set[str] = set()
+        self.probe_sent = False
         self.epoch, self.epoch_trained, self.finished = 1, 0, False
         self.counts: Counter[str] = Counter()
         cfg.inbox.mkdir(parents=True, exist_ok=True)
@@ -375,6 +444,8 @@ class Inbox:
             if row.aux:
                 self._keep_aux(row)
                 continue
+            if self._reserve_for_probe(row):
+                continue
             if self.cfg.sft and self.held_out(row):
                 self.holdout.append(row)
             else:
@@ -390,6 +461,31 @@ class Inbox:
         the dataset arrives, and again after a restart."""
         key = zlib.crc32(f"{self.cfg.seed}:{row.game_id}".encode())
         return key % 10_000 < self.cfg.sft_holdout * 10_000
+
+    def _reserve_for_probe(self, row: Decision) -> bool:
+        """Whether the row belongs to the probe set instead of the pool. Games are picked by a hash of their game_id
+        (one in four) from the first rows that arrive, until the set holds `probe_rows` rows; every row of a picked game
+        stays out of training, and one that arrives after the set is full is dropped and counted."""
+        n = self.cfg.probe_rows
+        if n <= 0 or self.cfg.sft:
+            return False
+        if row.game_id not in self.probe_games:
+            if len(self.probe) >= n or zlib.crc32(f"probe:{self.cfg.seed}:{row.game_id}".encode()) % 4:
+                return False
+            self.probe_games.add(row.game_id)
+        if len(self.probe) < n:
+            self.probe.append(row)
+            self.counts["probe_rows"] += 1
+        else:
+            self.counts["probe_dropped"] += 1
+        return True
+
+    def take_probe(self) -> list[Decision] | None:
+        """The full probe set, once, the first time it is asked for after it has filled; None otherwise."""
+        if self.probe_sent or self.cfg.probe_rows <= 0 or len(self.probe) < self.cfg.probe_rows:
+            return None
+        self.probe_sent = True
+        return list(self.probe)
 
     def _keep_aux(self, row: Decision) -> None:
         """An sft-flagged row waits for take_aux; with the auxiliary term off it is dropped, and counted apart from the
@@ -423,12 +519,26 @@ class Inbox:
         if len(self.pool) < n or not self.pool:
             return None
         order = sorted(range(len(self.pool)), key=lambda i: (-self.pool[i].version, i))
-        chosen = set(order[:n])
+        chosen = set(self._whole_groups(order, n) if self.cfg.whole_groups and not self.cfg.sft else order[:n])
         batch = [self.pool[i] for i in sorted(chosen)]
         self.pool = [row for i, row in enumerate(self.pool) if i not in chosen]
         if self.cfg.sft:
             self.epoch_trained += len(batch)
         return batch
+
+    def _whole_groups(self, order: list[int], n: int) -> list[int]:
+        """Pool indices of whole groups, the freshest group (its newest row) first, until at least n rows are held; the
+        last group may overshoot. A row without a group is a group of one."""
+        members: dict[object, list[int]] = {}
+        for i in order:
+            row = self.pool[i]
+            members.setdefault(row.group or ("row", i), []).append(i)
+        chosen: list[int] = []
+        for indices in members.values():  # `order` put each group's newest row first, so insertion order is freshness
+            if len(chosen) >= n:
+                break
+            chosen += indices
+        return chosen
 
     def take_aux(self) -> list[Decision]:
         """Up to aux_rows_per_update waiting sft-flagged rows, oldest first (a label does not go stale)."""
@@ -726,7 +836,7 @@ class Learner:
             [p for _, p in self.params], lr=cfg.lr, betas=cfg.betas, eps=cfg.eps, weight_decay=cfg.weight_decay
         )
         self.lr = cfg.lr
-        self.version = 0
+        self.version = cfg.start_version
         self.updates = 0
         self.aux_updates = 0  # updates that trained on sft-flagged rows: what the aux weight decays over
         self.sft_progress: tuple[int, int] = (1, 0)  # SFT: (epoch, rows of it trained), saved in each checkpoint
@@ -736,6 +846,9 @@ class Learner:
         self.backbone = backbone.model
         self.head_weight = backbone.lm_head.weight.detach().float()
         self.anchor_weights = self._load_anchor() if cfg.anchor and self.anchor_enabled else {}
+        self._probe_rows: list[Decision] = []  # the held-out probe set, every rank's copy (see set_probe)
+        self._probe_mine: list[Decision] = []
+        self._probe_prev: list[torch.Tensor] = []  # the previous version's log-probs of this rank's probe rows
         cfg.checkpoints.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -805,7 +918,7 @@ class Learner:
                 hidden = self.backbone(input_ids=ids).last_hidden_state[0, -(c + 1) : -1]
             log_probs = torch.log_softmax(hidden.float() @ self.head_weight.T, dim=-1)
             logp = log_probs.gather(1, target[:, None])[:, 0]
-            ent = -(log_probs.exp() * log_probs).sum(-1) if entropy else None
+            ent = -(log_probs.detach().exp() * log_probs.detach()).sum(-1) if entropy else None
         return logp, ent
 
     def anchor_logps(self, row: Decision) -> torch.Tensor:
@@ -846,15 +959,27 @@ class Learner:
         # every auxiliary row goes in minibatch 1, which always runs: a KL stop of the later ones cannot drop them
         aux_owned = [[r for i, r in enumerate(aux_rows) if i % comm.world == comm.rank]] + [[] for _ in batches[1:]]
         totals: Counter[str] = Counter()
-        prox, anchor = ({}, {}) if cfg.sft else self._prox_pass(rows, owned, totals, schedule.beta > 0)
+        lean = not cfg.sft and not cfg.full_prox
+        base_sample = self._base_sample(rows)
+        prox, anchor = (
+            ({}, {})
+            if cfg.sft
+            else self._prox_pass(rows, owned, totals, schedule.beta > 0, base_sample=base_sample, lean=lean)
+        )
         stepped, grad_norms, kl_check = 0, [], None
         for j, mb in enumerate(owned):
             if j > 0 and not cfg.sft:
                 kl_check = self._kl_after(mb, prox)
                 if kl_check > cfg.kl_stop:
                     break
-            grad_norms.append(self._train_minibatch(mb, len(batches[j]), prox, totals, anchor, aux_owned[j], schedule))
+            measure = base_sample if lean and j == 0 else None
+            grad_norms.append(
+                self._train_minibatch(
+                    mb, len(batches[j]), prox, totals, anchor, aux_owned[j], schedule, measure=measure
+                )
+            )
             stepped += 1
+        heldout = self._probe_step()
         reduced = self._reduce(totals)
         self.updates += 1
         self.aux_updates += bool(aux_rows)
@@ -865,9 +990,23 @@ class Learner:
             rows, reduced, (stepped, trained, grad_norms, kl_check), intake or {}, (started, base_version, lr_used)
         )
         health |= self._aux_health(reduced, schedule, len(aux_rows))
+        health["kl_step_heldout"] = heldout
         health["tripwires"] = self._tripwires(health)
         self._persist(health)
         return health
+
+    def measure(self, rows: list[Decision]) -> dict[str, Any]:
+        """The health record an update on `rows` would write, without training: the same row statistics, entropy and KL
+        to base, no step, no version, no publish. Every rank takes part; the weights are untouched."""
+        cfg, comm = self.cfg, self.comm
+        started, version, lr = time.time(), self.version, self.effective_lr()
+        rows = [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in rows]
+        owned = [[r for i, r in enumerate(mb) if i % comm.world == comm.rank] for mb in self._minibatches(rows)]
+        totals: Counter[str] = Counter()
+        self._prox_pass(rows, owned, totals)
+        reduced = self._reduce(totals)
+        health = self._health(rows, reduced, (0, 0, [], None), {}, (started, version, lr))
+        return health | self._aux_health(reduced, Schedule(0.0, 0.0), 0) | {"kl_step_heldout": None}
 
     def _tripwires(self, health: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         """This update's trips and alarms over the newest records; an SFT run samples nothing, so it has none."""
@@ -877,26 +1016,68 @@ class Learner:
         return evaluate_tripwires(list(self.recent), self.baseline, self.tripwire_config)
 
     def _minibatches(self, rows: list[Decision]) -> list[list[Decision]]:
+        if self.cfg.whole_groups and not self.cfg.sft and self.cfg.minibatches > 1:
+            grouped = self._group_minibatches(rows)
+            if grouped:
+                return grouped
         order = list(rows)
         random.Random(self.cfg.seed * 1_000_003 + self.version).shuffle(order)
         m, n = self.cfg.minibatches, len(order)
         bounds = [n * k // m for k in range(m + 1)]
         return [order[bounds[k] : bounds[k + 1]] for k in range(m)]
 
-    def _prox_pass(
-        self, rows: list[Decision], owned: list[list[Decision]], totals: Counter[str], with_anchor: bool = False
-    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-        """log pi_prox of every owned row, before any step, plus the entropy and KL-to-base health samples; with
-        `with_anchor` also the anchor's log-prob of every owned row (and the KL to it, over all of them)."""
-        sample = set(random.Random(self.cfg.seed + self.version).sample(
+    def _group_minibatches(self, rows: list[Decision]) -> list[list[Decision]] | None:
+        """The minibatches with every start group inside one of them: the groups (a row without one is a group of one)
+        shuffled, then filled in order, a minibatch closing once it holds its share. A group is never split, so a
+        minibatch may run over its share by less than one group. None when that leaves a minibatch empty (fewer groups
+        than minibatches): the caller falls back to a plain split."""
+        groups: dict[object, list[Decision]] = {}
+        for r in rows:
+            groups.setdefault(r.group or ("row", id(r)), []).append(r)
+        order = list(groups.values())
+        random.Random(self.cfg.seed * 1_000_003 + self.version).shuffle(order)
+        m, n = self.cfg.minibatches, len(rows)
+        out: list[list[Decision]] = [[]]
+        for g in order:
+            out[-1] += g
+            if len(out) < m and sum(len(b) for b in out) >= n * len(out) // m:
+                out.append([])
+        return out if len(out) == m and all(out) else None
+
+    def _base_sample(self, rows: Sequence[Decision]) -> set[int]:
+        """ids of the `base_kl_fraction` of `rows` the KL to the base model is measured on (at least one)."""
+        if not rows:
+            return set()
+        picked = random.Random(self.cfg.seed + self.version).sample(
             range(len(rows)), max(1, math.ceil(self.cfg.base_kl_fraction * len(rows)))
-        ))  # fmt: skip
-        position = {id(r): i for i, r in enumerate(rows)}
+        )
+        return {id(rows[i]) for i in picked}
+
+    def _prox_pass(
+        self,
+        rows: list[Decision],
+        owned: list[list[Decision]],
+        totals: Counter[str],
+        with_anchor: bool = False,
+        *,
+        base_sample: set[int] | None = None,
+        lean: bool = False,
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """log pi_prox of the owned rows, before any step, plus the entropy and KL-to-base health samples; with
+        `with_anchor` also the anchor's log-prob of every owned row (and the KL to it).
+
+        Full (the default here): every owned row. `lean` skips minibatch 1: pi_prox is the weights before any step, so
+        the training forward of minibatch 1 (see _train_minibatch's `measure`) already yields its log pi_prox, and the
+        measurements of its rows (entropy, KL to anchor, KL to base) are taken from that forward; only the later
+        minibatches' rows get a forward here. Either way every row is measured once, on the same sample."""
+        if base_sample is None:
+            base_sample = self._base_sample(rows)
+        prox_rows = [r for mb in (owned[1:] if lean else owned) for r in mb]
         mine = [r for mb in owned for r in mb]
         prox: dict[int, torch.Tensor] = {}
         anchor: dict[int, torch.Tensor] = {}
         masks = {id(r): torch.tensor(r.mask, device=self.device) for r in mine}
-        for row in mine:
+        for row in prox_rows:
             logp, ent = self.logps(row, grad=False, entropy=not row.is_hold)
             prox[id(row)] = logp
             if ent is not None:
@@ -905,23 +1086,61 @@ class Learner:
         if with_anchor:  # one swap of the anchor's weights for every row
             for row, logp_anchor in zip(mine, self.anchor_logps_many(mine), strict=True):
                 anchor[id(row)] = logp_anchor
-                totals["anchor_kl_sum"] += float(anchor_k3(prox[id(row)], logp_anchor, masks[id(row)]))
-                totals["anchor_kl_n"] += float(masks[id(row)].sum())
-        for row in (r for r in mine if position[id(r)] in sample):
-            # with the base model as the anchor its log-probs are the base's: no second pass
-            base_logp = (
-                anchor[id(row)]
-                if with_anchor and not self.anchor_weights
-                else self.logps(row, grad=False, adapter=False)[0]
-            )
-            delta = base_logp - prox[id(row)]
-            totals["base_kl_sum"] += float(((torch.exp(delta) - delta - 1) * masks[id(row)]).sum())
-            totals["base_kl_n"] += float(masks[id(row)].sum())
+                if id(row) in prox:
+                    totals["anchor_kl_sum"] += float(anchor_k3(prox[id(row)], logp_anchor, masks[id(row)]))
+                    totals["anchor_kl_n"] += float(masks[id(row)].sum())
+        for row in (r for r in prox_rows if id(r) in base_sample):
+            self._add_base_kl(row, prox[id(row)], masks[id(row)], anchor, totals)
         return prox, anchor
 
-    def _kl_after(self, mb: list[Decision], prox: dict[int, torch.Tensor]) -> float:
-        """Mean KL(pi_after || pi_prox) over the trained tokens of every rank's share of the minibatch."""
+    def _add_base_kl(
+        self,
+        row: Decision,
+        logp: torch.Tensor,
+        mask: torch.Tensor,
+        anchor: dict[int, torch.Tensor],
+        totals: Counter[str],
+    ) -> None:
+        # with the base model as the anchor its log-probs are the base's: no second pass
+        if id(row) in anchor and not self.anchor_weights:
+            base_logp = anchor[id(row)]
+        else:
+            base_logp = self.logps(row, grad=False, adapter=False)[0]
+        delta = base_logp - logp
+        totals["base_kl_sum"] += float(((torch.exp(delta) - delta - 1) * mask).sum())
+        totals["base_kl_n"] += float(mask.sum())
+
+    def set_probe(self, rows: Sequence[Decision]) -> None:
+        """Take the held-out probe rows (the same on every rank) and store the current weights' log-probs of them: the
+        baseline the next update's kl_step_heldout is measured against."""
+        cfg, comm = self.cfg, self.comm
+        self._probe_rows = [annotate(r, self.decode, cfg.tool_call_open, cfg.tool_call_close) for r in rows]
+        self._probe_mine = [r for i, r in enumerate(self._probe_rows) if i % comm.world == comm.rank]
+        self._probe_prev = self._probe_logps()
+
+    def _probe_logps(self) -> list[torch.Tensor]:
+        return [self.logps(r, grad=False)[0] for r in self._probe_mine]
+
+    def _probe_step(self) -> float | None:
+        """Mean KL(pi_new || pi_previous version) over the probe rows' sampled tokens, estimated as r log r - r + 1;
+        None with no probe. One no-grad forward of the probe; its log-probs are the next update's baseline."""
+        if not self._probe_rows:
+            return None
+        now = self._probe_logps()
         acc = torch.zeros(2, device=self.device)
+        for row, logp, before in zip(self._probe_mine, now, self._probe_prev, strict=True):
+            s, n = kl_estimate(logp, before, torch.tensor(row.mask, device=self.device))
+            acc += torch.tensor([s, n], device=self.device)
+        total, count = self.comm.sum(acc).tolist()
+        self._probe_prev = now
+        return total / max(count, 1.0)
+
+    def _kl_after(self, mb: list[Decision], prox: dict[int, torch.Tensor]) -> float:
+        """Mean KL(pi_after || pi_prox) over the trained tokens of every rank's share of the minibatch, or of the first
+        `kl_check_fraction` of it (at least one row; the minibatch is already shuffled)."""
+        acc = torch.zeros(2, device=self.device)
+        if self.cfg.kl_check_fraction < 1 and mb:
+            mb = mb[: max(1, math.ceil(self.cfg.kl_check_fraction * len(mb)))]
         for row in mb:
             logp, _ = self.logps(row, grad=False)
             s, n = kl_estimate(logp, prox[id(row)], torch.tensor(row.mask, device=self.device))
@@ -938,17 +1157,25 @@ class Learner:
         anchor: dict[int, torch.Tensor] | None = None,
         aux: Sequence[Decision] = (),
         schedule: Schedule | None = None,
+        *,
+        measure: set[int] | None = None,
     ) -> float:
         """Accumulate the loss gradient over this rank's rows, sum it across ranks, clip, step. Returns the norm.
 
         `size` is the minibatch's policy-gradient row count and the divisor of every term, so beta and alpha weigh the
-        anchor and the auxiliary cross-entropy against the PG term token for token."""
+        anchor and the auxiliary cross-entropy against the PG term token for token.
+
+        With `measure` (the first minibatch of a lean update, before any step) this forward is also the proximal pass:
+        the detached log-probs become log pi_prox, and the entropy, the KL to the anchor and the KL to base (on the rows
+        whose ids are in `measure`) are taken from it."""
         cfg = self.cfg
         schedule = schedule or Schedule(0.0, 0.0)
         self.optimizer.zero_grad(set_to_none=True)
         for row in mb:
-            logp, _ = self.logps(row, grad=True)
+            logp, ent = self.logps(row, grad=True, entropy=measure is not None and not row.is_hold)
             mask = torch.tensor(row.mask, device=self.device)
+            if measure is not None:
+                self._measure_first(row, logp.detach(), ent, mask, (prox, anchor or {}, totals), id(row) in measure)
             if cfg.sft:
                 terms = sft_terms(logp, mask)
             else:
@@ -985,6 +1212,26 @@ class Learner:
             group["lr"] = self.effective_lr()
         self.optimizer.step()
         return norm
+
+    def _measure_first(
+        self,
+        row: Decision,
+        logp: torch.Tensor,
+        ent: torch.Tensor | None,
+        mask: torch.Tensor,
+        shared: tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], Counter[str]],
+        sampled: bool,
+    ) -> None:
+        prox, anchor, totals = shared
+        prox[id(row)] = logp
+        if ent is not None:
+            totals["entropy_sum"] += float((ent * mask).sum())
+            totals["entropy_n"] += float(mask.sum())
+        if id(row) in anchor:
+            totals["anchor_kl_sum"] += float(anchor_k3(logp, anchor[id(row)], mask))
+            totals["anchor_kl_n"] += float(mask.sum())
+        if sampled:
+            self._add_base_kl(row, logp, mask, anchor, totals)
 
     def _sum_grads(self) -> None:
         if self.comm.world == 1:
@@ -1051,7 +1298,10 @@ class Learner:
         }
 
     def _persist(self, health: dict[str, Any]) -> None:
-        """Checkpoint, publish and log the update just made (rank 0 writes, everyone waits)."""
+        """Checkpoint, publish and log the update just made (rank 0 writes, everyone waits).
+        Bench mode writes nothing."""
+        if self.cfg.bench:
+            return
         if self.comm.rank == 0:
             self.save_checkpoint()
             self.publish(health)
@@ -1184,6 +1434,8 @@ class Learner:
         self.decisions_total = state["decisions_total"]
         self.lr = self.lr / 2
         self.recent.clear()
+        if self._probe_rows:
+            self._probe_prev = self._probe_logps()
         self.version = self.checkpoint_versions()[-1] + 1
         record = {"event": "rollback", "restored": version, "version": self.version, "lr": self.lr, "time": time.time()}
         self._persist(record)
@@ -1250,6 +1502,8 @@ class Learner:
 DEFAULTS: dict[str, Any] = {
     "window": 10,
     "min_records": 5,
+    "drift": "trip",
+    "grad_norm": "trip",
     "band_sd": 4.0,
     "band_floor": {"length": 5.0, "calls": 0.1, "exact_share": 0.02, "distinct_fraction": 0.02, "entropy": 0.05},
     "banded": {
@@ -1284,12 +1538,16 @@ def evaluate_tripwires(
               rejected_share only the mean is read
     config    overrides for DEFAULTS
 
-    Trips: window mean outside the band for length (tokens_p50), calls (calls_per_decision), exact_share,
-    distinct_fraction or entropy; hold share above 0.8; invented tool names above 0.5%; rejected share above
+    Trips: hold share above 0.8; invented tool names above 0.5%; rejected share above
     max(2 x baseline, 3%); this update's clipped share above clipped_trip; the newest grad norm above 5x the window's
-    median. Alarms: hold share above 0.6; KL to base or TIS truncation above their limits.
+    median (an alarm with grad_norm = "alarm"). Alarms: hold share above 0.6; KL to base or TIS truncation above their
+    limits. The banded checks (window mean outside the band for length (tokens_p50), calls (calls_per_decision),
+    exact_share, distinct_fraction or entropy) are trips, or alarms with drift = "alarm".
     """
     cfg = {**DEFAULTS, **(config or {})}
+    for switch in ("drift", "grad_norm"):
+        if cfg[switch] not in ("trip", "alarm"):
+            raise ValueError(f"{switch} must be 'trip' or 'alarm', not {cfg[switch]!r}")
     recent = list(window)[-cfg["window"] :]
     trips: list[dict[str, Any]] = []
     alarms: list[dict[str, Any]] = []
@@ -1303,6 +1561,7 @@ def evaluate_tripwires(
     def flag(into: list, name: str, metric: str, value: float, limit: Any, message: str) -> None:
         into.append({"name": name, "metric": metric, "value": value, "limit": limit, "message": message})
 
+    drift_into = trips if cfg["drift"] == "trip" else alarms
     for name, metric in cfg["banded"].items():
         value, ref = mean(metric), baseline.get(metric)
         if value is None or ref is None:
@@ -1310,7 +1569,7 @@ def evaluate_tripwires(
         spread = max(cfg["band_sd"] * ref["sd"], cfg["band_floor"].get(name, 0.0))
         low, high = ref["mean"] - spread, ref["mean"] + spread
         if not low <= value <= high:
-            flag(trips, name, metric, value, [low, high], f"{metric} {value:.4g} outside {low:.4g}..{high:.4g}")
+            flag(drift_into, name, metric, value, [low, high], f"{metric} {value:.4g} outside {low:.4g}..{high:.4g}")
 
     hold = mean("hold_share")
     if hold is not None and hold > cfg["hold_trip"]:
@@ -1358,7 +1617,7 @@ def evaluate_tripwires(
     norms = [r["grad_norm"] for r in recent if r.get("grad_norm") is not None]
     if len(norms) >= 2 and norms[-1] > cfg["grad_norm_factor"] * statistics.median(norms):
         flag(
-            trips,
+            trips if cfg["grad_norm"] == "trip" else alarms,
             "grad_norm",
             "grad_norm",
             norms[-1],
@@ -1393,6 +1652,155 @@ def baseline_from(records: Sequence[dict[str, Any]], window: int = 10) -> dict[s
     return baseline
 
 
+def stats_only(learner: Learner, rows_path: Path) -> dict[str, int]:
+    """The tripwire baseline of the policy the learner holds (the base model, v0): health records of the rows in
+    `rows_path` in batches of `decisions_per_update`, without changing the weights. Rank 0 reads the file and writes
+    ROOT/baseline-records.jsonl, then ROOT/baseline.json (baseline_from over the records, as --baseline reads it);
+    returns {records, decisions, dropped} on every rank. A file under one batch is refused."""
+    size = learner.cfg.decisions_per_update
+    rows: list[Decision] | None = None
+    if learner.comm.rank == 0:
+        rows = [
+            parse_row(json.loads(line), learner.cfg.max_len)
+            for line in rows_path.read_text().splitlines()
+            if line.strip()
+        ]
+    rows = learner.comm.broadcast(rows)
+    assert rows is not None
+    if len(rows) < size:
+        raise SystemExit(f"{rows_path} has {len(rows)} rows: stats-only needs at least one batch of {size}")
+    batches = [rows[i : i + size] for i in range(0, len(rows) - size + 1, size)]
+    records = []
+    for i, batch in enumerate(batches):
+        records.append(learner.measure(batch))
+        log.info("baseline record %d of %d", i + 1, len(batches))
+    if learner.comm.rank == 0:
+        learner.cfg.root.mkdir(parents=True, exist_ok=True)
+        text = "".join(json.dumps(r) + "\n" for r in records)
+        write_file_atomically(learner.cfg.root / "baseline-records.jsonl", lambda p: p.write_text(text))
+        write_file_atomically(
+            learner.cfg.root / "baseline.json", lambda p: p.write_text(json.dumps(baseline_from(records)))
+        )
+    learner.comm.barrier()
+    return {"records": len(records), "decisions": len(batches) * size, "dropped": len(rows) - len(batches) * size}
+
+
+def probe(
+    learner: Learner, rows_path: Path, *, agree_rows: int = 5, batch_rows: int = 32, warmup_rows: int = 8
+) -> dict[str, Any]:
+    """The box-day GPU gates of the learner (docs/s2-box-day.md), on rows vLLM sampled (the inbox format, with its
+    log-probs): how far the learner's log-prob of each sampled token is from vLLM's (the mean absolute gap over the
+    first `agree_rows` rows' tokens, before any update, so the adapter is still the base model), and how long one update
+    takes per trained decision on a synthetic batch of `batch_rows` rows with advantages of plus and minus one (after a
+    warm-up update of `warmup_rows`, whose first CUDA calls are slow). Rank 0 reads the file and the rows are broadcast;
+    every rank takes part in the updates; rank 0 returns the numbers."""
+    rows: list[Decision] | None = None
+    if learner.comm.rank == 0:
+        rows = [
+            parse_row(json.loads(line), learner.cfg.max_len)
+            for line in rows_path.read_text().splitlines()
+            if line.strip()
+        ]
+    rows = learner.comm.broadcast(rows)
+    assert rows is not None
+    if len(rows) < max(agree_rows, batch_rows):
+        raise SystemExit(f"{rows_path} has {len(rows)} rows: the probe needs at least {max(agree_rows, batch_rows)}")
+    result: dict[str, Any] = {}
+    if learner.comm.rank == 0:
+        gaps = []
+        for row in rows[:agree_rows]:
+            logp, _ = learner.logps(row, grad=False)
+            gaps.append((logp.float().cpu() - torch.tensor(row.logprobs)).abs())
+        every = torch.cat(gaps)
+        result["agreement"] = {
+            "rows": agree_rows, "tokens": int(every.numel()), "mean_abs_gap": float(every.mean()),
+            "max_abs_gap": float(every.max()),
+        }  # fmt: skip
+    signed = [replace(r, advantage=1.0 if i % 2 == 0 else -1.0) for i, r in enumerate(rows)]
+    learner.update(signed[:warmup_rows])
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    started = time.time()
+    health = learner.update(signed[warmup_rows : warmup_rows + batch_rows] or signed[:batch_rows])
+    elapsed = time.time() - started
+    learner.comm.barrier()
+    result["timing"] = {
+        "decisions": health["trained"], "seconds": elapsed, "seconds_per_decision": elapsed / max(health["trained"], 1),
+        "world": learner.comm.world,
+    }  # fmt: skip
+    return result
+
+
+def bench(learner: Learner, rows_dir: Path, updates: int) -> dict[str, Any]:
+    """Time `updates` real updates, with the learner's flags, on recorded decision rows: every *.jsonl in `rows_dir`
+    (the inbox format), read in name order. The rows' versions are ignored (each batch is stamped with the learner's
+    current one, so none is stale: they are off-policy rows the TIS weight handles), and the rows are reused from the
+    start when `updates` batches outrun them. Nothing is published, checkpointed or logged (cfg.bench); rank 0 writes
+    ROOT/bench.json with each update's seconds, rows (the batch the update took) and seconds per row, and the mean
+    seconds per row without update 1 (the warm-up: its first CUDA calls are slow). With `probe_rows` the probe is cut
+    from the first rows as in a run, so its forward is part of what is timed. Returns the file's content."""
+    cfg, comm = learner.cfg, learner.comm
+    size = cfg.decisions_per_update
+    inbox: Inbox | None = None
+    source: list[Decision] = []
+    if comm.rank == 0:
+        inbox = Inbox(cfg)
+        for path in sorted(rows_dir.glob("*.jsonl")):
+            for line in path.read_text().splitlines():
+                try:
+                    row = parse_row(json.loads(line), cfg.max_len)
+                except ValueError:
+                    continue
+                if not row.aux and not inbox._reserve_for_probe(row):
+                    source.append(row)
+    available = comm.broadcast(len(source))
+    if available < size:
+        raise SystemExit(f"{rows_dir} has {available} usable rows: the bench needs at least one batch of {size}")
+    records: list[dict[str, Any]] = []
+    cursor = 0
+    for u in range(updates):
+        action: dict[str, Any] = {}
+        if inbox is not None:
+            inbox.pool = [
+                replace(r, version=learner.version)
+                for r in source[cursor % len(source) :] + source[: cursor % len(source)]
+            ]
+            batch = inbox.take(learner.version)
+            assert batch is not None
+            cursor += len(batch)
+            action = {"rows": batch, "probe": inbox.take_probe()}
+        action = comm.broadcast(action)
+        if action["probe"]:
+            learner.set_probe(action["probe"])
+        comm.barrier()
+        started = time.perf_counter()
+        health = learner.update(action["rows"])
+        comm.barrier()
+        seconds = time.perf_counter() - started
+        rows = len(action["rows"])
+        records.append({
+            "update": u + 1, "seconds": seconds, "rows": rows, "trained": health["trained"],
+            "seconds_per_row": seconds / rows, "kl_step_heldout": health["kl_step_heldout"],
+        })  # fmt: skip
+        log.info("bench update %d of %d: %.2fs for %d rows", u + 1, updates, seconds, rows)
+    warm = records[1:]
+    result = {
+        "updates": records,
+        "mean_seconds_per_row": statistics.fmean(r["seconds_per_row"] for r in warm) if warm else None,
+        "mean_seconds": statistics.fmean(r["seconds"] for r in warm) if warm else None,
+        "world": comm.world,
+        "flags": {
+            "full_prox": cfg.full_prox, "anchor_beta0": cfg.anchor_beta0, "kl_check_fraction": cfg.kl_check_fraction,
+            "probe_rows": cfg.probe_rows, "whole_groups": cfg.whole_groups,
+            "decisions_per_update": size, "minibatches": cfg.minibatches,
+        },
+    }  # fmt: skip
+    if comm.rank == 0:
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        write_file_atomically(cfg.bench_result, lambda p: p.write_text(json.dumps(result)))
+    comm.barrier()
+    return result
+
+
 def serve(
     learner: Learner,
     inbox: Inbox | None,
@@ -1421,7 +1829,7 @@ def serve(
                 if batch is not None:
                     action = {
                         "op": "update", "rows": batch, "intake": inbox.drain_counts(), "aux": inbox.take_aux(),
-                        "progress": inbox.progress(),
+                        "progress": inbox.progress(), "probe": inbox.take_probe(),
                     }  # fmt: skip
                 elif quiet >= 2 and inbox.epoch_done():
                     action = {
@@ -1449,6 +1857,8 @@ def serve(
         elif action["op"] == "update":
             if "progress" in action:
                 learner.sft_progress = (int(action["progress"][0]), int(action["progress"][1]))
+            if action.get("probe"):
+                learner.set_probe(action["probe"])
             health = learner.update(action["rows"], action["intake"], action["aux"])
             done += 1
             log.info(
@@ -1468,6 +1878,13 @@ def parse() -> argparse.Namespace:
     )
     p.add_argument("--init", default="", help="a PEFT adapter to start from (ignored when the root has checkpoints)")
     p.add_argument(
+        "--start-version",
+        type=int,
+        default=0,
+        help="the version number of the --init adapter, already published at ROOT/adapters/v{N} for the games to play "
+        "(the first update then publishes N + 1); 0: the init adapter has no version of its own",
+    )
+    p.add_argument(
         "--known-tools", default="", help="comma-separated tool names; any other name a policy emits is invented"
     )
     p.add_argument("--baseline", default="", help="the base model's tripwire baseline (JSON from baseline_from)")
@@ -1486,9 +1903,57 @@ def parse() -> argparse.Namespace:
     p.add_argument("--aux-alpha0", type=float, default=0.2, help="RL: weight of the CE on sft rows; 0 drops those rows")
     p.add_argument("--aux-decay", type=float, default=0.995, help="RL: alpha_t = alpha0 * decay ** update")
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument(
+        "--drift",
+        choices=("trip", "alarm"),
+        default="trip",
+        help="RL: drift outside the baseline's bands trips (rollback) or, with `alarm`, is only reported",
+    )
+    p.add_argument(
+        "--grad-norm",
+        choices=("trip", "alarm"),
+        default="trip",
+        help="RL: a gradient-norm spike trips (rollback) or, with `alarm`, is only reported",
+    )
+    p.add_argument("--warmup-updates", type=int, default=10, help="RL: updates over which the lr warms up linearly")
+    p.add_argument("--decisions-per-update", type=int, default=256, help="RL: rows an update trains on (at least)")
+    p.add_argument(
+        "--full-prox",
+        action="store_true",
+        help="RL: run the proximal pass on every row (the E2 behaviour); default: minibatch 1 reuses its own forward",
+    )
+    p.add_argument(
+        "--kl-check-fraction",
+        type=float,
+        default=1.0,
+        help="RL: the share of minibatch 2's rows the KL-after stop check runs on; 1 = all",
+    )
+    p.add_argument(
+        "--probe-rows",
+        type=int,
+        default=0,
+        help="RL: rows held out of training for kl_step_heldout, the KL between consecutive versions; 0 = off",
+    )
+    p.add_argument(
+        "--whole-groups",
+        action="store_true",
+        help="RL: batch whole start groups (the rows' `group`), freshest first, and keep each in one minibatch",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--poll", type=float, default=2.0)
+    p.add_argument(
+        "--stats-only", default="", help="the tripwire baseline: health records of these v0 rows, no training, exit"
+    )
+    p.add_argument(
+        "--probe", default="", help="the box-day gates: read these sampled rows, write ROOT/probe.json, exit"
+    )
+    p.add_argument(
+        "--bench",
+        default="",
+        help="time updates on the *.jsonl decision rows in this directory, write ROOT/bench.json, publish nothing",
+    )
+    p.add_argument("--bench-updates", type=int, default=5, help="bench: how many updates to run and time")
     return p.parse_args()
 
 
@@ -1505,6 +1970,12 @@ def main() -> None:
     known_tools = tuple(t for t in args.known_tools.split(",") if t)
     if not known_tools and not args.sft:
         sys.exit("--known-tools names no tools, which would disable the invented-tool tripwire")
+    if args.bench and args.sft:
+        sys.exit("--bench times RL updates: not with --sft")
+    if not 0 < args.kl_check_fraction <= 1:
+        sys.exit("--kl-check-fraction must be in (0, 1]")
+    if args.start_version < 0 or (args.start_version and not args.init):
+        sys.exit("--start-version is a version number of the --init adapter: not negative, and with --init")
     baseline = json.loads(Path(args.baseline).read_text()) if args.baseline else None
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     device = torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}" if torch.cuda.is_available() else "cpu")
@@ -1517,13 +1988,38 @@ def main() -> None:
         known_tools=known_tools, sft=args.sft, sft_epochs=args.sft_epochs,
         anchor=resolve_anchor(args.init, args.anchor),
         anchor_beta0=args.anchor_beta0, anchor_decay=args.anchor_decay, aux_alpha0=args.aux_alpha0,
-        aux_decay=args.aux_decay,
+        aux_decay=args.aux_decay, warmup_updates=args.warmup_updates, decisions_per_update=args.decisions_per_update,
+        full_prox=args.full_prox, kl_check_fraction=args.kl_check_fraction, probe_rows=args.probe_rows,
+        whole_groups=args.whole_groups, bench=bool(args.bench), start_version=args.start_version,
     )  # fmt: skip
     log.info("init: %s; anchor: %s", cfg.init or "none", cfg.anchor or "base model")
     model = build_model(cfg, device)
     comm.sync_params([p for p in model.parameters() if p.requires_grad])
     tokenizer = AutoTokenizer.from_pretrained(cfg.base)
-    learner = Learner(cfg, model, lambda ids: tokenizer.decode(ids, skip_special_tokens=False), comm, baseline=baseline)
+    learner = Learner(
+        cfg,
+        model,
+        lambda ids: tokenizer.decode(ids, skip_special_tokens=False),
+        comm,
+        baseline=baseline,
+        tripwires={"drift": args.drift, "grad_norm": args.grad_norm},
+    )
+    if args.stats_only:
+        log.info("stats-only: %s", stats_only(learner, Path(args.stats_only)))
+        comm.close()
+        return
+    if args.bench:
+        log.info("bench: %s", bench(learner, Path(args.bench), args.bench_updates))
+        comm.close()
+        return
+    if args.probe:
+        result = probe(learner, Path(args.probe))
+        if comm.rank == 0:
+            (cfg.root / "probe.json").write_text(json.dumps(result))
+            log.info("probe: %s", result)
+        comm.barrier()
+        comm.close()
+        return
     if learner.resume():
         log.info("resumed at version %d", learner.version)
     serve(learner, Inbox(cfg) if comm.rank == 0 else None, poll=args.poll)
