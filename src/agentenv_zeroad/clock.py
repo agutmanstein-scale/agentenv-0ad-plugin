@@ -34,7 +34,9 @@ metrics.
 
 `pace_s` (showcase streams only; training never sets it) adds a wall-time floor: steps are never closer than `pace_s`,
 and the schedule restarts from now after a hold, so a slow reply is never followed by a burst. It delays wall time
-only. `holding` names the seat the clock is blocked on while it waits.
+only. The brain timeout is enforced at settle, so a decision's span of game time (latency_ms / 200 ms turns of `pace_s`
+each) must stay under `brain_timeout_s`; otherwise a late reply would be applied paced and missed unpaced.
+`holding` names the seat the clock is blocked on while it waits.
 """
 
 from __future__ import annotations
@@ -270,6 +272,11 @@ class LockstepClock(GameClock):
         self.latency_ms = latency_ms
         self.tick_turns = tick_turns
         self.brain_timeout_s = brain_timeout_s
+        if pace_s is not None and (latency_ms // TURN_MS) * pace_s >= brain_timeout_s:
+            raise ValueError(
+                f"pace_s {pace_s} makes a decision's {latency_ms} ms span last at least brain_timeout_s "
+                f"({brain_timeout_s:g} s), so a reply could be applied paced that an unpaced run would miss"
+            )
         self.pace_s = pace_s
         self.paced_wait_s = 0.0
         self.holding: dict[str, Any] | None = None
@@ -314,6 +321,8 @@ class LockstepClock(GameClock):
                     if self._stopping or self._done():
                         break
                 await self._pace()
+                if self._stopping:
+                    break
                 await self.step_once()
         finally:
             self._stopping = False
