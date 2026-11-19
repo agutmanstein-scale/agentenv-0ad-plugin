@@ -12,7 +12,7 @@ source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
 CMD=${1:-}; shift || true
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 DEADLINE_FILE=${ZEROAD_DEADLINE_FILE:-$ETC/deadline}
-VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || echo http://172.17.0.1:8000)
+VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || true)  # showcase-bootstrap.sh writes it
 SHOW=$STATE/showcase
 USAGE="usage: showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] | status [LINES] | stop"
 case $CMD in
@@ -37,12 +37,23 @@ case $CMD in
     [ -n "${ZEROAD_BOX_USD_PER_HOUR:-}" ] || die "ZEROAD_BOX_USD_PER_HOUR is not set in $CONF: the box has no rate"
     [ "$(active zeroad-showcase)" != active ] || die "a session is running: showcase.sh status, or stop it first"
     if [ "$DRY_RUN" = 0 ]; then
+      [ -n "$VLLM" ] || die "no $ETC/vllm.url: the showcase bootstrap did not finish (live/bootstrap.sh ID --showcase)"
       docker image inspect zeroad-showcase >/dev/null 2>&1 || die "no zeroad-showcase image: live/bootstrap.sh ID --showcase first"
       curl -fsS "$VLLM/health" >/dev/null || die "vLLM is not up at $VLLM (docker logs zeroad-vllm)"
+    else
+      VLLM=${VLLM:-http://172.17.0.1:8000}
     fi
+    # vLLM forgets runtime-loaded adapters on a restart (a box stopped and started), so the policy is loaded again here.
+    load_adapter "$VLLM" local/policy-v1 /adapters/v1 "$ETC"
+    for unit in zeroad-x zeroad-relay; do
+      [ "$(active $unit)" = active ] || run systemctl start "$unit"
+    done
     # One frontier game's cap is planned with the box hours; the runner's own budget.sh check before every game refuses
     # each later game that would pass the budget.
     cap=${ZEROAD_MATCH_CAP_USD:-9}
+    if [ ! -f "$DEADLINE_FILE" ] && [ "$DRY_RUN" = 0 ]; then
+      die "no power-off deadline file $DEADLINE_FILE: the box was not launched with its power-off armed"
+    fi
     if [ -f "$DEADLINE_FILE" ]; then
       left=$(awk -v d="$(cat "$DEADLINE_FILE")" -v n="${ZEROAD_NOW_EPOCH:-$(date +%s)}" 'BEGIN { printf "%.2f", (d - n) / 3600 }')
       awk -v l="$left" -v h="$HOURS" 'BEGIN { exit !(l >= h + 1) }' \
@@ -52,6 +63,16 @@ case $CMD in
     hours_usd=$(awk -v h="$HOURS" -v r="$ZEROAD_BOX_USD_PER_HOUR" 'BEGIN { printf "%.2f", h * r }')
     say "showcase: $HOURS h of box at \$$ZEROAD_BOX_USD_PER_HOUR/h = \$$hours_usd, plus one frontier game's cap of \$$cap, against budget \$$BUDGET (each later game is checked by the runner)"
     stamp=$(date -u +%Y%m%d-%H%M%S)
+    # The container runs as uid 1000: a throwaway folder of the session's shape and the ledger must be writable to it.
+    prepare_ledger
+    probe=$SHOW/.preflight-$stamp
+    run mkdir -p "$SHOW"
+    run install -d -o 1000 -g 1000 -m 755 "$probe"
+    showcase_mounts "$probe"
+    run docker run --rm --entrypoint sh "${MOUNTS[@]}" zeroad-showcase -c \
+      'touch "$1/.w" && rm "$1/.w" && : >> "$2"' _ "$probe" "$LEDGER" \
+      || { rm -rf "$probe"; die "the showcase container (uid 1000) cannot write its session folder or open the spend ledger for append"; }
+    run rm -rf "$probe"
     args=(--budget "$BUDGET" --stamp "$stamp" --hours "$HOURS")
     [ -z "$MAX_GAMES" ] || args+=(--max-games "$MAX_GAMES")
     [ -z "$ROTATION" ] || args+=(--rotation "$ROTATION")
@@ -61,6 +82,7 @@ case $CMD in
     run systemd-run --unit zeroad-showcase --collect -p KillMode=mixed -p TimeoutStopSec=1800 \
       -p "After=network-online.target docker.service" -p "Wants=network-online.target docker.service" \
       -p "WorkingDirectory=$REPO" "$BOX_HOME/box/showcase-run.sh" "${args[@]}"
+    say "the box powers off when the session ends on its own; a stop by hand or a failed upload keeps it up"
     say "started session $stamp; follow it with live/showcase.sh ID status"
     ;;
   status)

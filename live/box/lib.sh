@@ -117,3 +117,43 @@ enable_boxtime_timer() {
   run systemctl daemon-reload
   run systemctl enable --now zeroad-boxtime.timer
 }
+
+# load_adapter URL NAME PATH ETC: loads the LoRA adapter at PATH (inside the vLLM container) as NAME unless /v1/models
+# lists it, then checks it is listed. The key is read from ETC/vllm.env into a 0600 header file, never printed. vLLM
+# forgets runtime-loaded adapters when it restarts, so a box stopped and started needs this again.
+load_adapter() {
+  local url=$1 name=$2 path=$3 etc=$4 headers key
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "+ POST $url/v1/load_lora_adapter {\"lora_name\": \"$name\", \"lora_path\": \"$path\"} (key from $etc/vllm.env, never printed), unless /v1/models lists it"
+    return 0
+  fi
+  key=$(sed -n 's/^VLLM_API_KEY=//p' "$etc/vllm.env")
+  [ -n "$key" ] || die "no VLLM_API_KEY in $etc/vllm.env"
+  headers=$(umask 077; mktemp)
+  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$key" > "$headers"
+  if ! curl -fsS -H "@$headers" "$url/v1/models" | grep -q "\"$name\""; then
+    curl -fsS -H "@$headers" -d "{\"lora_name\": \"$name\", \"lora_path\": \"$path\"}" "$url/v1/load_lora_adapter" >/dev/null \
+      || { rm -f "$headers"; die "vLLM would not load the adapter as $name"; }
+  fi
+  curl -fsS -H "@$headers" "$url/v1/models" | grep -q "\"$name\"" || { rm -f "$headers"; die "vLLM does not list $name after loading it"; }
+  rm -f "$headers"
+}
+
+# prepare_ledger: the showcase container runs as uid 1000 and appends to the spend ledger as one bind-mounted file, so
+# the file (made if missing) gets group 1000 and mode 664. Re-applied at every start: `budget.sh reset` recreates it
+# root-owned.
+prepare_ledger() {
+  run mkdir -p "$STATE"
+  run touch "$LEDGER"
+  run chgrp 1000 "$LEDGER"
+  run chmod 664 "$LEDGER"
+}
+
+# showcase_mounts SESSION: sets MOUNTS, the showcase container's mounts: the state folder read-only (sibling sessions,
+# the ledger and boxtime.json are read from it), SESSION and the ledger file read-write, nothing else writable. The
+# deadline file is a --mount so that docker fails, rather than creating a directory, when it is missing.
+showcase_mounts() {
+  MOUNTS=(-v "$BOX_HOME:$BOX_HOME:ro" -v "$STATE:$STATE:ro" -v "$1:$1" -v "$LEDGER:$LEDGER"
+    --mount "type=bind,source=$DEADLINE_FILE,target=$DEADLINE_FILE,readonly"
+    -v "$REPO/live:/work/live:ro" -v /tmp/.X11-unix:/tmp/.X11-unix)
+}

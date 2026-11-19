@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# budget.sh check --planned-usd USD --planned-hours H --budget USD | show [--budget USD] | tick | reset
+# budget.sh check [--no-record] --planned-usd USD --planned-hours H --budget USD | show [--budget USD] | tick | reset
+# check --no-record does not write boxtime.json (a runner that is not root and cannot; the minute timer keeps it current).
 # The stream's budget guard. Model spend is the box ledger's (spend.jsonl, agentenv_zeroad.spend's format: one
 # {"what", "usd_est"} per match); box spend is the box's running hours at ZEROAD_BOX_USD_PER_HOUR, over every boot,
 # not just this one: `tick` (the zeroad-boxtime timer, every minute) records this boot's start and its latest minute
@@ -15,29 +16,31 @@
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
 CMD=${1:-}; shift || true
-PLANNED_USD=0 PLANNED_HOURS=0 BUDGET=
+PLANNED_USD=0 PLANNED_HOURS=0 BUDGET= NO_RECORD=0
 while [ $# -gt 0 ]; do
   case $1 in
     --planned-usd) PLANNED_USD=${2:?}; shift 2 ;;
     --planned-hours) PLANNED_HOURS=${2:?}; shift 2 ;;
     --budget) BUDGET=${2:?}; shift 2 ;;
+    --no-record) NO_RECORD=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 case $CMD in check|show|tick|reset) ;; *) echo "usage: budget.sh check|show [--planned-usd USD --planned-hours H] --budget USD | tick | reset" >&2; exit 2 ;; esac
 [ "$CMD" != check ] || [ -n "$BUDGET" ] || die "budget.sh check needs --budget (LIVE_BUDGET_USD)"
+[ "$NO_RECORD" = 0 ] || [ "$CMD" = check ] || die "--no-record is for check only"
 [ -n "${ZEROAD_BOX_USD_PER_HOUR:-}" ] || die "ZEROAD_BOX_USD_PER_HOUR is not set: the box's rate comes from its /etc/zeroad-live.conf (LIVE_BOX_USD_PER_HOUR); there is no default"
 NOW=${ZEROAD_NOW_EPOCH:-$(date +%s)}
 if [ -n "${ZEROAD_BOOT_EPOCH:-}" ]; then BOOT=$ZEROAD_BOOT_EPOCH
 elif [ "$DRY_RUN" = 1 ]; then BOOT=$NOW; echo "(dry run: as on a box booted now)"
 else BOOT=$(awk '/^btime/ {print $2}' /proc/stat); fi
 if [ "$CMD" = tick ] && [ "$DRY_RUN" = 1 ]; then say "+ record boot $BOOT up to $NOW in $STATE/boxtime.json"; exit 0; fi
-[ "$DRY_RUN" = 1 ] || mkdir -p "$STATE"
+[ "$DRY_RUN" = 1 ] || [ -d "$STATE" ] || mkdir -p "$STATE"
 python3 - "$CMD" "$LEDGER" "$PLANNED_USD" "$PLANNED_HOURS" "${BUDGET:-}" "$ZEROAD_BOX_USD_PER_HOUR" "$BOOT" "$NOW" \
-  "$STATE/boxtime.json" "$DRY_RUN" "${ZEROAD_RESET_SETTLE_S:-3}" <<'PY'
+  "$STATE/boxtime.json" "$DRY_RUN" "${ZEROAD_RESET_SETTLE_S:-3}" "$NO_RECORD" <<'PY'
 import json, math, os, pathlib, sys, time
 
-cmd, ledger, planned_usd, planned_h, budget, rate, boot, now, boxtime, dry_run, settle = sys.argv[1:]
+cmd, ledger, planned_usd, planned_h, budget, rate, boot, now, boxtime, dry_run, settle, no_record = sys.argv[1:]
 try:
     planned_usd, planned_h, rate = float(planned_usd), float(planned_h), float(rate)
     budget = float(budget) if budget else None
@@ -92,7 +95,7 @@ def describe(boots, n, model, box_h, ahead_usd=0.0):
 
 boots = json.loads(bt_path.read_text()) if bt_path.exists() else {}
 boots[str(boot)] = [boot, max(now, boots.get(str(boot), [boot, boot])[1])]
-if dry_run != "1":
+if dry_run != "1" and no_record != "1":
     write_boxtime(boots)
 if cmd == "tick":
     sys.exit(0)

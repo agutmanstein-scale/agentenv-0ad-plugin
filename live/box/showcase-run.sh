@@ -5,7 +5,7 @@
 # the GPU, the X socket and the box's relay, as docker-shim.sh gives them to the env container (host networking, so the
 # relay and vLLM are on the loopback). The LiteLLM key comes from SSM through with-model.sh and vLLM's from its root-only
 # file; both reach the container's environment, never a command line. The session's folder is
-# $STATE/showcase/showcase-STAMP (STAMP is the session's start time in UTC, also written to its `stamp` file).
+# $STATE/showcase/STAMP, owned by uid 1000 and never reused (STAMP is the session's start time in UTC, also written to its `stamp` file).
 # When the run ends, however it ends, the folder and the relay's segments written at or after STAMP are copied to
 # s3://BUCKET/PREFIX/run/showcase-STAMP/ (segments under video/) with the box's instance profile. Then, unless
 # --no-shutdown, a stop by hand (SIGTERM: the container is stopped, which records the game in play as no result and
@@ -35,7 +35,13 @@ PREFIX=${ZEROAD_S3_PREFIX:-zeroad-train}
 SESSION=$STATE/showcase/$STAMP
 DEST=s3://${BUCKET:-<bucket>}/$PREFIX/run/showcase-$STAMP/
 NAME=zeroad-showcase
-VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || echo http://127.0.0.1:8000)  # showcase-bootstrap.sh writes it
+VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || true)  # showcase-bootstrap.sh writes it
+if [ "$DRY_RUN" = 0 ]; then
+  [ -n "$VLLM" ] || die "no $ETC/vllm.url: the showcase bootstrap did not finish"
+  [ -f "$DEADLINE_FILE" ] || die "no power-off deadline file $DEADLINE_FILE"
+else
+  VLLM=${VLLM:-http://172.17.0.1:8000}
+fi
 export PATH="$PATH:/usr/local/bin"
 
 # hide: whatever aws prints goes through this, so the bucket's name never reaches the output.
@@ -66,18 +72,20 @@ upload() {
 
 say "showcase session $STAMP: ${PASS[*]-} (budget \$$BUDGET), folder $SESSION"
 [ "$DRY_RUN" = 1 ] || [ ! -e "$SESSION" ] || die "the session folder $SESSION exists: a session folder is never reused"
-run mkdir -p "$SESSION"
+run mkdir -p "$STATE/showcase"
+run install -d -o 1000 -g 1000 -m 755 "$SESSION"  # the container runs as uid 1000
+prepare_ledger
+showcase_mounts "$SESSION"
 [ "$DRY_RUN" = 1 ] || printf '%s\n' "$STAMP" > "$SESSION/stamp"
 run docker rm -f "$NAME" >/dev/null 2>&1 || true
 # The keys: LITELLM_API_KEY is in the environment from with-model.sh, VLLM_API_KEY comes from the root-only env file.
 container=(docker run --rm --init --name "$NAME" --network host --gpus all
-  -e NVIDIA_DRIVER_CAPABILITIES=all -v /tmp/.X11-unix:/tmp/.X11-unix --shm-size 2g
+  -e NVIDIA_DRIVER_CAPABILITIES=all --shm-size 2g
   -e DISPLAY=:0 -e ZEROAD_DISPLAY=:0 -e ZEROAD_ENCODER=nvenc -e ZEROAD_GRAPHICS=high -e "ZEROAD_RTMP_URL=$RELAY"
   --env-file "$ETC/vllm.env" -e "ZEROAD_VLLM_URL=$VLLM" -e LITELLM_BASE_URL -e LITELLM_API_KEY
   -e "LIVE_BUDGET_USD=$BUDGET" -e "ZEROAD_BOX_USD_PER_HOUR=$ZEROAD_BOX_USD_PER_HOUR"
   -e "ZEROAD_SPEND_LEDGER=$LEDGER" -e "ZEROAD_LIVE_HOME=$BOX_HOME" -e "ZEROAD_LIVE_STATE=$STATE" -e "ZEROAD_DEADLINE_FILE=$DEADLINE_FILE"
-  -v "$BOX_HOME:$BOX_HOME:ro" -v "$STATE:$STATE" -v "$DEADLINE_FILE:$DEADLINE_FILE:ro"
-  -v "$REPO/live:/work/live:ro" -w /work
+  "${MOUNTS[@]}" -w /work
   --entrypoint python zeroad-showcase
   -m agentenv_zeroad.showcase run --out "$SESSION" --config live/showcase/showcase.toml "${PASS[@]+"${PASS[@]}"}")
 cmd=("$BOX_HOME/box/with-model.sh" "${container[@]}")
@@ -90,12 +98,21 @@ else
   # makes the session record the game in play as no result and save session.json, and the upload below still runs.
   ( "${cmd[@]}" 2>&1 | redact | tee -a "$SESSION/run.log" ) &
   pid=$!
-  trap 'STOPPED=1; say "showcase: stop requested, stopping the container"; docker stop -t 600 "$NAME" >/dev/null 2>&1 || true' TERM INT
+  # A stop that lands before `docker run` made the container is retried until the container stops or the run is over.
+  alive() { local st; st=$(ps -o stat= -p "$1" 2>/dev/null) || return 1; [ -n "$st" ] && [[ $st != Z* ]]; }
+  stop_container() {
+    STOPPED=1; say "showcase: stop requested, stopping the container"
+    while alive "$pid"; do
+      docker stop -t 600 "$NAME" >/dev/null 2>&1 && break
+      sleep 1
+    done
+  }
+  trap stop_container TERM INT
   while :; do
     if wait "$pid"; then rc=0; else rc=$?; fi  # a trapped signal interrupts wait while the run still goes on
     kill -0 "$pid" 2>/dev/null || break
   done
-  trap - TERM INT
+  trap 'STOPPED=1' TERM INT  # a stop during the upload does not interrupt it
 fi
 say "showcase session $STAMP ended (exit $rc); uploading to $DEST" | hide
 up=0

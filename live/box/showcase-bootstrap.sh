@@ -170,13 +170,7 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   wait_vllm_up "$BRIDGE" 8000
   set -a; source "$ETC/vllm.env"; set +a
-  headers=$(umask 077; mktemp)
-  trap 'rm -f "$headers"' EXIT
-  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' "$VLLM_API_KEY" > "$headers"
-  if ! curl -fsS -H "@$headers" "http://$BRIDGE:8000/v1/models" | grep -q "\"$POLICY\""; then
-    curl -fsS -H "@$headers" -d "{\"lora_name\": \"$POLICY\", \"lora_path\": \"/adapters/v1\"}" \
-      "http://$BRIDGE:8000/v1/load_lora_adapter" >/dev/null || die "vLLM would not load the adapter as $POLICY"
-  fi
+  load_adapter "http://$BRIDGE:8000" "$POLICY" /adapters/v1 "$ETC"
   uv run --project "$REPO" --frozen --no-dev python -m agentenv_zeroad.pilot.smoke \
     --url "http://$BRIDGE:8000" --model "$POLICY"
 fi

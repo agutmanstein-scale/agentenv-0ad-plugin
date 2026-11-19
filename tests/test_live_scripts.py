@@ -2917,12 +2917,26 @@ def test_showcase_start_refuses_short_poweroff(stubs):
     assert ok.returncode == 0 and "systemd-run --unit zeroad-showcase" in ok.stderr
 
 
-def showcase_box(stubs, *args: str, sleeps=False, rules=(), **extra):
+def uid1000_stubs(stubs):
+    """install and chgrp as a non-root test user cannot run them: install -d makes the folder, both log their calls."""
+    log = stubs["tmp"] / "perm.log"
+    write_exe(
+        stubs["bin"] / "install",
+        f'#!/bin/sh\necho "install $*" >> {log}\nfor last; do :; done\nmkdir -p "$last"\n',
+    )
+    write_exe(stubs["bin"] / "chgrp", f'#!/bin/sh\necho "chgrp $*" >> {log}\n')
+    return log
+
+
+def showcase_box(stubs, *args: str, sleeps=False, stop_fails=0, rules=(), **extra):
     """Run box/showcase-run.sh for real against stubs: docker, shutdown and aws (which holds the key rule)."""
     tmp = stubs["tmp"]
     etc = tmp / "etc"
     etc.mkdir(exist_ok=True)
     (etc / "vllm.env").write_text("VLLM_API_KEY=vllm-secret-value\n")
+    (etc / "vllm.url").write_text("http://172.20.0.1:8000\n")
+    (etc / "deadline").write_text("1900000000\n")
+    uid1000_stubs(stubs)
     seg = tmp / "state" / "rec" / "zeroad"
     seg.mkdir(parents=True, exist_ok=True)
     for name in ("2026-11-19_11-59-59-000001.mp4", "2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"):
@@ -2932,7 +2946,8 @@ def showcase_box(stubs, *args: str, sleeps=False, rules=(), **extra):
         stubs["bin"] / "docker",
         f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
         f'case $1 in run) echo "key=$LITELLM_API_KEY" >> {tmp}/docker.env; {wait}exit 0 ;; '
-        f"stop) touch {tmp}/stopped ;; esac\n",
+        f"stop) n=$(cat {tmp}/stops 2>/dev/null || echo 0); echo $((n + 1)) > {tmp}/stops; "
+        f"[ $n -ge {stop_fails} ] && touch {tmp}/stopped || exit 1 ;; esac\n",
     )
     write_exe(
         stubs["bin"] / "shutdown",
@@ -2971,7 +2986,17 @@ def test_showcase_run_uploads_before_shutdown(stubs):
     assert LOOPBACK_RELAY in docker and "--gpus all" in docker and "DISPLAY=:0" in docker
     state = stubs["tmp"] / "state"
     assert f"-e ZEROAD_SPEND_LEDGER={state}/spend.jsonl" in docker  # the runner books each game in the box's ledger
-    assert f"-v {state}:{state} " in docker  # the folder holding it is mounted read-write (no :ro)
+    ledger = f"{state}/spend.jsonl"
+    # the container (uid 1000) writes only its session folder and the one ledger file: the state folder is read-only
+    assert (
+        f"-v {state}:{state}:ro " in docker
+        and f"-v {session}:{session} " in docker
+        and f"-v {ledger}:{ledger} " in docker
+    )
+    assert f"-v {state}:{state} " not in docker and "source=/" in docker and ",readonly" in docker
+    perm = (stubs["tmp"] / "perm.log").read_text().splitlines()
+    assert f"install -d -o 1000 -g 1000 -m 755 {session}" in perm and f"chgrp 1000 {ledger}" in perm
+    assert oct((state / "spend.jsonl").stat().st_mode & 0o777) == "0o664"
     assert SECRET not in docker and "vllm-secret-value" not in docker  # the keys travel in the environment only
     assert f"key={SECRET}" in (stubs["tmp"] / "docker.env").read_text()  # with-model.sh gave the child the key
     assert "bucket-1" not in out.stdout + out.stderr
@@ -3002,13 +3027,26 @@ def test_showcase_run_no_shutdown_when_upload_fails(stubs, how):
         assert "not shutting down" in out.stderr + out.stdout
 
 
-def test_showcase_run_stopped_by_hand_uploads_and_leaves_the_box_up(stubs):
+@pytest.mark.parametrize(
+    "stop_fails", [0, 2]
+)  # 2: the stop lands before the container exists, so docker stop fails twice
+def test_showcase_run_stopped_by_hand_uploads_and_leaves_the_box_up(stubs, stop_fails):
     import threading
 
     result = {}
     thread = threading.Thread(
         target=lambda: result.update(
-            out=showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--hours", "7.77", sleeps=True)
+            out=showcase_box(
+                stubs,
+                "--budget",
+                "60",
+                "--stamp",
+                "20261119-120000",
+                "--hours",
+                "7.77",
+                sleeps=True,
+                stop_fails=stop_fails,
+            )
         )
     )
     thread.start()  # the stub docker waits for `docker stop`; the unit's stop is SIGTERM to the script
@@ -3077,3 +3115,140 @@ def test_showcase_never_pushes(stubs):
     out = showcase(stubs, "start", "--hours", "1")
     assert "push" not in out.stderr.lower()
     assert set(re.findall(r"rtmps?://[^\s\"']+", out.stderr)) <= {LOOPBACK_RELAY}
+
+
+def showcase_start_box(box_stubs, *args: str, preflight_ok=True, adapter_loaded=False, **extra):
+    """Run box/showcase.sh start for real against stubs (systemctl, docker, curl, budget.sh's clock)."""
+    tmp = box_stubs["tmp"]
+    etc = tmp / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.env").write_text("VLLM_API_KEY=vllm-secret-value\n")
+    (etc / "vllm.url").write_text("http://172.20.0.1:8000\n")
+    (etc / "deadline").write_text(str(1_800_000_000 + 20 * 3600))
+    uid1000_stubs(box_stubs)
+    if adapter_loaded:
+        (tmp / "loaded").touch()
+    write_exe(
+        box_stubs["bin"] / "curl",
+        f'#!/bin/sh\necho "curl $*" >> {tmp}/curl.log\n'
+        f'case "$*" in *v1/models*) if [ -e {tmp}/loaded ]; then echo \'{{"data":[{{"id":"local/policy-v1"}}]}}\'; '
+        f"else echo '{{\"data\":[]}}'; fi ;; *load_lora_adapter*) touch {tmp}/loaded ;; esac\n",
+    )
+    write_exe(
+        box_stubs["bin"] / "docker",
+        f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
+        f'case "$*" in *"--entrypoint sh"*) exit {0 if preflight_ok else 1} ;; esac\n',
+    )
+    return run_box(
+        box_stubs,
+        "showcase.sh",
+        "start",
+        "--budget",
+        "60",
+        *args,
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_NOW_EPOCH="1800000000",
+        ZEROAD_BOOT_EPOCH="1799990000",
+        **extra,
+    )
+
+
+def test_showcase_start_loads_the_adapter_starts_the_stream_units_and_probes_the_container(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2")
+    assert out.returncode == 0, out.stderr + out.stdout
+    curl = (box_stubs["tmp"] / "curl.log").read_text()
+    assert curl.count("load_lora_adapter") == 1 and '"lora_name": "local/policy-v1"' in curl  # a restart lost it
+    assert "vllm-secret-value" not in curl
+    calls = systemctl_calls(box_stubs)
+    assert (
+        calls.index("start zeroad-x")
+        < calls.index("start zeroad-relay")
+        < next(i for i, c in enumerate(calls) if c.startswith("systemd-run"))
+    )
+    docker = (box_stubs["tmp"] / "docker.log").read_text()
+    state = box_stubs["tmp"] / "state"
+    assert "--entrypoint sh" in docker and ': >> "$2"' in docker and f"-v {state}:{state}:ro" in docker
+    perm = (box_stubs["tmp"] / "perm.log").read_text()
+    assert "chgrp 1000" in perm and "install -d -o 1000 -g 1000 -m 755" in perm
+    assert "powers off when the session ends on its own" in out.stdout
+    assert not list((state / "showcase").glob(".preflight-*"))  # the probe folder is gone
+
+
+def test_showcase_start_leaves_a_loaded_adapter_alone(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2", adapter_loaded=True)
+    assert out.returncode == 0, out.stderr
+    assert "load_lora_adapter" not in (box_stubs["tmp"] / "curl.log").read_text()
+
+
+def test_showcase_start_dies_when_the_container_cannot_write(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2", preflight_ok=False)
+    assert out.returncode != 0 and "cannot write its session folder or open the spend ledger" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_showcase_start_needs_vllm_url_and_the_deadline_file(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2")
+    assert out.returncode == 0
+    etc = box_stubs["tmp"] / "etc"
+    (etc / "deadline").unlink()
+    out = run_box(
+        box_stubs,
+        "showcase.sh",
+        "start",
+        "--budget",
+        "60",
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_BOOT_EPOCH="1799990000",
+    )
+    assert out.returncode != 0 and "no power-off deadline file" in out.stderr
+    (etc / "deadline").write_text("1900000000\n")
+    (etc / "vllm.url").unlink()
+    out = run_box(box_stubs, "showcase.sh", "start", "--budget", "60", ZEROAD_PILOT_ETC=str(etc))
+    assert out.returncode != 0 and "no " in out.stderr and "vllm.url" in out.stderr
+
+
+def test_budget_check_no_record_leaves_boxtime_alone_and_still_refuses(box_stubs):
+    now = 1_800_000_000
+    clock = {"ZEROAD_NOW_EPOCH": str(now), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    assert run_box(box_stubs, "budget.sh", "tick", **clock).returncode == 0
+    boxtime = box_stubs["tmp"] / "state" / "boxtime.json"
+    before = boxtime.read_bytes()
+    later = {"ZEROAD_NOW_EPOCH": str(now + 600), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    ok = run_box(box_stubs, "budget.sh", "check", "--no-record", "--budget", "50", **later)
+    assert ok.returncode == 0 and boxtime.read_bytes() == before
+    refused = run_box(box_stubs, "budget.sh", "check", "--no-record", "--planned-usd", "99", "--budget", "50", **later)
+    assert refused.returncode == 1 and "REFUSED" in refused.stdout and boxtime.read_bytes() == before
+    assert run_box(box_stubs, "budget.sh", "check", "--budget", "50", **later).returncode == 0
+    assert boxtime.read_bytes() != before  # without the flag it still records
+    assert run_box(box_stubs, "budget.sh", "show", "--no-record", **later).returncode != 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores a read-only folder")
+def test_budget_check_no_record_runs_against_a_read_only_state_folder(box_stubs):
+    now = 1_800_000_000
+    clock = {"ZEROAD_NOW_EPOCH": str(now), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    assert run_box(box_stubs, "budget.sh", "tick", **clock).returncode == 0
+    state = box_stubs["tmp"] / "state"
+    (state / "spend.jsonl").write_text('{"what": "g", "usd_est": 4}\n')
+    state.chmod(0o555)
+    try:
+        out = run_box(box_stubs, "budget.sh", "check", "--no-record", "--planned-usd", "9", "--budget", "50", **clock)
+        assert out.returncode == 0, out.stderr
+        assert "model $4.00" in out.stdout
+    finally:
+        state.chmod(0o755)
+
+
+def test_showcase_fetch_takes_a_stamp_and_says_so_when_there_is_no_session(stubs):
+    fetched = stubs["tmp"] / "fetched"
+    fetched.mkdir()
+    rules = [["sts get-caller-identity", "123456789012\n", 0], ["s3 ls", "", 0]]
+    extra = {"STUB_AWS_RULES": json.dumps(rules), "LIVE_FETCHED_DIR": str(fetched)}
+    out = showcase(stubs, "fetch", "--yes", forbid_aws=False, **extra)
+    assert out.returncode != 0 and "no showcase session on S3 yet" in out.stderr and "bucket-1" not in out.stderr
+    out = showcase(stubs, "fetch", "20261119-120000", "--yes", forbid_aws=False, **extra)
+    assert out.returncode == 0, out.stderr
+    assert len([c for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "ls"]]) == 1  # only the first fetch listed
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    assert "the box powers off when the session ends on its own" in showcase(stubs, "start", "--hours", "1").stderr
