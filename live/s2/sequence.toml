@@ -13,9 +13,10 @@ root = "/var/lib/zeroad-live/train/s2"
 uri = "s3://BUCKET/zeroad-train/run/s2"   # the sequence's own files: gates.json, logs, s2-report.json, labels, SFT epochs
 
 [sequence]                 # a person's calls on this run, read again on every --resume (docs/s2-box-day.md)
-accept_failed = ["e2", "e3"]   # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
+accept_failed = ["e2", "e3", "e4"]   # 17 Nov: E2d's recorded failure (docs/s2-e2-results.md) is accepted: E2 is not run again
                                # 18 Nov: E3's in-run slope gate missed narrowly; its paired held-out gate passed (73.3% vs 54.2%, p 2e-5): accepted
-stop_after = "e4"          # 18 Nov: the long-game check, then E4 in the same session; a failed check stops it before E4
+                               # 18 Nov: E4 (30-minute games from base, 12 updates) did not beat base, 21 vs 25 wins of 100: accepted, Run 1 follows
+stop_after = "run1"        # 18 Nov: train to win: init, then Run 1
 
 [e1]                       # GPU gates
 config = "e1.toml"
@@ -138,10 +139,19 @@ min_entropy_ratio = 0.7
 min_games = 20
 max_p = 0.05               # Run 1 starts from the chosen epoch only if it beats v0 at this one-sided level
 
-[run1]
+[run1]                     # 18 Nov: train to win: RL on the documented objective from the init step's model, paired end panels (run1.toml)
 config = "run1.toml"
-cap_hours = 11.0           # run1.toml's duration_hours (10) + its drain and final upload
-expected_hours = 10.3
-planned_usd = 70.0         # frontier spend: the end panels (20 games at about $2.5-3.5) with margin
-heldout_panel = "end-heldout"
-frontier_panel = "end-frontier"
+cap_hours = 13.5           # run1.toml's duration_hours (12.3) + the final upload
+expected_hours = 12.5      # 8 h of training, then 768 panel games of 30 minutes (about 3.9 h at about 200 an hour)
+lr = 3e-5                  # as E4
+drift = "alarm"            # as E4
+grad_norm = "alarm"        # as E4
+baseline_config = ""       # Run 1 uses the tripwire baseline.json made from the 30-minute baseline games (the tripwire step)
+min_updates = 5
+max_p = 0.05               # the paired R test (end-final vs end-base, Wilcoxon signed-rank, one-sided)
+anchor_beta0 = 0.0         # no pull back to the anchor
+warmup_updates = 2
+decisions_per_update = 512  # must equal run1.toml's [credit] decisions_per_update
+kl_check_fraction = 0.25
+probe_rows = 64
+whole_groups = true        # the learner batches whole same-start groups

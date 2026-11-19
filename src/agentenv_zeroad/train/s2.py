@@ -103,6 +103,8 @@ E4_END_PANELS = (
     "end-start",
     "end-final",
 )  # e4.toml's end panels: the start adapter, then the adapter current at the end
+RUN1_END_PANELS = ("end-base", "end-final")  # run1.toml's end panels: v0, then the adapter current at the end
+RUN1_INIT_VERSION = 1  # the SFT adapter, when Run 1 starts from it, is published as this version in Run 1's root
 E4_INIT_VERSION = 1  # E3's adapter is published as this version in the root of E4's check and of E4
 E4_MIN_CAP_GAMES = 30  # the margin scale is measured on at least this many of v0's cap-ended games
 E4_SCALE_RANGE = (2000.0, 20000.0)  # and clamped to this
@@ -218,11 +220,20 @@ SCHEMA: dict[str, dict[str, Any]] = {
     },
     "run1": {
         "config": "run1.toml",
-        "cap_hours": 11.0,
-        "expected_hours": 10.3,
-        "heldout_panel": "end-heldout",
-        "frontier_panel": "end-frontier",
-        "planned_usd": 30.0,
+        "cap_hours": 13.5,
+        "expected_hours": 12.5,
+        "lr": 3e-5,
+        "drift": "alarm",
+        "grad_norm": "alarm",
+        "baseline_config": "",  # "": the tripwire step's baseline.json, made from the 30-minute baseline games
+        "min_updates": 5,
+        "max_p": 0.05,  # the paired R test's one-sided Wilcoxon p
+        "anchor_beta0": 0.0,
+        "warmup_updates": 2,
+        "decisions_per_update": 512,  # the learner's batch; run1.toml's [credit] decisions_per_update must match
+        "kl_check_fraction": 0.25,
+        "probe_rows": 64,
+        "whole_groups": True,
     },
 }
 DEFAULT_ROOT = "/var/lib/zeroad-live/train/s2"
@@ -326,7 +337,7 @@ def load_settings(path: Path) -> Settings:
         tables[step] = {**defaults, **given}
         if float(tables[step]["cap_hours"]) <= 0:
             raise ValueError(f"[{step}] cap_hours must be positive")
-    for table in ("e2", "e3", "e4"):
+    for table in ("e2", "e3", "e4", "run1"):
         for switch in ("drift", "grad_norm"):
             if tables[table][switch] not in ("trip", "alarm"):
                 raise ValueError(f"[{table}] {switch} must be 'trip' or 'alarm', not {tables[table][switch]!r}")
@@ -429,6 +440,7 @@ def check_dir(path: Path, budget: float | None = None, resume_from: Path | None 
         raise ValueError("e2: [credit] positive_control must be true")
     _check_e3(configs, settings)
     _check_e4(configs, settings)
+    _check_run1(configs, settings)
     sp = settings["sft_panels"]
     if not 0 < int(sp["panel_games"]) < int(sp["heldout_games"]):
         raise ValueError(
@@ -534,10 +546,48 @@ def _check_e4(configs: ConfigDir, settings: Settings) -> None:
         raise ValueError("e3, e4 and e4_check need roots of their own")
 
 
+def _check_run1(configs: ConfigDir, settings: Settings) -> None:
+    """What Run 1 relies on: its two end panels exist, pair with each other and with the baselines' held-out panel on
+    identical starts, no end panel starts before train_hours, and it trains on the outcome with same-start credit in
+    batches the learner's size and a decisions range that is a pair."""
+    run1, base = configs.load("run1"), configs.load("baselines")
+    missing = set(RUN1_END_PANELS) - {p.name for p in run1.panels}
+    if missing:
+        raise ValueError(f"{run1.run_id}: no panel named {', '.join(sorted(missing))}")
+    heldout = str(settings["baselines"]["heldout_panel"])
+    for cfg, name in ((run1, RUN1_END_PANELS[1]), (base, heldout)):
+        if not _same_starts(run1, RUN1_END_PANELS[0], name, cfg):
+            raise ValueError(f"run1's {RUN1_END_PANELS[0]} and {cfg.run_id}'s {name} do not play identical starts")
+    panel = {p.name: p for p in run1.panels}
+    if run1.init_version not in (0, RUN1_INIT_VERSION):
+        raise ValueError(f"run1: init_version is 0 (the base model) or {RUN1_INIT_VERSION} (the SFT adapter)")
+    if panel[RUN1_END_PANELS[0]].version != 0 or panel[RUN1_END_PANELS[1]].version is not None:
+        raise ValueError("run1: end-base plays v0, the base model, and end-final the final adapter")
+    if run1.train_hours is None or any(panel[n].at_hours < run1.train_hours for n in RUN1_END_PANELS):
+        raise ValueError("run1: train_hours must be set and no end panel may start before it")
+    credit = run1.credit
+    if credit.get("positive_control") or credit.get("baseline") != "start_loo":
+        raise ValueError("run1: [credit] must train on the outcome (no positive_control) with baseline = start_loo")
+    if int(credit.get("group_size", 1)) != run1.games.seed_group:
+        raise ValueError("run1: [credit] group_size must be games.seed_group")
+    if int(credit.get("decisions_per_update", 256)) != int(settings["run1"]["decisions_per_update"]):
+        raise ValueError(
+            "run1: [credit] decisions_per_update must match [run1] decisions_per_update, the learner's batch"
+        )
+    decisions = credit.get("decisions", (8, 12))
+    if len(decisions) != 2 or not 1 <= int(decisions[0]) <= int(decisions[1]):
+        raise ValueError("run1: [credit] decisions is a pair lo, hi with 1 <= lo <= hi")
+    if "margin_scale" not in credit:
+        raise ValueError(
+            "run1: [credit] needs a margin_scale line for the step to replace with the check's measured one"
+        )
+    if not run1.stop_when_done:
+        raise ValueError("run1: stop_when_done must be set, so the run ends when the end panels are played")
+
+
 def _check_panel_names(configs: ConfigDir, settings: Settings) -> None:
     wanted = {
         "baselines": ("heldout_panel", "v1_panel", "frontier_panel", "calibration_panel"),
-        "run1": ("heldout_panel", "frontier_panel"),
         "e2": ("control_panel",),
     }
     for step, keys in wanted.items():
@@ -1063,6 +1113,10 @@ def panel_report(games: Sequence[G.PanelGame]) -> dict[str, dict[str, Any]]:
                 sum(g.ended_by == "conquest" and g.outcome == "lost" for g in found), len(found)
             ),
             "ahead_at_cap_share": share(sum(g.margin > 0 for g in cap), len(found)),
+            "won_share": share(
+                sum(g.ended_by == "conquest" and g.outcome == "won" for g in found) + sum(g.margin > 0 for g in cap),
+                len(found),
+            ),
             "median_cap_margin": statistics.median(g.margin for g in cap) if cap else None,
             "median_wall_s": statistics.median(walls) if walls else None,
         }
@@ -1497,19 +1551,90 @@ def step_init(ctx: Ctx) -> Outcome:
 
 
 # ---- Run 1 and the end ---------------------------------------------------------------------------
+def milestone_table(games: Sequence[G.PanelGame]) -> list[dict[str, Any]]:
+    """The milestones of `stats.DEFAULT_MILESTONES` on one panel's games, as a won share (a conquest won, or ahead on
+    net worth at the cap) and its one-sided 97.5% Wilson lower bound against the threshold; `lower_bonferroni` is the
+    bound at the level shared out across the milestones, as `stats.milestones` uses."""
+    z, z_bonferroni = (stats.NORMAL.inv_cdf(1 - a) for a in (0.025, stats.ALPHA / len(stats.DEFAULT_MILESTONES)))
+    out = []
+    for m in stats.DEFAULT_MILESTONES:
+        mine = [g for g in games if g.opponent == m.opponent]
+        wins = sum(
+            (g.ended_by == "conquest" and g.outcome == "won") or (g.ended_by in rs.CAP_ENDS and g.margin > 0)
+            for g in mine
+        )
+        lower = stats.wilson_lower(wins, len(mine), z)
+        out.append(
+            {
+                "name": m.name,
+                "games": len(mine),
+                "won_share": wins / len(mine) if mine else None,
+                "lower": lower,
+                "lower_bonferroni": stats.wilson_lower(wins, len(mine), z_bonferroni),
+                "threshold": m.threshold,
+                "met": bool(mine) and lower >= m.threshold,
+            }
+        )
+    return out
+
+
+def render_run1(ctx: Ctx, scale: float, init_version: int) -> Path:
+    """run1.toml with its [credit] margin_scale replaced by e4_check's and its init_version by the one in use, in
+    ROOT/s2/generated/."""
+    text = ctx.configs.file("run1").read_text()
+    for key, value in (("margin_scale", f"{scale:.1f}"), ("init_version", str(init_version))):
+        text, n = re.subn(
+            rf"^({key}\s*=\s*)[0-9.eE+-]+", lambda m, v=value: f"{m.group(1)}{v}", text, count=1, flags=re.M
+        )
+        if n != 1:
+            raise StepFailed(f"the run1 config has no {key} line to set")
+    out = ctx.s2 / "generated" / "run1.toml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text)
+    return out
+
+
 def step_run1(ctx: Ctx) -> Outcome:
-    cfg = ctx.cfg("run1")
+    """Run 1: RL from the init step's model on the documented objective, judged by the paired R of its end-final panel
+    over its end-base panel, both on the baselines' held-out starts. An SFT init is published into Run 1's root as
+    version 1, so the games and the base-model panel start from the right model."""
+    s, cfg = ctx.settings["run1"], ctx.cfg("run1")
     init = (ctx.record.data["steps"].get("init", {}).get("detail") or {}).get("init_path")
-    flags: list[str] = baseline_flags(ctx)
+    flags: list[str] = [*baseline_flags(ctx), *learner_flags(s), *e3_learner_flags(s)]
+    version = 0
     if init:
         if not Path(init).is_relative_to(ctx.cfg("sft").root):
             raise StepFailed(f"Run 1's init {init} is not an SFT checkpoint: no E2 adapter may carry over")
-        flags += ["--init", init, "--anchor", init]
-    ctx.say(f"run1: {'from ' + init if init else 'from the base model'}")
-    ctx.train_run(ctx.configs.file("run1"), flags, "rl run")
-    reason = final_reason(cfg.root)
-    trips = trips_in(cfg.root / "health.jsonl")
-    return Outcome([ended_normally(cfg.root, ("duration",))], {"reason": reason, "trips": trips, "init": init})
+        version = RUN1_INIT_VERSION
+        seed_adapter(Path(init), cfg.root, version)
+        flags += ["--init", str(cfg.root / "adapters" / f"v{version}"), "--start-version", str(version)]
+    scale, weight = e4_margin_scale(ctx), float(cfg.credit["cap_weight"])
+    ctx.say(f"run1: {'from ' + init if init else 'from the base model'}, margin scale {scale:.0f}")
+    ctx.train_run(render_run1(ctx, scale, version), flags, "rl run")
+    final, start = (panel_games(cfg.root / "panels" / name, scale, weight) for name in reversed(RUN1_END_PANELS))
+    paired, paired_detail = G.paired_reward_gate(final, start, max_p=float(s["max_p"]))
+    _, slope = G.in_run_slope_gate(training_games(cfg.root / "games", scale, weight))
+    updates, trips = updates_in(cfg.root / "health.jsonl"), trips_in(cfg.root / "health.jsonl")
+    gates = [
+        G.Gate("learner updates", float(updates), ">=", float(s["min_updates"])),
+        paired,
+        G.Gate("tripwire trips", float(trips), "<=", 0.0),
+        ended_normally(cfg.root, ("complete",)),
+    ]
+    detail = {
+        "init": init,
+        "init_version": version,
+        "margin_scale": scale,
+        "cap_weight": weight,
+        "paired": paired_detail,
+        "paired_margin": G.paired_margin_test(final, start),
+        "slope": slope,
+        "panels": {name: panel_report(g) for name, g in zip(RUN1_END_PANELS, (start, final), strict=True)},
+        "milestones": {name: milestone_table(g) for name, g in zip(RUN1_END_PANELS, (start, final), strict=True)},
+        "updates": updates,
+        "trips": trips,
+    }
+    return Outcome(gates, detail)
 
 
 STEP_FUNCS: dict[str, Callable[[Ctx], Outcome]] = {
@@ -1611,14 +1736,13 @@ def final_report(ctx: Ctx) -> str | None:
         base, sft, run1 = ctx.cfg("baselines"), ctx.cfg("sft"), ctx.cfg("run1")
         panels = ctx.s2 / "report-panels"
         panels.mkdir(parents=True, exist_ok=True)
-        b, r = ctx.settings["baselines"], ctx.settings["run1"]
+        b = ctx.settings["baselines"]
         links = {
             "v0-heldout": base.root / "panels" / b["heldout_panel"],
             "v0-v1-subset": base.root / "panels" / b["v1_panel"],
             "v0-frontier": base.root / "panels" / b["frontier_panel"],
             "teacher-calibration": base.root / "panels" / b["calibration_panel"],
-            "run1-heldout": run1.root / "panels" / r["heldout_panel"],
-            "run1-frontier": run1.root / "panels" / r["frontier_panel"],
+            "run1-heldout": run1.root / "panels" / RUN1_END_PANELS[1],
             **{p.name: p for p in (sft.root / "panels").glob(f"{SFT_PREFIX}*")},
         }
         for name, target in links.items():

@@ -30,7 +30,7 @@ config and nothing else. The configs are in `live/s2/`, one per step, with `sequ
 | sft | `learner.py --sft`, 2 epochs, lr 1e-4, a checkpoint per epoch | both epochs published, `sft-done.json` written | 0.8 h | 1.25 h |
 | sft_panels | Each epoch's adapter plays the first 192 games of the held-out panel; `stats.select_sft_checkpoint` picks one by held-out win rate with the entropy floor 0.7 and at least 20 games. The chosen epoch then plays the other 192 configs of the held-out panel (the `sft-rest` panel, `start = 192`), so it has the same 384 configs v0 has | every panel at least 90% finished, the epoch panels and the rest | 2.1 h | 3.0 h |
 | init | Run 1's start: the chosen epoch if `stats.panel_test` (opponent-stratified margin, on all 384 configs: the epoch's 192 and its 192 more against v0's games on the same configs) says it beats v0 at one-sided p under 0.05, else the base model. This is a decision, not a gate: it always passes and writes its reason | none | minutes | |
-| run1 | The RL run, 10 hours, Run 1's fixed mix, `--baseline s2/baseline.json`, `--init` and `--anchor` the chosen epoch (or neither), the critic on, hard states off unless `run1.toml` enables them. Panels at hour 8: the 384-game held-out panel and the frontier panel. Then the report, the final upload and `shutdown -h now` | the run ended by its duration (not budget, tripwire pause or crash); a missing or short tripwire baseline stops the step before it starts | 10.3 h | 11.0 h |
+| run1 | Train to win: RL from the init step's model (the base model, or the SFT epoch published as version 1 in Run 1's root) on Run 1's fixed mix and the documented reward (`run1.toml`), `--baseline s2/baseline.json` and E4's learner flags, 8 hours of training, then the end panels `end-base` (v0) and `end-final`, 384 games each on the baselines' held-out starts. Then the report, the final upload and `shutdown -h now` | at least 5 updates; `end-final` beats `end-base` on the paired R (one-sided Wilcoxon p under 0.05); no tripwire trip; the run ended "complete"; a missing or short tripwire baseline or e4_check margin scale stops the step before it starts | 12.5 h | 13.5 h |
 
 A failed gate, a step that reaches its cap, a budget refusal, two tripwire trips (the orchestrator's own rule: the
 second within 3 hours pauses and stops the run) or an error stops the sequence. The reason goes into
@@ -90,15 +90,15 @@ shares (games ending ahead) and their difference, with a bootstrap interval over
 
 **To start or resume.** `live/s2.sh ID start live/s2 --resume --yes`: the passed steps are skipped and E2 stays accepted. To
 look at the check before E3, set `stop_after = "e3_check"` first and change it back to `"e3"` for the second start. An E3 that was cut off and resumed keeps its run clock, replays its unfinished panel games from the panels'
-`games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $850 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
-`LIVE_MAX_HOURS` in `s2.env.example` is 40 for the whole sequence; set the box's own `live/s2.env` to match before starting.
+`games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $920 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
+`LIVE_MAX_HOURS` in `s2.env.example` is 42 for the whole sequence; set the box's own `live/s2.env` to match before starting.
 
 ### E4: the long-game check and E4
 
 Why E4 follows E3 is in `docs/s2-e3-results.md`: E3's final adapter led on net worth at the 12-minute cap, but every game
 ended at the cap, so it learned to keep value and avoid fights. The shipped `[sequence]` table now accepts E3's recorded
-failure as well (`accept_failed = ["e2", "e3"]`: its in-run slope gate missed, its paired held-out gate passed) and has
-`stop_after = "e4"`: the check and E4 run in one session, and a failed check stops the sequence before E4.
+failure as well (`accept_failed = ["e2", "e3"]`: its in-run slope gate missed, its paired held-out gate passed). E4 is now over
+too, and `docs/s2-e4-results.md` has what it showed: it is accepted as well, and `stop_after = "run1"` (see Run 1 below).
 
 **The check** (`e4_check`, 2.0 h) plays no training game: two held-out panels of 100 games on identical starts, 30-minute
 games, Petra-2 60% and Petra-3 40%. `long-base` is v0, and `long-e3` is E3's final adapter. The step reads the version E3's
@@ -133,6 +133,41 @@ the conquest won and lost shares and the ahead-at-cap share per panel and oppone
 
 **To start or resume.** `live/s2.sh ID start live/s2 --resume --yes`. To look at the check before E4, set
 `stop_after = "e4_check"` first and change it back to `"e4"` for the second start.
+
+### Run 1: train to win
+
+18 Nov: E4 did not beat base (`docs/s2-e4-results.md`) and is accepted, so the sequence runs `labels`, `sft`, `sft_panels`,
+`init` and then Run 1, and stops after it (`stop_after = "run1"`). Run 1 is the run that trains Qwen to win games, on the
+documented objective: a conquest is +1 or -1, and a game that reaches the 30-minute cap is `0.5 sign(m) + 0.5 tanh(m / s)`
+with `cap_weight` 1, so a lead at the cap counts as a win; 15% of the games run uncapped. The mix is bot 0.10, Petra-1
+0.35, Petra-2 0.35, Petra-3 0.10, base 0.10. The training is E4's, with a bigger share of each game: each start dealt 4
+times (start leave-one-out), whole groups of 512 decisions per update, and `decisions = [16, 24]` per seat-game (the
+default 8 to 12 starved E4's learner on long games: 12 updates in 3.5 hours, the learner busy 49%). `decisions` is a
+`[credit]` field; a TOML list becomes the tuple `CreditConfig` wants, as `orchestrate._fields` and `baseline.credit_for`
+convert it. There is no `[credit.critic]`: with start leave-one-out no critic is used.
+
+**Start.** The step starts from the init step's decision: the chosen SFT epoch if it beat v0, else the base model (no E2
+adapter can carry over). The expected case is the base model, as SFT lost to base, 31% to 34%. With an SFT epoch, the step
+publishes it into Run 1's root as `adapters/v1` and passes `--init ROOT/adapters/v1 --start-version 1`, with
+`init_version = 1` in the rendered config, so the base model plays none of the first games; `end-base` stays version 0.
+It renders `run1.toml` into `s2/generated/run1.toml` with `margin_scale` set to e4_check's measured 30-minute scale (the
+step fails before playing if e4_check recorded none). The learner flags are the tripwire baseline (`--baseline
+s2/baseline.json`, from the 30-minute baseline games) and E4's (`--lr 3e-5 --drift alarm --grad-norm alarm
+--anchor-beta0 0 --warmup-updates 2 --decisions-per-update 512 --kl-check-fraction 0.25 --probe-rows 64 --whole-groups`).
+
+**End panels.** At `train_hours` 8 the learner stops and two panels of 384 games start: `end-base` (v0) and `end-final`
+(the newest adapter). Both play exactly the starts of `baselines.toml`'s `heldout` panel (same seed, positions, opponent
+mix, start, games and time cap; `check_dir` refuses a config where they differ), so each pairs game by game with the
+other and with v0's earlier 384 games. There is no frontier panel. The run is 12.3 hours: 8 of training, then 768 games of
+up to 30 minutes at about 200 an hour (24 concurrent games, about 430 s each: 3.9 hours), then drains and uploads.
+
+**Gates.** At least 5 learner updates; `end-final` beats `end-base` on the paired per-start R (conquest +-1, the cap rule with
+`cap_weight` 1 and the rendered margin scale; one-sided Wilcoxon signed-rank, p under 0.05); no tripwire trip; the run ended
+"complete". Reported and not gated: each panel overall and per opponent (conquest won and lost, ahead at the cap, and
+`won_share`: conquest won plus ahead at the cap), the milestone table for both panels (`stats.DEFAULT_MILESTONES`: Petra-1
+50% and 65%, Petra-2 15%, 30%, 45% and 50%, Petra-3 15%) with each opponent's won share and its 97.5% Wilson lower bound
+(`lower_bonferroni` is the bound at the level `stats.milestones` shares across the seven), the paired net-worth margin test and the in-run
+slope.
 
 ### Why the tripwire baseline sits between the baselines and E2
 
@@ -174,10 +209,10 @@ panels), credited with Run 1's `[credit]` settings and no critic.
 1. `cp live/s2.env.example live/s2.env` (git-ignored) and fill in the AWS profile, account, subnets, security group,
    instance profile (needs SSM), bucket and owner tag, and the LiteLLM URL, as for `live/train.env`. The rest is set:
    `g6e.12xlarge` then `g6e.24xlarge` at $10.49 and $15.07 an hour, `LIVE_REQUIRE_RATE=1`, stop-not-terminate,
-   `LIVE_MAX_HOURS=40`, `LIVE_BUDGET_USD=850`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
+   `LIVE_MAX_HOURS=42`, `LIVE_BUDGET_USD=920`. If the launch falls back to the g6e.24xlarge, change `box_usd_per_hour` in
    every `live/s2/*.toml` to 15.07 first (`s2.sh start` refuses a mismatch) and expect about a third more box cost.
 2. Copy `live/s2` somewhere to edit, or edit it in place: nothing in it is a secret. Check the three frontier model names
-   in `baselines.toml` and `run1.toml` (`anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5`, `openai/gpt-6-astra`)
+   in `baselines.toml` (`anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5`, `openai/gpt-6-astra`)
    against what your LiteLLM serves; the Sonnet name is the one not already used elsewhere in this repo. The `s3.uri`s say
    `s3://BUCKET/zeroad-train/run/s2-...`; `s2.sh` fills in `LIVE_BUCKET` when it sends them.
 3. On the laptop: Scale VPN, `aws sso login`, `uv`, `zstd` (`brew install zstd`).
@@ -277,12 +312,12 @@ still up after `s2.sh stop`. Remove the LiteLLM key from SSM when no more runs n
 | labels | 0.4 | $4.2 | up to $68 (the caps; about $63 expected) |
 | sft | 0.8 | $8.4 | |
 | sft_panels | 2.1 | $22.0 | |
-| run1 | 10.3 | $108.0 | end frontier panel about $26 |
-| **Total** | **20.3** | **about $213** | **about $130** |
+| run1 | 12.5 | $131.1 | none: no frontier panel |
+| **Total** | **22.5** | **about $236** | **about $104** |
 
 About $343 if every step takes its expected time, at the planning prices. On the first box day (6 Nov) frontier games cost
 about $2.5-3.5 each and an Opus label about $0.036, so the frontier spend is nearer $275 than $130 and the day about
-$490 at the on-demand box rate; `LIVE_BUDGET_USD=850`. The design's S2 + S3 line was about $290
+$490 at the on-demand box rate; `LIVE_BUDGET_USD=920`. The design's S2 + S3 line was about $290
 ($157 + $131). This sequence costs more because it adds the E2 positive control's two hours (the design counted E2 inside
 the 6.5 h), the SFT panels (two epochs of 192 games, then the chosen epoch's other 192: 0.7 h, $7 more than the 1.4 h
 that two epochs alone took), the tripwire baseline (0.3 h), the 6 extra calibration games and the bootstrap hour. The
@@ -292,8 +327,8 @@ steps ran long is stopped by that check (with the guard's words in `gates.json`)
 
 The check before Run 1 is the tight one. It adds what the box and the ledger have spent (10.0 h of box and the bootstrap
 at $10.49 is $105, plus about $104 of frontier spend: the calibration, the frontier panel and the labels) to Run 1's
-11 h cap ($115) and its $30 of spend caps: about $354 at the expected pace. At $350 the sequence would stop at Run 1's
-start with "the budget guard refuses it", so the budget is $850 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
+13.5 h cap ($142) and no spend caps: about $351 at the expected pace. At $350 the sequence would stop at Run 1's
+start with "the budget guard refuses it", so the budget is $920 (`LIVE_BUDGET_USD` and every config's `budget_usd`,
 which `s2.sh start` requires to be at or under it): room for steps that run long, and still a stop for a runaway box.
 
 ## Uncertain until the first run
