@@ -35,6 +35,7 @@ PREFIX=${ZEROAD_S3_PREFIX:-zeroad-train}
 SESSION=$STATE/showcase/showcase-$STAMP
 DEST=s3://${BUCKET:-<bucket>}/$PREFIX/run/showcase-$STAMP/
 NAME=zeroad-showcase
+VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || echo http://127.0.0.1:8000)  # showcase-bootstrap.sh writes it
 export PATH="$PATH:/usr/local/bin"
 
 # hide: whatever aws prints goes through this, so the bucket's name never reaches the output.
@@ -71,9 +72,9 @@ run docker rm -f "$NAME" >/dev/null 2>&1 || true
 container=(docker run --rm --init --name "$NAME" --network host --gpus all
   -e NVIDIA_DRIVER_CAPABILITIES=all -v /tmp/.X11-unix:/tmp/.X11-unix --shm-size 2g
   -e DISPLAY=:0 -e ZEROAD_DISPLAY=:0 -e ZEROAD_ENCODER=nvenc -e ZEROAD_GRAPHICS=high -e "ZEROAD_RTMP_URL=$RELAY"
-  --env-file "$ETC/vllm.env" -e "ZEROAD_VLLM_URL=http://127.0.0.1:8000" -e LITELLM_BASE_URL -e LITELLM_API_KEY
+  --env-file "$ETC/vllm.env" -e "ZEROAD_VLLM_URL=$VLLM" -e LITELLM_BASE_URL -e LITELLM_API_KEY
   -e "LIVE_BUDGET_USD=$BUDGET" -e "ZEROAD_BOX_USD_PER_HOUR=$ZEROAD_BOX_USD_PER_HOUR"
-  -e "ZEROAD_LIVE_HOME=$BOX_HOME" -e "ZEROAD_LIVE_STATE=$STATE" -e "ZEROAD_DEADLINE_FILE=$DEADLINE_FILE"
+  -e "ZEROAD_SPEND_LEDGER=$LEDGER" -e "ZEROAD_LIVE_HOME=$BOX_HOME" -e "ZEROAD_LIVE_STATE=$STATE" -e "ZEROAD_DEADLINE_FILE=$DEADLINE_FILE"
   -v "$BOX_HOME:$BOX_HOME:ro" -v "$STATE:$STATE" -v "$DEADLINE_FILE:$DEADLINE_FILE:ro"
   -v "$REPO/live:/work/live:ro" -v "$SESSION:/out" -w /work
   --entrypoint python zeroad-showcase

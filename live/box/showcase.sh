@@ -3,9 +3,8 @@
 # The showcase session on this box (bootstrapped with bootstrap.sh --showcase) in the transient unit zeroad-showcase
 # (showcase-run.sh), which survives an SSM disconnect. `start` refuses while a session runs, while vLLM or the showcase
 # image is missing, when the power-off deadline leaves less than H + 1 hours (live/extend-poweroff.sh moves it), and when
-# budget.sh says --budget would be passed by the box hours so far plus H plus the caps of the frontier games the
-# session could play (at most --max-games, else two an hour; the rotation's ids that are not petra bots, as a share of
-# the rotation, at ZEROAD_MATCH_CAP_USD each). H is 4 unless given. `status` prints the unit, the game in play, the
+# budget.sh says --budget would be passed by the box hours so far plus H at the box rate plus one frontier game's cap
+# (ZEROAD_MATCH_CAP_USD; the runner checks every later game itself). H is 6 unless given. `status` prints the unit, the game in play, the
 # session table, the spend, the power-off and the GPU memory. `stop` sends SIGTERM: the game in play is recorded as no
 # result, the session uploads, and the box stays up (no power-off after a stop by hand).
 # shellcheck source=lib.sh
@@ -18,7 +17,7 @@ SHOW=$STATE/showcase
 USAGE="usage: showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] | status [LINES] | stop"
 case $CMD in
   start)
-    BUDGET= HOURS=4 MAX_GAMES= ROTATION= MODE=
+    BUDGET= HOURS=6 MAX_GAMES= ROTATION= MODE=
     while [ $# -gt 0 ]; do
       case $1 in
         --budget) BUDGET=${2:?--budget needs USD}; shift 2 ;;
@@ -41,22 +40,17 @@ case $CMD in
       docker image inspect zeroad-showcase >/dev/null 2>&1 || die "no zeroad-showcase image: live/bootstrap.sh ID --showcase first"
       curl -fsS "$VLLM/health" >/dev/null || die "vLLM is not up at $VLLM (docker logs zeroad-vllm)"
     fi
-    # The frontier games' caps: the rotation's ids other than the petra bots, as a share of the games it could play.
-    rotation=$ROTATION
-    [ -n "$rotation" ] || rotation=$(sed -n 's/^rotation *= *\[\(.*\)\].*/\1/p' "$REPO/live/showcase/showcase.toml" 2>/dev/null | tr -d '" ')
-    [ -n "$rotation" ] || die "no rotation: give --rotation or set it in live/showcase/showcase.toml"
-    frontier=$(tr ',' '\n' <<<"$rotation" | grep -vc '^petra' || true)
-    total=$(tr ',' '\n' <<<"$rotation" | wc -l | tr -d ' ')
+    # One frontier game's cap is planned with the box hours; the runner's own budget.sh check before every game refuses
+    # each later game that would pass the budget.
     cap=${ZEROAD_MATCH_CAP_USD:-9}
-    games=$(awk -v h="$HOURS" -v m="${MAX_GAMES:-0}" 'BEGIN { n = int(h * 2); if (n < h * 2) n++; if (m > 0 && m < n) n = m; print n }')
-    usd=$(awk -v g="$games" -v f="$frontier" -v t="$total" -v c="$cap" 'BEGIN { k = g * f / t; n = int(k); if (n < k) n++; printf "%.2f", n * c }')
     if [ -f "$DEADLINE_FILE" ]; then
       left=$(awk -v d="$(cat "$DEADLINE_FILE")" -v n="${ZEROAD_NOW_EPOCH:-$(date +%s)}" 'BEGIN { printf "%.2f", (d - n) / 3600 }')
       awk -v l="$left" -v h="$HOURS" 'BEGIN { exit !(l >= h + 1) }' \
         || die "the box powers off in $left h and the session needs $HOURS h + 1: live/extend-poweroff.sh ID HOURS moves the power-off"
     fi
-    "$BOX_HOME/box/budget.sh" check --planned-usd "$usd" --planned-hours "$HOURS" --budget "$BUDGET"
-    say "showcase: $HOURS h, up to $games games, $frontier of $total rotation ids are frontier: \$$usd of caps at \$$cap, budget \$$BUDGET"
+    "$BOX_HOME/box/budget.sh" check --planned-usd "$cap" --planned-hours "$HOURS" --budget "$BUDGET"
+    hours_usd=$(awk -v h="$HOURS" -v r="$ZEROAD_BOX_USD_PER_HOUR" 'BEGIN { printf "%.2f", h * r }')
+    say "showcase: $HOURS h of box at \$$ZEROAD_BOX_USD_PER_HOUR/h = \$$hours_usd, plus one frontier game's cap of \$$cap, against budget \$$BUDGET (each later game is checked by the runner)"
     stamp=$(date -u +%Y%m%d-%H%M%S)
     args=(--budget "$BUDGET" --stamp "$stamp" --hours "$HOURS")
     [ -z "$MAX_GAMES" ] || args+=(--max-games "$MAX_GAMES")

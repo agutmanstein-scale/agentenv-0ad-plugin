@@ -3,8 +3,8 @@
 #        | fetch [--with-video] | watch  [--yes|--dry-run]
 # The showcase session (the RL-trained Qwen against Opus, Astra and Petra-3, rendered) on box ID, bootstrapped with
 # bootstrap.sh --showcase; run every command with LIVE_ENV=live/showcase.env. `start` runs the session as the unit
-# zeroad-showcase, through box/showcase.sh: H hours (4 unless given), refused when LIVE_BUDGET_USD would be passed by the
-# box hours so far plus H plus the frontier games' caps, or when the box's power-off leaves less than H + 1 hours
+# zeroad-showcase, through box/showcase.sh: H hours (6 unless given), refused when LIVE_BUDGET_USD would be passed by the
+# box hours so far plus H plus one frontier game's cap, or when the box's power-off leaves less than H + 1 hours
 # (extend-poweroff.sh moves it). LIST is a comma-separated rotation of opponents (live/showcase/showcase.toml's if not
 # given); --mode replay plays the recorded games again. `status` shows the unit, the game in play, the session table,
 # the spend, the power-off and the GPU memory. `stop` ends the session early: the game in play is recorded as no result,
@@ -24,7 +24,7 @@ check_instance_id "$ID"
 WATCH_URL=rtmp://127.0.0.1:1935/zeroad
 case $SUB in
   start)
-    HOURS=4; out=()
+    HOURS=6; out=()
     while [ $# -gt 0 ]; do
       case $1 in
         --hours) [[ ${2:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--hours needs a number"; HOURS=$2; shift 2 ;;
@@ -36,7 +36,7 @@ case $SUB in
     done
     [ "$DRY_RUN" = 1 ] && LIVE_BUDGET_USD=${LIVE_BUDGET_USD:-60}
     need LIVE_BUDGET_USD
-    log "showcase on $ID for $HOURS h against \$$LIVE_BUDGET_USD (box hours at \$$RATE/h + the frontier games' caps), box power-off in at most ${LIVE_MAX_HOURS:-?} h"
+    log "showcase on $ID for $HOURS h against \$$LIVE_BUDGET_USD (box hours at \$$RATE/h + one frontier game's cap), box power-off in at most ${LIVE_MAX_HOURS:-?} h"
     ssm_box "$ID" 300 showcase.sh start --budget "$LIVE_BUDGET_USD" --hours "$HOURS" "${out[@]+"${out[@]}"}"
     log "started; follow it with live/showcase.sh $ID status; live/showcase.sh $ID watch to see it; live/showcase.sh $ID fetch --yes afterwards" ;;
   status)

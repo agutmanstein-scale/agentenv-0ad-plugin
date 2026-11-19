@@ -2883,7 +2883,7 @@ def test_showcase_start_dry_run_prints_the_plan(stubs):
     assert "systemd-run --unit zeroad-showcase" in plan and "box/showcase-run.sh" in plan
     for arg in ("--hours 2", "--max-games 4", "--rotation opus,petra-3", "--mode live", "--budget 60"):
         assert arg in plan, arg
-    assert "frontier" in plan  # the guard's sum: 2 h of box at $2.24 plus 2 frontier games' caps
+    assert "2 h of box at $2.24/h = $4.48" in plan and "one frontier game's cap" in plan
     assert "bucket-1" not in plan and "bucket-1" not in out.stdout
     assert not aws_calls(stubs)  # nothing was called: forbid_aws would have made the stub exit 99
     watch = showcase(stubs, "watch", "--dry-run")
@@ -2893,8 +2893,16 @@ def test_showcase_start_dry_run_prints_the_plan(stubs):
 
 
 def test_showcase_start_refuses_over_budget(stubs):
-    out = showcase(stubs, "start", "--hours", "8")  # 8 h at $2.24 and 11 frontier games at $9 pass $60
+    out = showcase(stubs, "start", "--hours", "24")  # 24 h at $2.24 and one game at $9 pass $60
     assert out.returncode != 0 and "REFUSED" in out.stderr and "systemd-run" not in out.stderr
+
+
+def test_showcase_start_plans_the_box_hours_and_one_game_not_every_game(stubs):
+    out = showcase(stubs, "start")  # 6 h by default: $13.44 + $9 fits $60; 12 games at $9 each would not
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "--hours 6" in plan and "6 h of box at $2.24/h = $13.44" in plan and "one frontier game's cap of $9" in plan
+    assert "systemd-run --unit zeroad-showcase" in plan
 
 
 def test_showcase_start_refuses_short_poweroff(stubs):
@@ -2961,6 +2969,9 @@ def test_showcase_run_uploads_before_shutdown(stubs):
     )
     assert "--config live/showcase/showcase.toml" in docker and "--name zeroad-showcase" in docker
     assert LOOPBACK_RELAY in docker and "--gpus all" in docker and "DISPLAY=:0" in docker
+    state = stubs["tmp"] / "state"
+    assert f"-e ZEROAD_SPEND_LEDGER={state}/spend.jsonl" in docker  # the runner books each game in the box's ledger
+    assert f"-v {state}:{state} " in docker  # the folder holding it is mounted read-write (no :ro)
     assert SECRET not in docker and "vllm-secret-value" not in docker  # the keys travel in the environment only
     assert f"key={SECRET}" in (stubs["tmp"] / "docker.env").read_text()  # with-model.sh gave the child the key
     assert "bucket-1" not in out.stdout + out.stderr
