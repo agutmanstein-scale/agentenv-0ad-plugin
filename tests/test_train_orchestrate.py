@@ -1490,6 +1490,26 @@ def test_box_hours_count_every_boot_the_way_budget_sh_does_and_never_less_than_t
     assert budget.spend(short, 4 * 3600.0, 10.0, ledger, box).box_hours == pytest.approx(4.0)  # the clock is larger
 
 
+def test_box_hours_and_the_run_clock_count_only_from_the_last_reset(tmp_path):
+    at = 100_000
+    boxtime = tmp_path / "boxtime.json"
+    boxtime.write_text(
+        json.dumps({"1000": [1000, 1000 + 7200], "90000": [90000, at + 1800], "120000": [120000, 120000]})
+    )
+    box = budget.BoxTime(boxtime, boot_epoch=120000)
+    assert box.reset_at is None
+    assert box.hours(120000 + 3600) == pytest.approx(2 + (at + 1800 - 90000) / 3600 + 1)
+    (tmp_path / "budget-resets.jsonl").write_text(json.dumps({"at": 5}) + "\n" + json.dumps({"at": at}) + "\n")
+    assert box.reset_at == at
+    assert box.hours(120000 + 3600) == pytest.approx(0.5 + 1.0)  # the old boot ended before at; one spans it
+    started = budget.RunClock(tmp_path / "clock.json", now=0.0)  # a run that began long before the reset
+    spent = budget.spend(started, at + 7200, 10.0, tmp_path / "spend.jsonl", box)
+    assert spent.box_hours == pytest.approx(2.0)  # the run clock clipped to the 2 h since at, not 27.8 h
+    assert budget.spend(started, at + 7200, 10.0, tmp_path / "spend.jsonl", None).box_hours == pytest.approx(
+        (at + 7200) / 3600
+    )
+
+
 # ---- the disk, the learner's pulse, old adapters ---------------------------------------------------------------
 async def test_a_box_short_of_disk_starts_no_games_and_alarms_until_there_is_room(tmp_path, monkeypatch):
     free = {"gb": 3.0}

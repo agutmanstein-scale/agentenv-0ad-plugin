@@ -141,6 +141,7 @@ CHANGE_SCRIPTS = [
     ("stop.sh", ID),
     ("stop.sh", ID, "--push-only"),
     ("repair.sh", ID),
+    ("budget-reset.sh", ID),
     ("stop-box.sh", ID),
     ("teardown.sh", ID),
     ("grow-disk.sh", ID, "500"),
@@ -963,6 +964,75 @@ def test_the_budget_keeps_the_box_hours_of_earlier_boots(box_stubs):
     assert out.returncode == 1, out.stdout
     assert "box $13.20 (10.0 h at $1.32/h, 2 boots)" in out.stdout
     assert "REFUSED: $23.52 would pass the $23 budget" in out.stdout
+
+
+def _reset_clock(now, boot=None):
+    return {"ZEROAD_NOW_EPOCH": str(now), "ZEROAD_BOOT_EPOCH": str(boot if boot is not None else now - 3 * 3600)}
+
+
+def test_reset_archives_the_ledger_and_box_time_and_the_counter_restarts_at_zero(box_stubs):
+    state = box_stubs["tmp"] / "state"
+    state.mkdir(exist_ok=True)
+    (state / "spend.jsonl").write_text('{"what": "a", "usd_est": 7.5}\n')
+    now = 1_800_000_000
+    (state / "boxtime.json").write_text(json.dumps({"1000": [1000, 1000 + 7200]}))
+    env = {**_reset_clock(now), "ZEROAD_RESET_SETTLE_S": "0"}
+    out = run_box(box_stubs, "budget.sh", "reset", **env)
+    assert out.returncode == 0, out.stderr
+    assert "before: model $7.50 (1 matches) + box $6.60 (5.0 h at $1.32/h, 2 boots)" in out.stdout
+    assert "after: model $0.00 (0 matches) + box $0.00 (0.0 h at $1.32/h)" in out.stdout
+    stamp = "20270115T080000Z"
+    assert json.loads((state / f"boxtime-before-reset-{stamp}.json").read_text()) == {
+        "1000": [1000, 8200],
+        str(now - 3 * 3600): [now - 3 * 3600, now],
+    }
+    assert "7.5" in (state / f"spend-before-reset-{stamp}.jsonl").read_text()
+    assert (state / "spend.jsonl").read_text() == ""
+    row = json.loads((state / "budget-resets.jsonl").read_text())
+    assert row["at"] == now and row["before"]["model_usd"] == 7.5 and row["before"]["box_hours"] == 5.0
+    assert row["before"]["box_usd"] == 6.6 and row["before"]["total_usd"] == 14.1
+    assert sorted(row["archived"]) == [f"boxtime-before-reset-{stamp}.json", f"spend-before-reset-{stamp}.jsonl"]
+    hour = {**_reset_clock(now + 3600, now - 3 * 3600), "ZEROAD_RESET_SETTLE_S": "0"}
+    shown = run_box(box_stubs, "budget.sh", "show", **hour)
+    assert "model $0.00 (0 matches) + box $1.32 (1.0 h at $1.32/h" in shown.stdout
+
+
+def test_after_a_reset_an_earlier_boot_counts_only_the_part_after_it(box_stubs):
+    state = box_stubs["tmp"] / "state"
+    state.mkdir(exist_ok=True)
+    at = 1_800_000_000
+    (state / "budget-resets.jsonl").write_text(json.dumps({"at": at}) + "\n")
+    (state / "boxtime.json").write_text(
+        json.dumps({"1000": [1000, at - 100], "2000": [at - 7200, at + 3600], str(at + 9000): [at + 9000, at + 9000]})
+    )
+    out = run_box(box_stubs, "budget.sh", "show", **_reset_clock(at + 9000, at + 9000))
+    assert "box $1.32 (1.0 h at $1.32/h, 3 boots)" in out.stdout
+
+
+def test_a_boxtime_the_timer_writes_back_during_the_reset_is_rewritten(box_stubs):
+    state = box_stubs["tmp"] / "state"
+    state.mkdir(exist_ok=True)
+    now = 1_800_000_000
+    (state / "boxtime.json").write_text(json.dumps({"1000": [1000, 5000]}))
+    script = f"sleep 0.5; echo '{{\"1000\": [1000, 5000]}}' > {state}/boxtime.json"
+    timer = subprocess.Popen(["bash", "-c", script])
+    out = run_box(box_stubs, "budget.sh", "reset", **_reset_clock(now), ZEROAD_RESET_SETTLE_S="1.5")
+    timer.wait()
+    assert out.returncode == 0, out.stderr
+    assert list(json.loads((state / "boxtime.json").read_text())) == [str(now - 3 * 3600)]
+
+
+def test_a_dry_run_reset_writes_nothing(box_stubs):
+    state = box_stubs["tmp"] / "state"
+    state.mkdir(exist_ok=True)
+    (state / "spend.jsonl").write_text('{"what": "a", "usd_est": 7.5}\n')
+    out = run_box(
+        box_stubs, "budget.sh", "reset", DRY_RUN="1", ZEROAD_RESET_SETTLE_S="0", **_reset_clock(1_800_000_000)
+    )
+    assert out.returncode == 0, out.stderr
+    assert "+ mv " in out.stdout and "spend-before-reset-" in out.stdout
+    assert sorted(p.name for p in state.iterdir()) == ["spend.jsonl"]
+    assert "7.5" in (state / "spend.jsonl").read_text()
 
 
 @pytest.mark.parametrize("budget", ["nan", "NaN", "inf", "-inf"])

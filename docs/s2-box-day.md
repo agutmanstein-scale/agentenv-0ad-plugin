@@ -91,7 +91,7 @@ shares (games ending ahead) and their difference, with a bootstrap interval over
 **To start or resume.** `live/s2.sh ID start live/s2 --resume --yes`: the passed steps are skipped and E2 stays accepted. To
 look at the check before E3, set `stop_after = "e3_check"` first and change it back to `"e3"` for the second start. An E3 that was cut off and resumed keeps its run clock, replays its unfinished panel games from the panels'
 `games.jsonl`, and restores credit's held starts, the game stream and the end-of-training flag from `ROOT/orchestrator`. The budget is $920 (`LIVE_BUDGET_USD` and every config's `budget_usd`) and
-`LIVE_MAX_HOURS` in `s2.env.example` is 42 for the whole sequence; set the box's own `live/s2.env` to match before starting.
+`LIVE_MAX_HOURS` in `s2.env.example` is 42 for the whole sequence; set the box's own `live/s2.env` to match before starting. To start the spend counter again from $0 (a new budget period), run `live/budget-reset.sh ID --yes`, even while the sequence is running: it archives the ledger and box hours (`spend-before-reset-*`, `boxtime-before-reset-*`, `budget-resets.jsonl` in the box's state folder) and nothing is deleted.
 
 ### E4: the long-game check and E4
 
