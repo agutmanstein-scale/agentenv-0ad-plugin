@@ -70,3 +70,18 @@ time (12.3 h at $10.49/h) and no model API; $98 of it falls after the reset.
 
 Run 2 per the plan: 24 hours on one box or two replicate runs, an adaptive mix, frozen snapshots of the policy (at most 20%),
 about 30 frontier games a day. Worth adding: a held-out map, a replicate seed, more weight on Petra-3 and above.
+
+## Against Opus and Astra (`run1_frontier`, 19 Nov)
+
+Play-only, `live/s2/run1-frontier.toml`: the final adapter (version 50) against Opus (`anthropic/claude-opus-5-5`) and
+Astra (`openai/gpt-6-astra`), 16 games each, 30-minute cap, equal latency, seats alternating, on the baselines' frontier
+starts (game j here is the baselines' game j).
+
+| vs | Qwen won-lost | Won by conquest / at the cap | Lost by conquest / at the cap | 95% interval of the win rate | Teacher failed calls | Spend |
+|---|---|---|---|---|---|---|
+| Opus | 13-3 | 5 / 8 | 0 / 3 | 57% to 93% | 0 a game | $39.16 |
+| Astra | 9-7 | 1 / 8 | 2 / 5 | 33% to 77% | 0 a game | $38.55 |
+
+On the starts base Qwen also played, the adapter won all of them: 8 of 8 against Opus (v0 4-4) and 4 of 4 against Astra (v0
+2-2). Every base loss there became a win and no base win was lost. v0's Astra games were handicapped (about 33 failed Astra
+calls a game through the proxy); these had none. Samples are small: Opus is clearly beaten, Astra is about even.
