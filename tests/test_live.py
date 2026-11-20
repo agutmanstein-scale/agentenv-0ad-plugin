@@ -3,6 +3,7 @@ recorder's commands (display, Chrome, ffmpeg with RTMP only behind its flag)."""
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -499,6 +500,7 @@ class FakeProc:
         *,
         xvfb_fails: bool = False,
         ffmpeg_fails: bool = False,
+        focused: str = "pyrogenesis",
     ):
         self.argv, self.events, self.tmp = argv, events, tmp
         self.name = Path(argv[0]).name
@@ -507,6 +509,7 @@ class FakeProc:
         self.stdin = self
         self.stderr = self._lines()
         self.got_q = False
+        self.focused = focused
         if self.name == "xdotool" or (self.name == "ffmpeg" and ffmpeg_fails):
             self._exit(0 if self.name == "xdotool" else 1)
         elif self.name == "Xvfb":
@@ -518,6 +521,10 @@ class FakeProc:
     def _exit(self, code: int) -> None:
         self.returncode = code
         self._done.set()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        out = f"{self.focused}\n".encode() if "getwindowfocus" in self.argv else b""
+        return out, b""
 
     async def _lines(self):
         yield b"ffmpeg: frame=1\n"
@@ -550,7 +557,7 @@ class FakeProc:
 def fake_processes(tmp_path, monkeypatch):
     events: list[str] = []
     procs: list[FakeProc] = []
-    options = {"xvfb_fails": False, "ffmpeg_fails": False}
+    options = {"xvfb_fails": False, "ffmpeg_fails": False, "focused": "pyrogenesis"}
     (tmp_path / "x11").mkdir()
     monkeypatch.setattr(live, "X11_DIR", tmp_path / "x11")
     monkeypatch.setattr(live.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -649,3 +656,49 @@ async def test_attach_game_moves_and_focuses_the_new_window(tmp_path, fake_proce
     await b.open_display()
     await b.attach_game()
     assert events == ["xdotool search --sync --class pyrogenesis", "xdotool search --class pyrogenesis windowfocus"]
+
+
+REFOCUS = "xdotool search --class pyrogenesis windowfocus"
+
+
+async def test_the_broadcast_refocuses_the_game_when_another_window_holds_the_focus(tmp_path, fake_processes, caplog):
+    events, _, options, _ = fake_processes
+    options["focused"] = "Google-chrome"
+    b = live.Broadcast(BroadcastSettings(), tmp_path / "out", overlay_draw_s=0, ffmpeg_check_s=0, focus_check_s=0)
+    await b.open_display()
+    with caplog.at_level(logging.INFO, logger=live.log.name):
+        await b.start("http://127.0.0.1:18765/live?stream")
+        for _ in range(10):
+            await asyncio.sleep(0)
+        await b.stop()
+    assert events.count(REFOCUS) >= 2
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "Google-chrome" in warnings[0].getMessage()
+
+
+async def test_the_focus_keeper_leaves_a_focused_game_alone(tmp_path, fake_processes, caplog):
+    events, _, _, _ = fake_processes
+    b = live.Broadcast(BroadcastSettings(), tmp_path / "out", overlay_draw_s=0, ffmpeg_check_s=0, focus_check_s=0)
+    await b.open_display()
+    with caplog.at_level(logging.INFO, logger=live.log.name):
+        await b.start("http://127.0.0.1:18765/live?stream")
+        for _ in range(10):
+            await asyncio.sleep(0)
+        await b.stop()
+    assert events.count(REFOCUS) == 1
+    infos = [r for r in caplog.records if r.getMessage() == "the game's window has the X focus"]
+    assert len(infos) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_stop_ends_the_focus_keeper(tmp_path, fake_processes):
+    events, _, _, _ = fake_processes
+    b = live.Broadcast(BroadcastSettings(), tmp_path / "out", overlay_draw_s=0, ffmpeg_check_s=0, focus_check_s=0)
+    await b.open_display()
+    await b.start("http://127.0.0.1:18765/live?stream")
+    await asyncio.sleep(0)
+    await b.stop()
+    seen = len(events)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert len(events) == seen

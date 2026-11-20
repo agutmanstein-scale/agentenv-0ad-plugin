@@ -358,6 +358,11 @@ class BroadcastSettings:
         )
 
 
+def window_focus_check_command() -> list[str]:
+    """Prints the class of the window that holds the X input focus."""
+    return ["xdotool", "getwindowfocus", "getwindowclassname"]
+
+
 class Broadcast:
     """The X display, the overlay window and the recorder of one rendered match.
 
@@ -372,8 +377,10 @@ class Broadcast:
         *,
         overlay_draw_s: float = 3.0,
         ffmpeg_check_s: float = 2.0,
+        focus_check_s: float = 2.0,
     ):
         self.settings = settings
+        self.focus_check_s = focus_check_s
         self.overlay_draw_s = overlay_draw_s
         self.ffmpeg_check_s = ffmpeg_check_s
         self.opened_at: float | None = None
@@ -386,6 +393,7 @@ class Broadcast:
         self._ffmpeg: asyncio.subprocess.Process | None = None
         self._profile: Path | None = None
         self._log_task: asyncio.Task[None] | None = None
+        self._focus_task: asyncio.Task[None] | None = None
 
     async def open_display(self) -> str:
         self.opened_at = time.time()
@@ -446,6 +454,7 @@ class Broadcast:
         await asyncio.sleep(self.ffmpeg_check_s)
         if self._ffmpeg.returncode is not None:
             raise RuntimeError(f"ffmpeg exited with {self._ffmpeg.returncode} at start; see {self.log_path}")
+        self._focus_task = asyncio.create_task(self._keep_focus())
         rtmp = " and streaming over RTMP" if s.rtmp_url else ""
         log.info("recording %s %s to 1920x1080, %d fps (%s)%s", self.display, s.layout.frame, s.fps, s.encoder, rtmp)
 
@@ -455,6 +464,46 @@ class Broadcast:
         env = {**os.environ, "DISPLAY": self.display}
         await self._xdotool(window_move_command(self.settings.layout.game), env, "move the game's window", sync=True)
         await self._xdotool(window_focus_command(), env, "focus the game's window")
+
+    async def _keep_focus(self) -> None:
+        """Keep the X focus on the game: 0.28 stops updating the camera while its window lacks it, and a Chrome that
+        maps its window late takes it (no window manager runs)."""
+        assert self.display is not None
+        env = {**os.environ, "DISPLAY": self.display}
+        lost = False
+        announced = False
+        while True:
+            await asyncio.sleep(self.focus_check_s)
+            try:
+                if shutil.which("xdotool") is None:
+                    return
+                focused = await self._focused_class(env)
+                if focused is not None and focused.strip().lower() == GAME_WINDOW_CLASS:
+                    if lost or not announced:
+                        log.info("the game's window has the X focus")
+                    lost, announced = False, True
+                    continue
+                await self._xdotool(window_focus_command(), env, "focus the game's window")
+                if not lost:
+                    log.warning(
+                        "the game's window had lost the X focus to %s; focused it again",
+                        (focused or "").strip() or "nothing",
+                    )
+                lost = True
+            except Exception:
+                log.warning("the focus check failed", exc_info=True)
+
+    async def _focused_class(self, env: dict[str, str]) -> str | None:
+        """The focused window's class, or None when xdotool fails or finds none."""
+        proc = await asyncio.create_subprocess_exec(
+            *window_focus_check_command(), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), 5)
+        except TimeoutError:
+            proc.kill()
+            return None
+        return out.decode(errors="replace") if proc.returncode == 0 else None
 
     async def _xdotool(self, cmd: list[str], env: dict[str, str], what: str, *, sync: bool = False) -> None:
         if shutil.which("xdotool") is None:
@@ -488,6 +537,11 @@ class Broadcast:
 
     async def stop(self) -> Path | None:
         """Finish the recording and stop everything this broadcast started; the MP4's path, if one was written."""
+        focus, self._focus_task = self._focus_task, None
+        if focus is not None:
+            focus.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await focus
         ffmpeg, self._ffmpeg = self._ffmpeg, None
         if ffmpeg is not None and ffmpeg.returncode is None:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, AttributeError):
