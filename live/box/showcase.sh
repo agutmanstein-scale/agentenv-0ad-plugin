@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
-# showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] | status [LINES] | stop
+# showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay]
+#             [--continue STAMP] [--no-shutdown] | status [LINES] | stop
 # The showcase session on this box (bootstrapped with bootstrap.sh --showcase) in the transient unit zeroad-showcase
 # (showcase-run.sh), which survives an SSM disconnect. `start` refuses while a session runs, while vLLM or the showcase
 # image is missing, when the power-off deadline leaves less than H + 1 hours (live/extend-poweroff.sh moves it), and when
 # budget.sh says --budget would be passed by the box hours so far plus H at the box rate plus one frontier game's cap
-# (ZEROAD_MATCH_CAP_USD; the runner checks every later game itself). H is 6 unless given. `status` prints the unit, the game in play, the
-# session table, the spend, the power-off and the GPU memory. `stop` sends SIGTERM: the game in play is recorded as no
+# (ZEROAD_MATCH_CAP_USD; the runner checks every later game itself). H is 6 unless given. --continue STAMP starts the
+# table from the rows of the earlier session $STATE/showcase/STAMP; --no-shutdown keeps the box up at the end. `status` prints the unit, the game in play, the
+# session table and its last game (from session.json), the spend, the power-off and the GPU memory. `stop` sends SIGTERM: the game in play is recorded as no
 # result, the session uploads, and the box stays up (no power-off after a stop by hand).
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
 CMD=${1:-}; shift || true
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
+# session_summary FILE: how the session ended and one line per opponent, from the rows the runner saves.
+session_summary() {
+  jq -c '{ended, ended_why, games: (.rows | length), table: (.rows | group_by(.opponent) | map({opponent: .[0].opponent,
+    w: (map(select(.result == "win")) | length), l: (map(select(.result == "loss")) | length),
+    d: (map(select(.result == "draw")) | length), nr: (map(select(.result == "no_result")) | length)}))}' "$1" 2>/dev/null \
+    | cut -c1-3000 || echo "(none yet)"
+}
 DEADLINE_FILE=${ZEROAD_DEADLINE_FILE:-$ETC/deadline}
 VLLM=$(cat "$ETC/vllm.url" 2>/dev/null || true)  # showcase-bootstrap.sh writes it
 SHOW=$STATE/showcase
-USAGE="usage: showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] | status [LINES] | stop"
+USAGE="usage: showcase.sh start --budget USD [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] [--continue STAMP] [--no-shutdown] | status [LINES] | stop"
 case $CMD in
   start)
-    BUDGET= HOURS=6 MAX_GAMES= ROTATION= MODE=
+    BUDGET= HOURS=6 MAX_GAMES= ROTATION= MODE= CONTINUE= NO_SHUTDOWN=0
     while [ $# -gt 0 ]; do
       case $1 in
         --budget) BUDGET=${2:?--budget needs USD}; shift 2 ;;
@@ -25,6 +34,8 @@ case $CMD in
         --max-games) MAX_GAMES=${2:-}; shift 2 ;;
         --rotation) ROTATION=${2:-}; shift 2 ;;
         --mode) MODE=${2:-}; shift 2 ;;
+        --continue) CONTINUE=${2:-}; shift 2 ;;
+        --no-shutdown) NO_SHUTDOWN=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
       esac
     done
@@ -34,6 +45,9 @@ case $CMD in
     [ -z "$MAX_GAMES" ] || [[ $MAX_GAMES =~ ^[1-9][0-9]*$ ]] || die "--max-games needs a number"
     [ -z "$ROTATION" ] || [[ $ROTATION =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || die "--rotation needs a,b,c"
     [ -z "$MODE" ] || [[ $MODE =~ ^(live|replay)$ ]] || die "--mode is live or replay"
+    [ -z "$CONTINUE" ] || [[ $CONTINUE =~ ^[0-9]{8}-[0-9]{6}$ ]] || die "--continue needs a STAMP (YYYYMMDD-HHMMSS, UTC)"
+    [ -z "$CONTINUE" ] || [ "$DRY_RUN" = 1 ] || [ -f "$SHOW/$CONTINUE/session.json" ] \
+      || die "no earlier session $CONTINUE with a session.json in $SHOW"
     [ -n "${ZEROAD_BOX_USD_PER_HOUR:-}" ] || die "ZEROAD_BOX_USD_PER_HOUR is not set in $CONF: the box has no rate"
     [ "$(active zeroad-showcase)" != active ] || die "a session is running: showcase.sh status, or stop it first"
     if [ "$DRY_RUN" = 0 ]; then
@@ -77,12 +91,14 @@ case $CMD in
     [ -z "$MAX_GAMES" ] || args+=(--max-games "$MAX_GAMES")
     [ -z "$ROTATION" ] || args+=(--rotation "$ROTATION")
     [ -z "$MODE" ] || args+=(--mode "$MODE")
+    [ -z "$CONTINUE" ] || args+=(--continue "$SHOW/$CONTINUE")
+    [ "$NO_SHUTDOWN" = 0 ] || args+=(--no-shutdown)
     # TimeoutStopSec: a stop makes the container finish its game record, then the session uploads (video included).
     # KillMode=mixed: the stop's SIGTERM reaches the script alone, which stops the container itself.
     run systemd-run --unit zeroad-showcase --collect -p KillMode=mixed -p TimeoutStopSec=1800 \
       -p "After=network-online.target docker.service" -p "Wants=network-online.target docker.service" \
       -p "WorkingDirectory=$REPO" "$BOX_HOME/box/showcase-run.sh" "${args[@]}"
-    say "the box powers off when the session ends on its own; a stop by hand or a failed upload keeps it up"
+    say "the box powers off when a session that ran ends on its own; a stop by hand, a failed upload, a refusal before the first game or a crash keeps it up"
     say "started session $stamp; follow it with live/showcase.sh ID status"
     ;;
   status)
@@ -90,14 +106,15 @@ case $CMD in
     [[ $N =~ ^[0-9]+$ ]] || { echo "usage: showcase.sh status [LINES]" >&2; exit 2; }
     say "zeroad-showcase: $(active zeroad-showcase)"
     if [ "$DRY_RUN" = 1 ]; then
-      say "+ the newest session's state.json (the game in play) and session.json (the table); journalctl -u zeroad-showcase -n $N; budget.sh show; poweroff.sh status; nvidia-smi memory; vLLM health"
+      say "+ the newest session's session.json (the table and the last game); journalctl -u zeroad-showcase -n $N; budget.sh show; poweroff.sh status; nvidia-smi memory; vLLM health"
       exit 0
     fi
     session=$(ls -d "$SHOW"/[0-9]*-[0-9]* 2>/dev/null | sort | tail -1 || true)
     if [ -n "$session" ]; then
       echo "--- session ${session##*/}"
-      echo "--- game in play"; jq -c . "$session/state.json" 2>/dev/null | cut -c1-1500 || echo "(none yet)"
-      echo "--- session table"; jq -c . "$session/session.json" 2>/dev/null | cut -c1-3000 || echo "(none yet)"
+      echo "--- session table"; session_summary "$session/session.json"
+      echo "--- last game"; jq -c '.rows | last // "(none yet)"' "$session/session.json" 2>/dev/null | cut -c1-1500 || echo "(none yet)"
+      [ ! -f "$session/box.txt" ] || { echo "--- box"; cat "$session/box.txt"; }
     else
       echo "(no session yet)"
     fi

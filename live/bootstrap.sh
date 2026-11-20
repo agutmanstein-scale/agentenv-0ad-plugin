@@ -81,7 +81,7 @@ if [ "$CPU" = 1 ]; then
   exit 0
 fi
 if [ "$SHOWCASE" = 1 ]; then
-  ssm_box "$ID" 5400 showcase-bootstrap.sh "$payload_url" "$repo_url"
+  ssm_box "$ID" 7200 showcase-bootstrap.sh "$payload_url" "$repo_url"
   log "bootstrapped showcase box $ID at $rev"
   exit 0
 fi

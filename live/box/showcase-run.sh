@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # showcase-run.sh --budget USD --stamp YYYYMMDD-HHMMSS [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay]
-#                 [--no-shutdown]: the zeroad-showcase unit's process (box/showcase.sh starts it).
+#                 [--continue SESSION_DIR] [--no-shutdown]: the zeroad-showcase unit's process (box/showcase.sh starts it).
 # Runs the showcase session (python -m agentenv_zeroad.showcase run) in the zeroad-showcase container, on display :0 with
 # the GPU, the X socket and the box's relay, as docker-shim.sh gives them to the env container (host networking, so the
 # relay and vLLM are on the loopback). The LiteLLM key comes from SSM through with-model.sh and vLLM's from its root-only
@@ -9,7 +9,9 @@
 # When the run ends, however it ends, the folder and the relay's segments written at or after STAMP are copied to
 # s3://BUCKET/PREFIX/run/showcase-STAMP/ (segments under video/) with the box's instance profile. Then, unless
 # --no-shutdown, a stop by hand (SIGTERM: the container is stopped, which records the game in play as no result and
-# saves session.json) or a failed upload, it runs `shutdown -h now`, which stops the box (never terminates it).
+# saves session.json) or a failed upload, it runs `shutdown -h now`, which stops the box (never terminates it), but
+# only when the runner exited 0 (it ran and ended normally) and session.json holds a finished game: after a refusal
+# before the first game or a crash the box stays up (the deadline power-off bounds it) and box.txt says why.
 # The bucket's name is never printed.
 # shellcheck source=lib.sh
 source "${ZEROAD_LIVE_HOME:-/opt/zeroad-live}/box/lib.sh"
@@ -22,11 +24,12 @@ while [ $# -gt 0 ]; do
     --max-games) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "--max-games needs a number"; PASS+=("$1" "$2"); shift 2 ;;
     --rotation) [[ ${2:-} =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || die "--rotation needs a,b,c"; PASS+=("$1" "$2"); shift 2 ;;
     --mode) [[ ${2:-} =~ ^(live|replay)$ ]] || die "--mode is live or replay"; PASS+=("$1" "$2"); shift 2 ;;
+    --continue) [[ ${2:-} =~ ^$STATE/showcase/[0-9]{8}-[0-9]{6}$ ]] || die "--continue needs an earlier session folder under $STATE/showcase"; PASS+=("$1" "$2"); shift 2 ;;
     --no-shutdown) SHUTDOWN=0; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
-[ -n "$BUDGET" ] && [ -n "$STAMP" ] || die "usage: showcase-run.sh --budget USD --stamp YYYYMMDD-HHMMSS [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] [--no-shutdown]"
+[ -n "$BUDGET" ] && [ -n "$STAMP" ] || die "usage: showcase-run.sh --budget USD --stamp YYYYMMDD-HHMMSS [--hours H] [--max-games N] [--rotation a,b,c] [--mode live|replay] [--continue SESSION_DIR] [--no-shutdown]"
 : "${ZEROAD_BOX_USD_PER_HOUR:?the box has no rate: ZEROAD_BOX_USD_PER_HOUR is not set in $CONF}"
 ETC=${ZEROAD_PILOT_ETC:-/etc/zeroad-live}
 DEADLINE_FILE=${ZEROAD_DEADLINE_FILE:-$ETC/deadline}
@@ -121,7 +124,15 @@ if [ "$up" = 1 ]; then
   echo "ERROR: the upload failed: not shutting down, the box stays up with the session in $SESSION" >&2
   exit 1
 fi
-if [ "$STOPPED" = 1 ]; then say "stopped by hand: the box stays up"; exit 0; fi
-if [ "$SHUTDOWN" = 0 ]; then say "--no-shutdown: the box stays up"; exit "$rc"; fi
+# finished: the number of rows of session.json whose game is over (a refusal or a crash leaves none of its own)
+finished=0
+if [ "$DRY_RUN" = 0 ] && [ -f "$SESSION/session.json" ]; then
+  finished=$(jq '[.rows[] | select(.result != "pending")] | length' "$SESSION/session.json" 2>/dev/null || echo 0)
+fi
+stays() { say "$1: the box stays up (the power-off deadline still bounds it)"; [ "$DRY_RUN" = 1 ] || echo "$1" > "$SESSION/box.txt"; }
+if [ "$STOPPED" = 1 ]; then stays "stopped by hand"; exit 0; fi
+if [ "$SHUTDOWN" = 0 ]; then stays "--no-shutdown"; exit "$rc"; fi
+if [ "$rc" != 0 ]; then stays "the runner exited $rc (a refusal before the first game, or a crash)"; exit "$rc"; fi
+if [ "$DRY_RUN" = 0 ] && [ "${finished:-0}" -lt 1 ]; then stays "session.json holds no finished game"; exit 0; fi
 run shutdown -h now
 exit "$rc"

@@ -2725,6 +2725,7 @@ def test_showcase_bootstrap_dry_run_prints_the_plan(stubs):
     plan = out.stderr
     assert out.returncode == 0, plan
     assert "box/showcase-bootstrap.sh https://PRESIGNED-payload-url https://PRESIGNED-repo-url" in plan
+    assert "timeout 7200s" in plan  # the vLLM, engine and image builds take longer than 90 minutes on a slow day
     text = plan.replace("\\", "")
     for flag in (
         "--dtype bfloat16",
@@ -2928,8 +2929,9 @@ def uid1000_stubs(stubs):
     return log
 
 
-def showcase_box(stubs, *args: str, sleeps=False, stop_fails=0, rules=(), **extra):
-    """Run box/showcase-run.sh for real against stubs: docker, shutdown and aws (which holds the key rule)."""
+def showcase_box(stubs, *args: str, sleeps=False, stop_fails=0, rules=(), exit_code=0, finished=1, **extra):
+    """Run box/showcase-run.sh for real against stubs: docker, shutdown and aws (which holds the key rule). The
+    stub runner exits `exit_code` and leaves a session.json with `finished` finished rows (none: no file)."""
     tmp = stubs["tmp"]
     etc = tmp / "etc"
     etc.mkdir(exist_ok=True)
@@ -2942,10 +2944,19 @@ def showcase_box(stubs, *args: str, sleeps=False, stop_fails=0, rules=(), **extr
     for name in ("2026-11-19_11-59-59-000001.mp4", "2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"):
         (seg / name).write_text("x")
     wait = f"while [ ! -e {tmp}/stopped ]; do sleep 0.05; done; " if sleeps else ""
+    (tmp / "rows.json").write_text(
+        json.dumps({"rows": [{"result": "win"}] * (finished or 0) + [{"result": "pending"}]})
+    )
+    save = (
+        'out=; prev=; for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done; '
+        f'[ -z "$out" ] || cp {tmp}/rows.json "$out/session.json"; '
+        if finished is not None
+        else ""
+    )
     write_exe(
         stubs["bin"] / "docker",
         f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
-        f'case $1 in run) echo "key=$LITELLM_API_KEY" >> {tmp}/docker.env; {wait}exit 0 ;; '
+        f'case $1 in run) echo "key=$LITELLM_API_KEY" >> {tmp}/docker.env; {save}{wait}exit {exit_code} ;; '
         f"stop) n=$(cat {tmp}/stops 2>/dev/null || echo 0); echo $((n + 1)) > {tmp}/stops; "
         f"[ $n -ge {stop_fails} ] && touch {tmp}/stopped || exit 1 ;; esac\n",
     )
@@ -3100,6 +3111,7 @@ def test_showcase_fetch_reads_the_newest_session_without_video_unless_asked(stub
     [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
     assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
     assert sync[3].endswith("showcase-20261119-120000") and "video/*" in sync and "--exclude" in sync
+    assert "broadcast/recording*.mp4" in sync  # the recording is uploaded but not fetched unless asked
     assert "bucket-1" not in out.stdout + out.stderr
     stubs["log"].unlink()
     showcase(stubs, "fetch", "--with-video", "--yes", forbid_aws=False, **extra)
@@ -3170,7 +3182,7 @@ def test_showcase_start_loads_the_adapter_starts_the_stream_units_and_probes_the
     assert "--entrypoint sh" in docker and ': >> "$2"' in docker and f"-v {state}:{state}:ro" in docker
     perm = (box_stubs["tmp"] / "perm.log").read_text()
     assert "chgrp 1000" in perm and "install -d -o 1000 -g 1000 -m 755" in perm
-    assert "powers off when the session ends on its own" in out.stdout
+    assert "powers off when a session that ran ends on its own" in out.stdout
     assert not list((state / "showcase").glob(".preflight-*"))  # the probe folder is gone
 
 
@@ -3251,4 +3263,101 @@ def test_showcase_fetch_takes_a_stamp_and_says_so_when_there_is_no_session(stubs
     assert len([c for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "ls"]]) == 1  # only the first fetch listed
     [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
     assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
-    assert "the box powers off when the session ends on its own" in showcase(stubs, "start", "--hours", "1").stderr
+    assert (
+        "the box powers off when a session that ran ends on its own" in showcase(stubs, "start", "--hours", "1").stderr
+    )
+
+
+def shutdowns(stubs) -> list[dict]:
+    return [c for c in aws_calls(stubs) if c["argv"][0] == "shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("why", "kwargs", "returncode", "reason"),
+    [
+        ("a refusal before game 1", {"exit_code": 1, "finished": None}, 1, "a refusal before the first game"),
+        ("a crash after games", {"exit_code": 1, "finished": 2}, 1, "a refusal before the first game, or a crash"),
+        ("a clean exit with no finished game", {"exit_code": 0, "finished": 0}, 0, "holds no finished game"),
+    ],
+)
+def test_showcase_run_leaves_the_box_up_unless_a_session_ran_and_ended_normally(stubs, why, kwargs, returncode, reason):
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", **kwargs)
+    assert [c for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "cp"]]  # it uploaded all the same
+    assert not shutdowns(stubs), why
+    assert out.returncode == returncode, out.stderr
+    assert reason in out.stdout + out.stderr and "the box stays up" in out.stdout
+    session = stubs["tmp"] / "state" / "showcase" / "20261119-120000"
+    assert reason in (session / "box.txt").read_text()  # which `status` prints
+
+
+def test_showcase_run_shuts_down_after_a_finished_session_and_not_after_a_pending_one(stubs):
+    ran = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", finished=1)
+    assert ran.returncode == 0 and len(shutdowns(stubs)) == 1
+    stubs["log"].unlink()
+    showcase_box(stubs, "--budget", "60", "--stamp", "20261119-130000", finished=0)  # only a pending row
+    assert not shutdowns(stubs)
+
+
+def test_showcase_no_shutdown_and_continue_pass_through_every_script(stubs):
+    out = showcase(stubs, "start", "--hours", "1", "--continue", "20261119-100000", "--no-shutdown")
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "--continue 20261119-100000" in plan and "--no-shutdown" in plan  # laptop to box script
+    assert "--continue /" in plan and "/showcase/20261119-100000" in plan  # box script to the runner: the folder
+    bad = showcase(stubs, "start", "--continue", "last")
+    assert bad.returncode != 0 and "--continue needs a STAMP" in bad.stderr
+
+
+def test_showcase_run_passes_the_earlier_session_folder_to_the_container_and_refuses_other_paths(stubs):
+    state = stubs["tmp"] / "state"
+    earlier = state / "showcase" / "20261119-100000"
+    out = showcase_box(
+        stubs, "--budget", "60", "--stamp", "20261119-120000", "--continue", str(earlier), "--no-shutdown"
+    )
+    assert out.returncode == 0, out.stderr
+    docker = (stubs["tmp"] / "docker.log").read_text()
+    assert f"--continue {earlier}" in docker and "--no-shutdown" not in docker  # the shell's own flag stays here
+    assert not shutdowns(stubs)
+    other = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-130000", "--continue", "/etc")
+    assert other.returncode != 0 and "--continue needs an earlier session folder" in other.stderr
+
+
+def test_showcase_box_start_continue_needs_the_earlier_session_and_hands_over_its_folder(box_stubs):
+    missing = showcase_start_box(box_stubs, "--hours", "2", "--continue", "20261119-100000")
+    assert missing.returncode != 0 and "no earlier session 20261119-100000" in missing.stderr
+    earlier = box_stubs["tmp"] / "state" / "showcase" / "20261119-100000"
+    earlier.mkdir(parents=True)
+    (earlier / "session.json").write_text('{"rows": []}')
+    out = showcase_start_box(box_stubs, "--hours", "2", "--continue", "20261119-100000", "--no-shutdown")
+    assert out.returncode == 0, out.stderr
+    [run_call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert f"--continue {earlier}" in run_call and "--no-shutdown" in run_call
+
+
+def test_showcase_status_reads_session_json_for_the_table_and_the_last_game(box_stubs):
+    session = box_stubs["tmp"] / "state" / "showcase" / "20261119-100000"
+    session.mkdir(parents=True)
+    rows = [
+        {"index": 0, "opponent": "Opus", "result": "win", "game_id": "g0"},
+        {"index": 1, "opponent": "Astra", "result": "no_result", "game_id": "g1"},
+        {"index": 2, "opponent": "Opus", "result": "loss", "game_id": "g2"},
+    ]
+    (session / "session.json").write_text(json.dumps({"rows": rows, "ended": None, "ended_why": None}))
+    (session / "box.txt").write_text("stopped by hand")
+    out = run_box(box_stubs, "showcase.sh", "status", "5")
+    assert out.returncode == 0, out.stderr
+    assert '"games":3' in out.stdout and '{"opponent":"Opus","w":1,"l":1,"d":0,"nr":0}' in out.stdout
+    assert '{"opponent":"Astra","w":0,"l":0,"d":0,"nr":1}' in out.stdout
+    assert '"game_id":"g2"' in out.stdout.split("--- last game")[1]
+    assert "state.json" not in (BOX / "showcase.sh").read_text() and "stopped by hand" in out.stdout
+
+
+def test_the_logs_redaction_does_not_buffer_and_still_hides_the_stream_url():
+    assert "sed -u -E" in (BOX / "lib.sh").read_text()
+    out = subprocess.run(
+        ["bash", "-c", f"source {BOX}/lib.sh; echo 'push to rtmps://live.example/app/KEY ok' | redact"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "push to <rtmp url> ok"

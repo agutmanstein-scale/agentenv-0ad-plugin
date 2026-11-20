@@ -26,7 +26,7 @@ run() {
   if [ "$DRY_RUN" = 1 ]; then printf '+'; printf ' %q' "$@"; printf '\n'; else "$@"; fi
 }
 # The RTMP URL carries the stream key: every log line that could hold it goes through redact.
-redact() { sed -E 's#rtmps?://[^[:space:]"'"'"']+#<rtmp url>#g'; }
+redact() { sed -u -E 's#rtmps?://[^[:space:]"'"'"']+#<rtmp url>#g'; }
 active() { [ "$DRY_RUN" = 1 ] && { echo inactive; return; }; systemctl is-active "$1" 2>/dev/null || true; }
 # require_engine_image IMAGE [PATCH...]: die unless docker has IMAGE and its zeroad.patches label names every PATCH. The
 # rt engine is built by scripts/build-engine.sh rt (pilot-bootstrap.sh --train runs it); an older rt image built without
