@@ -21,6 +21,7 @@
   .detail { color: var(--gold); font-size: 14px; min-height: 1em; }
   .board { display: flex; flex-direction: column; gap: 4px; background: var(--panel); border: 1px solid var(--line);
            border-radius: 8px; padding: 8px 10px; }
+  .board:empty { display: none; }
   .board div { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
   .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
   .seat { background: var(--panel); border: 1px solid var(--line); border-left: 6px solid var(--c);
@@ -48,15 +49,31 @@
   body.compact .civ, body.compact .orders div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.compact .orders div:nth-child(n+3) { display: none; }
   body.compact .say { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .block { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+           display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+  .block:empty { display: none; }
+  .block h2 { margin: 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--gold); }
+  .block .line { display: flex; justify-content: space-between; gap: 8px; font-variant-numeric: tabular-nums; }
+  .block .big { font-weight: 700; font-size: 15px; }
+  .hold { color: var(--gold); font-variant-numeric: tabular-nums; font-size: 14px; }
+  .hold:empty { display: none; }
+  .replay { color: var(--gold); font-size: 13px; }
+  .replay:empty { display: none; }
 </style>
 </head>
 <body>
 <main>
-  <header><h1>0 A.D. Live Arena</h1><div><span class="clock" id="clock">--:--</span>
+  <header><h1 id="title">0 A.D. Live Arena</h1><div><span class="clock" id="clock">--:--</span>
     <span class="cap" id="cap"></span></div></header>
+  <div class="replay" id="replay"></div>
+  <div class="block" id="series"></div>
+  <div class="block" id="session"></div>
   <div class="detail" id="detail"></div>
   <div class="board" id="board"></div>
   <div id="seats" style="display:flex;flex-direction:column;gap:10px"></div>
+  <div class="block" id="intermission" style="display:none"></div>
+  <div class="hold" id="hold"></div>
+  <div class="block" id="backstory"></div>
 </main>
 <script>
 "use strict";
@@ -70,18 +87,48 @@ const clock = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Strin
 const res = r => r ? ["food", "wood", "stone", "metal"].map(k => `<div><span>${k}</span>${r[k]}</div>`).join("") : "";
 
 function thinking(seat, elapsed) {
+  if (last.replay) return "";  // a replay shows no live model call
   if (seat.kind !== "agent") return `<span class="think">${esc(seat.model)}</span>`;
   if (seat.thinking_s != null && seat.thinking_s + elapsed >= 1)
     return `<span class="think on">thinking… ${Math.floor(seat.thinking_s + elapsed)} s</span>`;
   return `<span class="think">${seat.last_call_s != null ? "answered in " + seat.last_call_s + " s" : "ready"}</span>`;
 }
 
+const sessionRows = table => (table || []).map(r =>
+  `<div class="line"><span>vs ${esc(r.opponent)}</span><b>${r.w}-${r.l}${r.d ? "-" + r.d + "D" : ""}${r.nr ? " · " + r.nr + " no result" : ""}</b></div>`).join("");
+
+const droppedLines = ss => ss ? (ss.dropped || []).map(t => `<div class="muted">${esc(t)}</div>`).join("") : "";
+
+// The showcase's blocks are drawn only when the state carries their keys; the env's overlay has none of them.
+function renderShowcase(elapsed) {
+  const s = last.series, ss = last.session, im = last.intermission;
+  // the series header names the show: the env's own title, "Live Arena", would call a replay live
+  document.getElementById("title").style.display = s ? "none" : "";
+  document.getElementById("replay").textContent = last.replay ? "replay · played " + last.replay.played_at : "";
+  document.getElementById("series").innerHTML = s
+    ? `<div class="line big"><span>${esc(s.policy)}</span><span>vs ${esc(s.opponent ?? "…")}</span></div>
+       <div class="line"><span>game ${s.game} · round ${s.round}</span><span>${im ? "" : esc(s.clock)}</span></div>` : "";
+  document.getElementById("session").innerHTML = ss
+    ? `<h2>Session</h2>${sessionRows(ss.table)}${ss.no_result_reason ? `<div class="muted">no result: ${esc(ss.no_result_reason)}</div>` : ""}${droppedLines(ss)}` : "";
+  document.getElementById("hold").textContent = last.hold && !im
+    ? `⏸ waiting on ${last.hold.name ?? "a seat"} · ${(last.hold.waited_s + elapsed).toFixed(1)} s` : "";
+  document.getElementById("backstory").innerHTML = last.backstory
+    ? last.backstory.map((l, i) => `<div class="${i ? "" : "big"}">${esc(l)}</div>`).join("") : "";
+  const card = document.getElementById("intermission");
+  card.style.display = im ? "" : "none";
+  card.innerHTML = im
+    ? `<h2>Between games</h2><div class="big">${esc(im.last.headline)}</div>
+       <div>next: ${esc(im.next)}</div>${sessionRows(im.table)}${droppedLines(ss)}` : "";
+  document.getElementById("seats").style.display = im ? "none" : "flex";
+}
+
 function render() {
   if (!last) return;
+  last.seats ??= []; last.scoreboard ??= [];  // no match between games: the showcase blocks still draw
   const elapsed = last.status === "playing" ? (performance.now() - fetchedAt) / 1000 : 0;
   document.body.classList.toggle("compact", last.seats.length > 2);
-  document.getElementById("clock").textContent = clock(last.game_ms + elapsed * 1000);
-  document.getElementById("cap").textContent = last.cap ? "/ " + last.cap : "";
+  document.getElementById("clock").textContent = last.intermission ? "" : clock((last.game_ms ?? 0) + elapsed * 1000);
+  document.getElementById("cap").textContent = last.cap && !last.intermission ? "/ " + last.cap : "";
   document.getElementById("detail").textContent = last.detail || (last.status === "starting" ? "Starting…" : "");
   document.getElementById("board").innerHTML = last.scoreboard.map((s, i) =>
     `<div><span><span class="swatch" style="background:${esc(s.color)}"></span>${i + 1}. ${esc(s.name)}</span><b>${s.score}</b></div>`).join("");
@@ -96,6 +143,7 @@ function render() {
       ${seat.recent.length ? `<div class="orders">${seat.recent.map(o => `<div class="${esc(o.status)}">${esc(o.at)} <b>${esc(o.who)}:</b> ${esc(o.line)}</div>`).join("")}</div>` : ""}
       ${seat.say ? `<div class="say">“${esc(seat.say.text)}”</div>` : ""}
     </section>`).join("");
+  renderShowcase(elapsed);
 }
 
 async function poll() {

@@ -1,0 +1,705 @@
+"""The showcase session: one game at a time under training's lockstep rules, until the hours, the games, the budget or
+the power-off say stop.
+
+`run_session` plays the rotation (Opus, Astra, Petra-3, ...) one game after another. Before each game it picks the
+next opponent that isn't dropped, a fresh held-out start no earlier panel or game used, and checks the stop rules, the
+box's budget and the power-off margin. The policy plays `local/policy-v<N>` (`mix.repin`), every other seat is as the
+13-3's panel built it. A game is classified (`results.classify`), added to `session.json`, and followed by an
+intermission with the finished engine left up but unstepped, so the last frame stays on screen.
+
+A game also ends as "no result" when a seat's calls fail `FAILURES_IN_A_ROW` times in a row. That is read from the
+seats' own `sampler_stats()` (the counters `classify` reads), once a second: `failed_calls` counts calls that raised,
+never a reply that came too late (the clock cancels that call and misses the decision), so slow replies never count.
+
+SIGTERM stops the game in play as no result ("stopped by hand"), saves `session.json` and returns, so the script that
+runs the session can upload and power the box off.
+
+Replay mode (`SessionOptions.mode == "replay"`, the fallback when a live render can't run) is `_ReplayRunner` in
+`replay_session.py`, a subclass of this runner that shares all of the above.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import re
+import secrets
+import signal
+import time
+from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+
+from agentenv_zeroad.engine import RunningEngine
+from agentenv_zeroad.live import Broadcast
+from agentenv_zeroad.llm import StrategistModel
+from agentenv_zeroad.showcase.overlay import OverlayServer, hold_of, showcase_state
+from agentenv_zeroad.showcase.replay import ReplayClock, ReplayHandle
+from agentenv_zeroad.showcase.results import FAILURES_IN_A_ROW, TIME_CAP_MINUTES, GameRow, Session, classify
+from agentenv_zeroad.showcase.specs import ShowcaseConfig, next_starts, used_seeds
+from agentenv_zeroad.train.config import PanelConfig, RunConfig
+from agentenv_zeroad.train.game import LockstepMatch, play_game
+from agentenv_zeroad.train.mix import repin
+from agentenv_zeroad.train.panels import UNSET_URL, game_at, position
+from agentenv_zeroad.train.spec import GameSpec, SeatSpec
+
+log = logging.getLogger(__name__)
+
+# What each frontier seat of the 13-3's games could spend: the box's ZEROAD_MATCH_CAP_USD (live/box/s2-run.sh exports
+# 9 unless set; run1-frontier.toml has no game_cap_usd), which the orchestrator gave build_model as cap_usd.
+FRONTIER_SEAT_CAP_USD = 9.0
+PLANNED_GAME_HOURS = 0.75
+ENGINE_FAILURES_IN_A_ROW = 3
+WATCH_EVERY_S = 1.0
+POLICY_FAILURES_IN_A_ROW = 2
+STOPPED_BY_HAND = "stopped by hand"
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)  # a Ctrl-C is a stop by hand too
+CRASHED = "the box or the runner failed"
+RUNNER_FAILED = "the runner failed"
+# The relay's API (mediamtx.yml: apiAddress, on the host network the session container shares): a path that has a
+# publisher answers 200 with "ready": true.
+RELAY_STATUS_URL = "http://127.0.0.1:9997/v3/paths/get/zeroad"
+RELAY_RESTART_TRIES = 10  # after a restart, the relay gets this many seconds to show the stream
+POLICY_DISPLAY = "Qwen3-8B + RL"
+SEAT_DISPLAY = {"opus": "Opus 5.5", "astra": "GPT-6 Astra"}  # a teacher's name on the board; others keep theirs
+HOW_TEXT = {"conquest": "conquest", "net_worth": f"ahead on net worth at {TIME_CAP_MINUTES}:00"}
+NON_RUN_CONFIGS = frozenset({"sequence.toml", "sft-panels.toml"})  # settings and a template, not run configs
+NO_FAILURES = {"policy": 0, "opponent": 0}
+OVERLAY_PORT = 18766
+
+ModelFor = Callable[[SeatSpec, str], StrategistModel]
+
+
+@dataclass(frozen=True)
+class SessionOptions:
+    """How a session runs. `rotation` names the opponents (a teacher of the panel, or `petra-<n>`); `policy_url` is the
+    box's vLLM and `teacher_url` the LiteLLM proxy the teachers are reached through."""
+
+    out: Path
+    rotation: tuple[str, ...]
+    hours: float = 6.0
+    max_games: int | None = None
+    mode: Literal["live", "replay"] = "live"
+    pace_s: float = 0.2
+    intermission_s: float = 120.0
+    min_poweroff_margin_s: float = 2700.0
+    seat_cap_usd: float = FRONTIER_SEAT_CAP_USD
+    policy_url: str = "http://127.0.0.1:8000"
+    teacher_url: str = UNSET_URL
+    continue_from: Path | None = None  # an earlier session's folder whose rows this session's table starts from
+    relay_status_url: str = RELAY_STATUS_URL
+
+
+@dataclass(frozen=True)
+class SessionDeps:
+    """What the session needs from the box; tests fake them. `budget_ok` is `budget.sh check`, `preflight` returns
+    the problems found (one check per model of the rotation but the dropped opponents' ids it is given, run before the
+    first game only), `check_game(opponent)` the problems of one later game's two seats by role (`policy`, `opponent`;
+    none if it is not given), `record_spend(what, usd)` books a game's spend estimate in the box ledger
+    `budget.sh check` reads."""
+
+    start_engine: Callable[[], Awaitable[RunningEngine]]
+    budget_ok: Callable[[float, float], Awaitable[bool]]
+    poweroff_left_s: Callable[[], float]
+    model_for: ModelFor
+    preflight: Callable[[Collection[str]], Awaitable[list[str]]]
+    record_spend: Callable[[str, float], None]
+    now: Callable[[], float]
+    sleep: Callable[[float], Awaitable[None]]
+    # replay mode only: `start_headless` is the engine a game is played on, `start_replay(commands)` shows a replay,
+    # and `replay_clock` makes the clock a replay's game time is read from (default: wall time at 1x).
+    start_headless: Callable[[], Awaitable[RunningEngine]] | None = None
+    start_replay: Callable[[Path], Awaitable[ReplayHandle]] | None = None
+    replay_clock: Callable[[], ReplayClock] | None = None
+    check_game: Callable[[str], Awaitable[dict[str, str]]] | None = None
+
+
+class _Stopped(Exception):
+    """SIGTERM arrived while the engine was starting or the game was being set up."""
+
+
+class _HeldEngine:
+    """The engine handle a match gets: `close()` does nothing, so the finished game's last frame stays up through the
+    intermission; the session closes the real engine afterwards."""
+
+    def __init__(self, running: RunningEngine):
+        self.engine = running.engine
+        self._running = running
+
+    async def close(self) -> None:
+        return None
+
+    async def copy_replay(self, dest: Path) -> Path | None:
+        return await self._running.copy_replay(dest)
+
+
+@dataclass
+class _Live:
+    """What the overlay shows right now."""
+
+    phase: str = "starting"
+    opponent: str = ""
+    match: LockstepMatch | None = None
+    intermission: dict[str, Any] | None = None
+    game_no: int = 1
+    round_no: int = 1
+    names: dict[str, str] = field(default_factory=dict)  # slot -> the seat's name on the board, for the hold line
+    watch: asyncio.Task[None] | None = field(default=None, repr=False)
+
+
+def display_name(opponent: str) -> str:
+    """The name on the board: `opus` is Opus, `petra-3` is Petra-3."""
+    return opponent.capitalize()
+
+
+def game_spec(
+    cfg: ShowcaseConfig, run_cfg: RunConfig, panel: PanelConfig, opts: SessionOptions, start: int, opponent: str
+) -> GameSpec:
+    """The policy's game at held-out index `start` against `opponent`: the 13-3's spec, with the policy on the adapter
+    version the config names, served by `opts.policy_url`."""
+    spec = game_at(run_cfg, panel, start, opponent, opts.teacher_url)
+    return repin(spec, cfg.adapter_version, opts.policy_url)
+
+
+def run_configs(rules_config: Path) -> list[Path]:
+    """The configs beside the rules config whose panels' seeds a showcase start must avoid: every `*.toml` there but
+    `NON_RUN_CONFIGS`. One that fails to load raises later, since a skipped config could let a seen start through."""
+    found = [p for p in sorted(rules_config.parent.glob("*.toml")) if p.name not in NON_RUN_CONFIGS]
+    if rules_config not in found:
+        raise ValueError(f"the rules config {rules_config.name} is not a run config beside it")
+    return found
+
+
+async def run_session(
+    opts: SessionOptions, cfg: ShowcaseConfig, deps: SessionDeps, broadcast: Broadcast | None
+) -> Session:
+    """Play the session and return it (also saved in `opts.out/session.json`)."""
+    if opts.mode == "replay":
+        from agentenv_zeroad.showcase.replay_session import _ReplayRunner
+
+        return await _ReplayRunner(opts, cfg, deps, broadcast).run()
+    return await _Runner(opts, cfg, deps, broadcast).run()
+
+
+class _Runner:
+    def __init__(
+        self, opts: SessionOptions, cfg: ShowcaseConfig, deps: SessionDeps, broadcast: Broadcast | None
+    ) -> None:
+        self.opts, self.cfg, self.deps, self.broadcast = opts, cfg, deps, broadcast
+        self.run_cfg = cfg.run_config()
+        self.panel = next(p for p in self.run_cfg.panels if p.name == cfg.panel)
+        self.names = tuple(display_name(o) for o in opts.rotation)
+        self.session = Session(opts.out / "session.json", rotation=self.names)
+        self.stop = asyncio.Event()
+        self.live = _Live()
+        self.broadcast_started = False
+        self.played = 0
+        self.engine_failures = 0
+        self.strict_done = False  # the first game's check of every rotation model has passed
+        self.unreachable: str | None = None  # why the game about to be claimed has no opponent to play
+        self.restarts = 0  # broadcast restarts
+        self.started_at = 0.0
+        self.tools: list[Any] = []
+        self.token = ""
+        self.running: RunningEngine | None = None
+        self.earlier: set[int] | None = None
+        self.pace_s: float | None = opts.pace_s  # the floor of a step's wall time; training's games have none
+
+    async def run(self) -> Session:
+        from agentenv_zeroad.server import tool_specs
+
+        for opponent in self.opts.rotation:
+            if not opponent.startswith("petra-") and opponent not in {t.name for t in self.panel.teachers}:
+                raise ValueError(f"the rotation names {opponent!r}, which is no teacher of panel {self.panel.name}")
+        self.tools = await tool_specs()
+        self.session.load()
+        self.session.rows = _settled(self.session.rows, CRASHED)
+        if self.opts.continue_from is not None:
+            self._carry(self.opts.continue_from)
+        self.session.ended = self.session.ended_why = None
+        self.started_at = self.deps.now()
+        loop = asyncio.get_running_loop()
+        handled: list[signal.Signals] = []
+        for sig in STOP_SIGNALS:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, self.stop.set)
+                handled.append(sig)
+        overlay = self._start_overlay()
+        try:
+            await self._run()
+        finally:
+            self.live.phase = "ended"
+            self.session.rows = _settled(self.session.rows, RUNNER_FAILED)
+            if self.session.ended is None:
+                self._end("crashed", RUNNER_FAILED)
+            self.session.save()
+            await self._shutdown(overlay, handled)
+        return self.session
+
+    def _carry(self, folder: Path) -> None:
+        """Start the table from an earlier session's rows (`--continue`): its pending game never finished, so it is a
+        no result of the box or the runner. The rows are marked with the folder they came from."""
+        earlier = Session(folder / "session.json")
+        if not earlier.path.is_file():
+            raise ValueError(f"cannot continue {folder.name}: it has no session.json")
+        earlier.load()
+        carried = [replace(r, carried_from=r.carried_from or folder.name) for r in _settled(earlier.rows, CRASHED)]
+        self.session.rows = carried + self.session.rows
+        log.info("continuing %s: %d games carried over", folder.name, len(carried))
+
+    def _start_overlay(self) -> OverlayServer | None:
+        if self.broadcast is None:
+            return None
+        self.token = secrets.token_urlsafe(24)
+        server = OverlayServer(self._state, self.token, port=OVERLAY_PORT)
+        server.start()
+        return server
+
+    async def _shutdown(self, overlay: OverlayServer | None, handled: list[signal.Signals]) -> None:
+        for sig in handled:
+            asyncio.get_running_loop().remove_signal_handler(sig)
+        if self.broadcast is not None and self.broadcast_started:
+            with contextlib.suppress(Exception):
+                await self.broadcast.stop()
+        if overlay is not None:
+            overlay.stop()
+
+    def _state(self) -> dict[str, Any]:
+        live = self.live
+        return showcase_state(
+            self.session,
+            live.match,
+            phase=live.phase,
+            opponent=live.opponent,
+            game_no=live.game_no,
+            round_no=live.round_no,
+            hold=hold_of(live.match, live.names) if live.match is not None else None,
+            mode=self.opts.mode,
+            played_at=None,
+            intermission=live.intermission,
+            dropped=sorted(self.session.dropped()),
+        )
+
+    def _end(self, code: str, why: str) -> None:
+        self.session.ended, self.session.ended_why = code, why
+        log.info("session ends: %s (%s)", code, why)
+
+    async def _run(self) -> None:
+        while True:
+            next_game = await self._next_game()
+            if next_game is None:
+                return
+            row = await self._game(*next_game)
+            if self.stop.is_set():
+                return self._end("stopped", STOPPED_BY_HAND)
+            if (verdict := self._verdict(row)) is not None:
+                return self._end(*verdict)
+
+    async def _next_game(self) -> tuple[int, str] | None:
+        """The held-out start and the opponent of the game to play next, or None once the reason the session ends is
+        recorded (no opponent left, a refusal, a failed preflight, no fresh start, or a stop)."""
+        opponent = self._next_opponent()
+        if opponent is None:
+            self._end("opponents", "every opponent in the rotation was dropped")
+            return None
+        if (refusal := await self._refusal(opponent)) is not None:
+            self._end(*refusal)
+            return None
+        strict_now = not self.strict_done
+        try:
+            problems = await self._until_stop(self.deps.preflight(self._dropped_ids())) if strict_now else []
+        except _Stopped:
+            self._end("stopped", STOPPED_BY_HAND)
+            return None
+        if problems:
+            self._end("preflight", "; ".join(problems))
+            return None
+        self.strict_done = True
+        try:
+            start = next_starts(self.run_cfg, self.cfg.first_index, self._used(), 1)[0]
+        except ValueError as e:
+            self._end("starts", str(e))
+            return None
+        try:
+            if not strict_now and not await self._seats_reachable(opponent):
+                return None
+            if not await self._until_stop(self._broadcast_healthy()):
+                self._end("broadcast", "the stream could not be kept up (ffmpeg, Chrome or the relay)")
+                return None
+        except _Stopped:
+            self._end("stopped", STOPPED_BY_HAND)
+            return None
+        return start, opponent
+
+    async def _seats_reachable(self, opponent: str) -> bool:
+        """Check the two seats of the game about to start (a later game: the first game's check covered them all).
+        False once the session ends because the policy is unreachable; an unreachable opponent is only noted, so its
+        game is recorded as a no result."""
+        self.unreachable = None
+        if self.deps.check_game is None:
+            return True
+        found = await self._until_stop(self.deps.check_game(opponent))
+        if "policy" in found:
+            self._end("policy", f"the policy's server is unreachable: {found['policy']}")
+            return False
+        if "opponent" in found:
+            self.unreachable = f"{display_name(opponent)} unreachable"
+            log.warning("%s: %s", display_name(opponent), found["opponent"])
+        return True
+
+    async def _broadcast_healthy(self) -> bool:
+        """At a game boundary of a live session: ffmpeg, Chrome and the relay's stream are all up, or the broadcast
+        was stopped and started once and they are now."""
+        broadcast = self.broadcast
+        if broadcast is None or not self.broadcast_started or self.opts.mode != "live":
+            return True
+        problems = await self._broadcast_problems(broadcast, 1)
+        if not problems:
+            return True
+        log.warning("the broadcast is unhealthy (%s): restarting it", ", ".join(problems))
+        if not await self._restart_broadcast(broadcast):
+            return False
+        problems = await self._broadcast_problems(broadcast, RELAY_RESTART_TRIES)
+        if problems:
+            log.error("the broadcast is still unhealthy after a restart (%s)", ", ".join(problems))
+        return not problems
+
+    async def _broadcast_problems(self, broadcast: Broadcast, relay_tries: int) -> list[str]:
+        problems = []
+        if not broadcast.recording:
+            problems.append("ffmpeg is not running")
+        if not broadcast.overlay_alive:
+            problems.append("Chrome is not running")
+        for k in range(relay_tries):
+            if await self._relay_ready():
+                break
+            if k + 1 < relay_tries:
+                await self.deps.sleep(1.0)
+        else:
+            problems.append("the relay has no stream")
+        return problems
+
+    async def _relay_ready(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as http:
+                response = await http.get(self.opts.relay_status_url)
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            return False
+        return response.status_code == 200 and isinstance(body, dict) and body.get("ready") is True
+
+    async def _restart_broadcast(self, broadcast: Broadcast) -> bool:
+        """Stop and start the broadcast once; the unfinished recording is kept as `recording-N.mp4`."""
+        self.restarts += 1
+        with contextlib.suppress(Exception):
+            await broadcast.stop()
+        self.broadcast_started = False
+        with contextlib.suppress(OSError):
+            if broadcast.record_path.exists():
+                broadcast.record_path.replace(broadcast.record_path.with_name(f"recording-{self.restarts}.mp4"))
+        try:
+            await self._show()
+        except Exception as e:  # noqa: BLE001 - a broadcast that cannot restart ends the session, not the run
+            log.error("the broadcast could not be restarted: %s", type(e).__name__)
+            return False
+        return True
+
+    def _verdict(self, row: GameRow) -> tuple[str, str] | None:
+        """The (code, why) the session ends with after this game's row, or None to play on."""
+        self.engine_failures = self.engine_failures + 1 if row.blame == "engine" else 0
+        if self.engine_failures >= ENGINE_FAILURES_IN_A_ROW:
+            return "engine", f"{self.engine_failures} games in a row failed on the engine"
+        recent = self.session.rows[-POLICY_FAILURES_IN_A_ROW:]
+        if len(recent) == POLICY_FAILURES_IN_A_ROW and all(r.blame == "policy" for r in recent):
+            return "policy", f"{POLICY_FAILURES_IN_A_ROW} games in a row failed on the policy's calls"
+        return None
+
+    def _used(self) -> set[int]:
+        if self.earlier is None:
+            siblings = sorted(self.opts.out.parent.glob("*/session.json"))
+            self.earlier = used_seeds(run_configs(self.cfg.rules_config), siblings)
+        return self.earlier | self.session.seeds() | self._started_here()
+
+    def _started_here(self) -> set[int]:
+        """The seeds of the starts whose game folder exists in this session's folder, whatever became of the game."""
+        found = set()
+        for folder in (self.opts.out / "games").glob(f"{self.panel.name}-*"):
+            if match := re.match(rf"{re.escape(self.panel.name)}-(\d+)-", folder.name):
+                found.add(position(self.run_cfg, "held_out", int(match.group(1))).seed)
+        return found
+
+    def _dropped_ids(self) -> set[str]:
+        dropped = self.session.dropped()
+        return {o for o, name in zip(self.opts.rotation, self.names, strict=True) if name in dropped}
+
+    def _next_opponent(self, after: str | None = None, session: Session | None = None) -> str | None:
+        """The rotation's opponent after the last game's (or after `after`'s), skipping the opponents `session`
+        (default: this one) has dropped (as the rotation's id, not its name)."""
+        session = session or self.session
+        names, dropped = self.names, session.dropped()
+        last = after if after is not None else session.rows[-1].opponent if session.rows else None
+        first = (names.index(last) + 1) % len(names) if last in names else 0
+        for k in range(len(names)):
+            i = (first + k) % len(names)
+            if names[i] not in dropped:
+                return self.opts.rotation[i]
+        return None
+
+    async def _refusal(self, opponent: str) -> tuple[str, str] | None:
+        opts = self.opts
+        if self.stop.is_set():
+            return "stopped", STOPPED_BY_HAND
+        if opts.max_games is not None and self.played >= opts.max_games:
+            return "max_games", f"{self.played} games played"
+        if self.deps.now() - self.started_at >= opts.hours * 3600:
+            return "hours", f"{opts.hours:g} hours passed"
+        left, margin_s, hours = self.deps.poweroff_left_s(), self._margin_s(), self._planned_hours()
+        if left < margin_s:
+            return "poweroff", f"{left / 60:.0f} min to the power-off, a game needs {margin_s / 60:.0f}"
+        planned = 0.0 if opponent.startswith("petra-") else opts.seat_cap_usd
+        if not await self.deps.budget_ok(planned, hours):
+            return "budget", f"the budget guard refused a game of ${planned:g} and {hours:g} h"
+        return None
+
+    def _margin_s(self) -> float:
+        """The time the power-off must still be away for a game to start."""
+        return self.opts.min_poweroff_margin_s
+
+    def _planned_hours(self) -> float:
+        """The box hours the budget check plans for the game about to start."""
+        return PLANNED_GAME_HOURS
+
+    def _claim(self, start: int, opponent: str) -> tuple[GameSpec, GameRow]:
+        """The game's spec and its pending row, which is added and saved before anything starts: a crash leaves it, so
+        the start isn't replayed."""
+        spec = game_spec(self.cfg, self.run_cfg, self.panel, self.opts, start, opponent)
+        name = display_name(opponent)
+        slot = str(next(n for n, seat in enumerate(spec.seats, 1) if seat.trainable))
+        rows = len(self.session.rows)
+        self.live = _Live("starting", name, None, None, rows + 1, rows // len(self.names) + 1)
+        self.live.names = {
+            str(n): POLICY_DISPLAY if seat.trainable else SEAT_DISPLAY.get(seat.name or "", name)
+            for n, seat in enumerate(spec.seats, 1)
+            if seat.kind == "llm"
+        }
+        pending = GameRow(
+            index=self.session.next_index(),
+            game_id=spec.game_id,
+            opponent=name,
+            seed=spec.seed,
+            policy_slot=slot,
+            result="pending",
+            how=None,
+            reason=None,
+            failed=dict(NO_FAILURES),
+            decisions=dict(NO_FAILURES),
+            played_at=time.time(),
+        )
+        self.session.add(pending)
+        self.session.save()
+        self.running = None
+        return spec, pending
+
+    def _conclude(self, spec: GameSpec, pending: GameRow, results: dict[str, Any]) -> GameRow:
+        """Classify the finished game into its row, save it, count it and book its spend."""
+        row = classify(results, index=pending.index, opponent=pending.opponent, policy_slot=pending.policy_slot)
+        if self.stop.is_set():
+            row = replace(row, result="no_result", how=None, reason=STOPPED_BY_HAND, blame=None)
+        self.session.rows[-1] = row
+        self.session.save()
+        self.played += 1
+        self._book(spec, results)
+        return row
+
+    async def _release(self, spec: GameSpec, booked: bool) -> None:
+        """Book a game that never got to (at its caps), and close its engine."""
+        if not booked:
+            self._book(spec, None)
+        if self.running is not None:
+            with contextlib.suppress(Exception):
+                await self.running.close()
+
+    async def _game(self, start: int, opponent: str) -> GameRow:
+        spec, pending = self._claim(start, opponent)
+        booked = False
+        try:
+            results = await self._run_game(spec)
+            row = self._conclude(spec, pending, results)
+            booked = True
+            if not self.stop.is_set():
+                await self._intermission(row)
+        finally:
+            await self._release(spec, booked)
+        return row
+
+    async def _open_engine(self) -> None:
+        """Start the engine the game is played on (kept in `self.running`) and put it on screen."""
+        self.running = await self._until_stop(self.deps.start_engine())
+        await self._until_stop(self._show(self.running))
+
+    async def _run_game(self, spec: GameSpec) -> dict[str, Any]:
+        """The game's results; a failure (or a stop before the match began) is a failed game's results. A game whose
+        opponent was found unreachable is not played: its results say so, and that it spent nothing."""
+        if self.unreachable is not None:
+            reason, self.unreachable = self.unreachable, None
+            return {
+                "status": "failed",
+                "ended_by": "failed",
+                "spec": spec.to_json(),
+                "spend_usd_est": 0.0,
+                "showcase": {"unreachable": reason},
+            }
+        try:
+            await self._open_engine()
+            assert self.running is not None
+            return await self._play(spec, self.running)
+        except _Stopped:
+            failure = "stopped"
+        except Exception as e:  # noqa: BLE001 - one game's failure is its no result, not the session's end
+            log.error("game %s failed: %s", spec.game_id, type(e).__name__)
+            failure = type(e).__name__
+        return {"status": "failed", "ended_by": "failed", "detail": f"{failure}: ", "spec": spec.to_json()}
+
+    async def _until_stop(self, work: Awaitable[Any]) -> Any:
+        """`work`'s result, or `_Stopped` (with `work` cancelled) if SIGTERM comes first."""
+        task = asyncio.ensure_future(work)
+        stopper = asyncio.ensure_future(self.stop.wait())
+        try:
+            await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                return task.result()
+            raise _Stopped
+        finally:
+            stopper.cancel()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _book(self, spec: GameSpec, results: dict[str, Any] | None) -> None:
+        """The game's spend into the box ledger: its estimate from the results, or the caps of its frontier seats when
+        there are none (the game failed, or was interrupted), as run-match.sh books a match it can't read."""
+        usd = (results or {}).get("spend_usd_est")
+        if usd is None:
+            usd = self.opts.seat_cap_usd * sum(1 for s in spec.seats if s.kind == "llm" and not s.trainable)
+        self.deps.record_spend(spec.game_id, float(usd))
+
+    async def _show(self, running: RunningEngine | None = None) -> None:
+        if self.broadcast is None:
+            return
+        if self.broadcast_started:
+            await self.broadcast.attach_game()
+            return
+        await self.broadcast.open_display()
+        self.broadcast_started = True  # so a stop or a failure part-way still stops Chrome and ffmpeg
+        try:
+            await self.broadcast.start(f"http://127.0.0.1:{OVERLAY_PORT}/live?stream&token={self.token}")
+        except BaseException:
+            self.broadcast_started = False
+            with contextlib.suppress(Exception):
+                await self.broadcast.stop()
+            raise
+
+    async def _play(self, spec: GameSpec, running: RunningEngine) -> dict[str, Any]:
+        game = asyncio.create_task(
+            play_game(
+                spec,
+                _HeldEngine(running),
+                self.opts.out / "games" / spec.game_id,
+                tools=self.tools,
+                model_for=self.deps.model_for,
+                pace_s=self.pace_s,
+                on_match=self._on_match,
+            )
+        )
+        stopper = asyncio.create_task(self.stop.wait())
+        try:
+            await asyncio.wait({game, stopper}, return_when=asyncio.FIRST_COMPLETED)
+            if not game.done():
+                await self._stop_match(game)
+            try:
+                return await game
+            except asyncio.CancelledError:
+                if self.stop.is_set() and game.cancelled():
+                    raise _Stopped from None
+                raise
+        finally:
+            for task in (stopper, self.live.watch):
+                if task is not None:
+                    task.cancel()
+            game.cancel()
+
+    def _on_match(self, match: LockstepMatch) -> None:
+        self.live.match, self.live.phase = match, "playing"
+        self.live.watch = asyncio.create_task(self._watch_failures(match))
+
+    async def _stop_match(self, game: asyncio.Task[dict[str, Any]]) -> None:
+        if self.live.match is None:
+            game.cancel()  # still setting up: play_game stops its match and re-raises
+            await asyncio.gather(game, return_exceptions=True)
+        else:
+            await self.live.match.stop(STOPPED_BY_HAND)
+
+    async def _watch_failures(self, match: LockstepMatch) -> None:
+        """Stop the game as no result once a seat's last FAILURES_IN_A_ROW calls all failed."""
+        seen = {slot: model.sampler_stats() for slot, model in match.models.items()}
+        streak = dict.fromkeys(match.models, 0)
+        while not match.over:
+            await self.deps.sleep(WATCH_EVERY_S)
+            for slot, model in match.models.items():
+                now = model.sampler_stats()
+                answered = now["calls"] - seen[slot]["calls"]
+                failed = now["failed_calls"] - seen[slot]["failed_calls"]
+                seen[slot] = now
+                # within one second a seat finishes at most one call; if both counters moved, count the worst order
+                streak[slot] = failed if answered else streak[slot] + failed
+                if streak[slot] >= FAILURES_IN_A_ROW:
+                    match.extra["showcase"] = {"ended_early": {"slot": slot, "failures": FAILURES_IN_A_ROW}}
+                    await match.stop("ended early")
+                    return
+
+    def _card(self, row: GameRow, upcoming: str, table: list[dict[str, Any]]) -> dict[str, Any]:
+        """The intermission card: the game just finished, what comes next, and the table."""
+        won, lost = {"win": ("Qwen", row.opponent), "loss": (row.opponent, "Qwen")}.get(row.result, (None, None))
+        return {
+            "last": {
+                "winner": won,
+                "loser": lost,
+                "how": HOW_TEXT.get(row.how or "", row.how),
+                "result": row.result if row.result in ("draw", "no_result") else "win",
+                "reason": row.reason,
+            },
+            "next": upcoming,
+            "table": table,
+        }
+
+    async def _wait_intermission(self) -> None:
+        sleeper = asyncio.create_task(self.deps.sleep(self.opts.intermission_s))
+        stopper = asyncio.create_task(self.stop.wait())
+        try:
+            await asyncio.wait({sleeper, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sleeper.cancel()
+            stopper.cancel()
+
+    async def _intermission(self, row: GameRow) -> None:
+        final = self.opts.hours * 3600 <= self.deps.now() - self.started_at or (
+            self.opts.max_games is not None and self.played >= self.opts.max_games
+        )
+        upcoming = self._next_opponent()
+        self.live.match, self.live.phase = None, "intermission"
+        self.live.intermission = self._card(
+            row, "end of session" if final or upcoming is None else display_name(upcoming), self.session.table()
+        )
+        try:
+            await self._wait_intermission()
+        finally:
+            self.live.intermission = None
+
+
+def _settled(rows: list[GameRow], reason: str) -> list[GameRow]:
+    """The rows with each pending one made a no result of the engine's: its game never finished."""
+    return [replace(r, result="no_result", reason=reason, blame="engine") if r.result == "pending" else r for r in rows]

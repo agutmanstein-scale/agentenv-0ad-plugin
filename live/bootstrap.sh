@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap.sh ID [--images build|pull] [--pilot|--train|--actor|--cpu] [--yes|--dry-run]
+# bootstrap.sh ID [--images build|pull] [--pilot|--train|--actor|--cpu|--showcase] [--yes|--dry-run]
 # Makes box ID a stream box: ships this checkout's HEAD (`git archive`; uncommitted changes don't go) and live/box
 # with the box config from live.env through S3 (presigned, so the box needs no S3 rights), then runs box/bootstrap.sh
 # through SSM: the GPU and driver check, Docker's address pools, Xorg on the L4, ffmpeg, mediamtx, uv, the images
@@ -12,7 +12,10 @@
 # trainer image, the same power-off check; live/actor.sh runs it, docs/s4-actors.md). With --cpu
 # it makes a CPU box on a plain Ubuntu 24.04 AMI (the S1 tool check, live/s1.sh; box/cpu-bootstrap.sh): no GPU or
 # driver check, no Xorg, ffmpeg, mediamtx or vLLM; Docker, uv, the zeroad-engine image (--images build, about 10 min,
-# or pull zeroad-engine:TAG from LIVE_IMAGE_REGISTRY), the repo and the box-time timer. A dry run unless --yes.
+# or pull zeroad-engine:TAG from LIVE_IMAGE_REGISTRY), the repo and the box-time timer. With --showcase it makes the
+# showcase box (a g6e.2xlarge with one 48 GB L40S, LIVE_ENV=live/showcase.env; box/showcase-bootstrap.sh): the stream
+# setup, the show engine and the showcase image, one vLLM with Run 1's v50 adapter copied from S3 and checked, a
+# strategist call and the paced-engine test. The bucket's name is never printed. A dry run unless --yes.
 # shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
 parse_mode change "$@"
@@ -20,7 +23,7 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 ID=${1:-}; shift || true
 check_instance_id "$ID"
 IMAGES=${LIVE_IMAGES:-build}
-PILOT=0 TRAIN=0 ACTOR=0 CPU=0
+PILOT=0 TRAIN=0 ACTOR=0 CPU=0 SHOWCASE=0
 while [ $# -gt 0 ]; do
   case $1 in
     --images) IMAGES=${2:?--images needs build or pull}; shift 2 ;;
@@ -28,11 +31,14 @@ while [ $# -gt 0 ]; do
     --train) PILOT=1 TRAIN=1; shift ;;
     --actor) PILOT=1 ACTOR=1; shift ;;
     --cpu) CPU=1; shift ;;
+    --showcase) SHOWCASE=1; shift ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
 [ "$CPU" = 0 ] || [ "$PILOT" = 0 ] || die "--cpu is not combined with --pilot, --train or --actor"
 [ "$ACTOR" = 0 ] || [ "$TRAIN" = 0 ] || die "--actor and --train are different boxes"
+[ "$SHOWCASE" = 0 ] || [ "$PILOT$CPU" = 00 ] || die "--showcase is not combined with --pilot, --train, --actor or --cpu"
+[ "$SHOWCASE" = 0 ] || export LIVE_REDACT_BUCKET=1 BOX_CONF_S3=1
 case $IMAGES in
   build) IMAGE_ARGS=(--images build) ;;
   pull)
@@ -72,6 +78,11 @@ wait_ssm "$ID"
 if [ "$CPU" = 1 ]; then
   ssm_box "$ID" 5400 cpu-bootstrap.sh "$payload_url" "$repo_url" "${IMAGE_ARGS[@]}"
   log "bootstrapped CPU box $ID at $rev. Next: live/s1.sh $ID start --yes"
+  exit 0
+fi
+if [ "$SHOWCASE" = 1 ]; then
+  ssm_box "$ID" 7200 showcase-bootstrap.sh "$payload_url" "$repo_url"
+  log "bootstrapped showcase box $ID at $rev"
   exit 0
 fi
 if [ "$PILOT" = 1 ]; then

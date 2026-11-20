@@ -7,6 +7,7 @@ import pytest
 
 from agentenv_zeroad.clock import LockstepClock
 from agentenv_zeroad.engine import TURN_MS, FakeEngine
+from tests.virtual_time import run_virtual
 
 pytestmark = pytest.mark.anyio
 
@@ -217,3 +218,164 @@ async def test_a_failed_step_puts_its_commands_back_and_logs_nothing():
     with pytest.raises(RuntimeError):
         await clock.step_once()
     assert clock.pending(1) == 1 and clock.commands == [] and clock.steps == 0
+
+
+class TimedSeat:
+    """A seat whose k-th decision answers after `delays[k]` loop-time seconds (the last delay repeats) and records the
+    game time each `begin` saw."""
+
+    def __init__(self, slot, delays):
+        self.slot, self.delays = slot, list(delays)
+        self.begun, self.count = [], 0
+        self.clock = None
+
+    async def begin(self, game_ms):
+        self.begun.append(game_ms)
+        delay = self.delays[min(self.count, len(self.delays) - 1)]
+        self.count += 1
+        return TimedDecision(self, delay, self.count)
+
+
+class TimedDecision:
+    def __init__(self, seat, delay, number):
+        self.seat, self.delay, self.number = seat, delay, number
+
+    async def answer(self):
+        await asyncio.sleep(self.delay)
+
+    async def apply(self):
+        self.seat.clock.queue(int(self.seat.slot), {"type": "order", "seat": self.seat.slot, "n": self.number})
+
+    async def miss(self, reason):
+        pass
+
+
+def virtual_clock(loop, *, pace_s=None, seats=(), step_starts=None):
+    """A LockstepClock on `loop`'s virtual time over an instant engine; `step_starts` collects each step's start."""
+    fake = FakeEngine()
+    clock = LockstepClock(fake, observe=_true, act=_nothing, done=lambda: False, brains=list(seats), pace_s=pace_s)
+    clock._now = loop.time
+    for seat in seats:
+        seat.clock = clock
+    if step_starts is not None:
+        real_step = clock.step_once
+
+        async def recording():
+            step_starts.append(loop.time())
+            return await real_step()
+
+        clock.step_once = recording
+    return clock
+
+
+async def _true():
+    return True
+
+
+async def _nothing():
+    pass
+
+
+def test_paced_clock_steps_no_faster_than_pace():
+    starts = []
+
+    async def scenario(loop):
+        clock = virtual_clock(loop, pace_s=0.2, step_starts=starts)
+        await clock.run(max_steps=50)
+        return loop.time()
+
+    elapsed = run_virtual(scenario)
+    assert elapsed >= 9.8 - 1e-9
+    assert len(starts) == 50
+    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(starts, starts[1:], strict=False))
+
+
+def test_unpaced_clock_never_sleeps_for_pace():
+    async def scenario(loop):
+        clock = virtual_clock(loop, seats=[TimedSeat("1", [0.0])])
+        await clock.run(max_steps=50)
+        return loop.time(), clock.metrics()
+
+    elapsed, metrics = run_virtual(scenario)
+    assert elapsed == 0
+    assert metrics["paced_wait_s"] == 0 and metrics["pace_s"] is None
+
+
+def test_paced_clock_does_not_burst_after_hold():
+    starts = []
+
+    async def scenario(loop):
+        seat = TimedSeat("1", [8.0, 0.0])  # paced game time reaches the 5 s deadline at 4.8 s, so the block lasts 3.2 s
+        clock = virtual_clock(loop, pace_s=0.2, seats=[seat], step_starts=starts)
+        await clock.run(max_steps=60)
+        return clock
+
+    clock = run_virtual(scenario)
+    held = max(range(1, len(starts)), key=lambda i: starts[i] - starts[i - 1])
+    assert starts[held] - starts[held - 1] >= 2.5
+    after = starts[held : held + 11]
+    assert len(after) == 11
+    assert all(b - a >= 0.2 - 1e-9 for a, b in zip(after, after[1:], strict=False))
+    assert clock.metrics()["paced_wait_s"] > 0
+
+
+def test_holding_names_the_slot_during_a_block_and_clears_after():
+    samples = []
+
+    async def scenario(loop):
+        seat = TimedSeat("1", [8.0])
+        clock = virtual_clock(loop, pace_s=0.2, seats=[seat])
+        task = asyncio.create_task(clock.run(max_steps=30))
+        while not task.done():
+            samples.append((loop.time(), clock.holding))
+            await asyncio.sleep(0.5)
+        return clock
+
+    clock = run_virtual(scenario)
+    held = [(t, h) for t, h in samples if h is not None]
+    assert held, "the clock never reported a hold"
+    assert all(h["slot"] == "1" and h["since"] == pytest.approx(4.8) for _, h in held)
+    assert clock.holding is None
+
+
+def test_pacing_changes_nothing_a_seat_sees():
+    delays = [0.5, 4.0, 6.5, 130.0]
+
+    async def scenario(loop, pace_s):
+        seats = [TimedSeat("1", delays), TimedSeat("2", list(reversed(delays)))]
+        clock = virtual_clock(loop, pace_s=pace_s, seats=seats)
+        await clock.run(max_steps=600)
+        return clock.commands, clock.decisions, [s.begun for s in seats]
+
+    unpaced = run_virtual(lambda loop: scenario(loop, None))
+    paced = run_virtual(lambda loop: scenario(loop, 0.2))
+    assert any(d["missed"] for d in unpaced[1]), "the 130 s answer should have missed"
+    assert paced == unpaced
+    assert paced[0], "the seats' orders should have gone out in commands"
+
+
+def test_stop_during_pace_sleep_takes_no_more_steps():
+    async def scenario(loop):
+        clock = virtual_clock(loop, pace_s=0.2)
+        clock.start()
+        await asyncio.sleep(0.5)
+        clock.queue(1, {"type": "late"})
+        steps, commands = clock.steps, list(clock.commands)
+        await clock.stop()
+        return clock, steps, commands
+
+    clock, steps, commands = run_virtual(scenario)
+    assert steps > 0 and clock.steps == steps
+    assert clock.commands == commands and clock.pending(1) == 1
+
+
+def test_pace_too_slow_for_the_brain_timeout_is_refused():
+    with pytest.raises(ValueError, match="brain_timeout_s"):
+        LockstepClock(FakeEngine(), observe=None, act=None, done=lambda: False, pace_s=5.0, brain_timeout_s=120.0)
+    LockstepClock(FakeEngine(), observe=None, act=None, done=lambda: False, pace_s=0.2, brain_timeout_s=120.0)
+
+
+@pytest.mark.parametrize("pace_s", [0, -1])
+def test_pace_must_be_positive(pace_s):
+    with pytest.raises(ValueError, match="pace_s"):
+        LockstepClock(FakeEngine(), observe=None, act=None, done=lambda: False, pace_s=pace_s)

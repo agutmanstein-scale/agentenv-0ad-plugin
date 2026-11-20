@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# bootstrap.sh PAYLOAD_URL REPO_URL [--images build | --images pull --registry REG --tag TAG]
+# bootstrap.sh PAYLOAD_URL REPO_URL [--images build | --images pull --registry REG --tag TAG | --images none]
 # Run as root on a fresh g6.4xlarge (Deep Learning Base OSS NVIDIA driver AMI, Ubuntu 22.04) by live/bootstrap.sh.
 # Makes it a stream box: checks the L4 and its driver (the AMI's; it installs none), keeps the AMI's Docker and NVIDIA
 # runtime and adds address pools, installs Xorg, ffmpeg, mediamtx and uv, unpacks the box scripts and the repo, builds
 # (or pulls) the images and registers them with agent-env, installs the docker shim and the units, and starts the
-# display, the relay and the half-hourly health timer. Nothing is played or pushed. Idempotent.
+# display, the relay and the half-hourly health timer. Nothing is played or pushed. Idempotent. --images none leaves the
+# images and agent-env's registrations out (showcase-bootstrap.sh builds its own on the show engine).
 set -euo pipefail
 PAYLOAD_URL=${1:?usage: bootstrap.sh PAYLOAD_URL REPO_URL [--images build|pull ...]}
 REPO_URL=${2:?usage: bootstrap.sh PAYLOAD_URL REPO_URL [--images build|pull ...]}
@@ -18,8 +19,8 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-case $IMAGES in build) ;; pull) [ -n "$REGISTRY" ] || { echo "--images pull needs --registry" >&2; exit 2; } ;;
-  *) echo "--images must be build or pull" >&2; exit 2 ;; esac
+case $IMAGES in build|none) ;; pull) [ -n "$REGISTRY" ] || { echo "--images pull needs --registry" >&2; exit 2; } ;;
+  *) echo "--images must be build, pull or none" >&2; exit 2 ;; esac
 
 BOX_HOME=${ZEROAD_LIVE_HOME:-/opt/zeroad-live}
 STATE=${ZEROAD_LIVE_STATE:-/var/lib/zeroad-live}
@@ -79,17 +80,19 @@ if [ ! -x "$BOX_HOME/bin/mediamtx" ] || [ "$DRY_RUN" = 1 ]; then
 fi
 run install -m 755 "$BOX_HOME/box/docker-shim.sh" "$BOX_HOME/bin/docker"
 
-step "images ($IMAGES) and agent-env registration (env zeroad-live, agents zeroad-commander and zeroad-luna)"
-AE=(env XDG_STATE_HOME="$STATE/agentenv" AGENT_ENV_CONFIG=/etc/zeroad-live/agent-env.toml
-    uv run --project "$BOX_HOME/repo" --frozen --no-dev agent-env)
-if [ "$IMAGES" = pull ]; then
-  run docker pull "$REGISTRY/mcp-server-zeroad-live:$TAG"
-  run docker tag "$REGISTRY/mcp-server-zeroad-live:$TAG" mcp-server-zeroad-live
-  run "${AE[@]}" zeroad setup --live --image mcp-server-zeroad-live
-else
-  run "${AE[@]}" zeroad setup --live --source "$BOX_HOME/repo"
+if [ "$IMAGES" != none ]; then
+  step "images ($IMAGES) and agent-env registration (env zeroad-live, agents zeroad-commander and zeroad-luna)"
+  AE=(env XDG_STATE_HOME="$STATE/agentenv" AGENT_ENV_CONFIG=/etc/zeroad-live/agent-env.toml
+      uv run --project "$BOX_HOME/repo" --frozen --no-dev agent-env)
+  if [ "$IMAGES" = pull ]; then
+    run docker pull "$REGISTRY/mcp-server-zeroad-live:$TAG"
+    run docker tag "$REGISTRY/mcp-server-zeroad-live:$TAG" mcp-server-zeroad-live
+    run "${AE[@]}" zeroad setup --live --image mcp-server-zeroad-live
+  else
+    run "${AE[@]}" zeroad setup --live --source "$BOX_HOME/repo"
+  fi
+  run "${AE[@]}" zeroad setup --agents-only --source "$BOX_HOME/repo"
 fi
-run "${AE[@]}" zeroad setup --agents-only --source "$BOX_HOME/repo"
 
 step "units: the display on the L4, the relay (records every match), the push (not started), the health timer"
 run sh -c 'cp "$1"/box/units/*.service "$1"/box/units/*.timer /etc/systemd/system/' _ "$BOX_HOME"

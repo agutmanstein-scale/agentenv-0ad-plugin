@@ -35,3 +35,32 @@ class VirtualTime:
             self.t = max(self.t, wake)
             if not future.done():
                 future.set_result(None)
+
+
+class VirtualLoop(asyncio.SelectorEventLoop):
+    """An event loop whose clock is virtual: when nothing is runnable, time jumps to the next timer.
+
+    `loop.time()`, `asyncio.sleep` and `asyncio.wait(timeout=...)` all run on it, so code that reads the running loop's
+    time (the lockstep clock's hold and brain-timeout bookkeeping) is exact and instant under test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._virtual_t = 0.0
+
+    def time(self) -> float:
+        return self._virtual_t
+
+    def _run_once(self) -> None:
+        if not self._ready and self._scheduled:
+            self._virtual_t = max(self._virtual_t, self._scheduled[0]._when)
+        super()._run_once()
+
+
+def run_virtual(make_coro):
+    """Run `make_coro(loop)` to completion on a fresh `VirtualLoop` and return its result."""
+    loop = VirtualLoop()
+    try:
+        return loop.run_until_complete(make_coro(loop))
+    finally:
+        loop.close()

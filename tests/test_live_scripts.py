@@ -166,6 +166,7 @@ CHANGE_SCRIPTS = [
     ("train.sh", ID, "start", str(LIVE / "train-run.example.toml"), "--play-only"),
     ("train.sh", ID, "stop"),
     ("bootstrap.sh", ID, "--cpu"),
+    ("bootstrap.sh", ID, "--showcase"),
     ("bootstrap.sh", ID, "--cpu", "--images", "build"),
     ("s1.sh", ID, "start"),
     ("s1.sh", ID, "start", "--n", "10", "--replays", "5", "--wall-hours", "1.5", "--engines", "20"),
@@ -2679,3 +2680,684 @@ def test_the_actor_scripts_run_with_the_train_extra(stubs):
         text = (BOX / script).read_text()
         assert "--no-dev python" not in text, script
         assert "--extra train python" in text, script
+
+
+SHOWCASE_ENV = LIVE / "showcase.env.example"
+VLLM_IMAGE = "vllm/vllm-openai:v0.11.0"
+
+
+def showcase_stubs(stubs):
+    env_file = stubs["tmp"] / "showcase.env"
+    env_file.write_text(
+        f"source {SHOWCASE_ENV}\nLIVE_BUCKET=bucket-1\nLIVE_AWS_ACCOUNT=123456789012\n"
+        "LIVE_SUBNETS='subnet-a subnet-b'\nLIVE_SECURITY_GROUP=sg-1\n"
+    )
+    stubs["env"]["LIVE_ENV"] = str(env_file)
+    return stubs
+
+
+def vllm_flags(out: str, name: str) -> dict[str, str]:
+    """The engine flags of the `docker run` that starts container `name`: everything after the vLLM image."""
+    [line] = [x for x in out.replace("\\", "").splitlines() if x.startswith(f"+ docker run -d --name {name} ")]
+    tokens = line.split(f"{VLLM_IMAGE} ")[1].split()
+    flags: dict[str, str] = {}
+    for i, tok in enumerate(tokens):
+        if tok.startswith("--"):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            flags[tok] = "" if nxt.startswith("--") or not nxt else nxt
+    return flags
+
+
+def test_the_showcase_env_is_the_trainings_instance_profile_on_one_l40s_with_a_60_dollar_budget(stubs):
+    text = SHOWCASE_ENV.read_text()
+    assert 'source "$_showcase_env_dir/live.env"' in text  # the site settings are live.env's
+    out = run(showcase_stubs(stubs), "launch.sh", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "g6e.2xlarge" in plan and "g6e.12xlarge" not in plan and "bucket-1" not in plan
+    for setting in ('LIVE_GPU_RATES="g6e.2xlarge=2.24"', "LIVE_MAX_HOURS=10", "LIVE_BUDGET_USD=60"):
+        assert setting in text, setting
+    assert "LIVE_SHUTDOWN_BEHAVIOR=stop" in text and "LIVE_INSTANCE_PROFILE=zeroad-train-box" in text
+
+
+def test_showcase_bootstrap_dry_run_prints_the_plan(stubs):
+    out = run(showcase_stubs(stubs), "bootstrap.sh", ID, "--showcase", forbid_aws=True)
+    plan = out.stderr
+    assert out.returncode == 0, plan
+    assert "box/showcase-bootstrap.sh https://PRESIGNED-payload-url https://PRESIGNED-repo-url" in plan
+    assert "timeout 7200s" in plan  # the vLLM, engine and image builds take longer than 90 minutes on a slow day
+    text = plan.replace("\\", "")
+    for flag in (
+        "--dtype bfloat16",
+        "--generation-config vllm",
+        "--enable-lora",
+        "--max-lora-rank 32",
+        "--max-model-len 8192",
+        "--max-loras 1",
+        "--gpu-memory-utilization 0.55",
+    ):
+        assert flag in text, flag
+    assert VLLM_IMAGE in text and "scripts/build-engine.sh show" in text and "zeroad-engine:0.28-show" in text
+    assert "ENGINE_IMAGE=zeroad-engine:0.28-show" in text and "-t zeroad-showcase" in text
+    assert "zeroad-train/run/s2-run1/adapters/v50/" in text and "showcase/adapters/v1" in text
+    assert "local/policy-v1" in text and "pilot.smoke" in text and "--model local/policy-v1" in text
+    assert "-m engine tests/engine/test_paced_engine.py" in text
+    [engine_test] = [x for x in text.splitlines() if "pytest -m engine" in x and x.lstrip().startswith("box| +")]
+    assert "uv run --directory " in engine_test and " --project" not in engine_test  # the tests path is relative to it
+    assert engine_test.rstrip().endswith("-q -rs")
+    assert "bucket-1" not in plan and "bucket-1" not in out.stdout  # the bucket is redacted everywhere
+    assert "s3://<bucket>/zeroad-train/run/s2-run1/adapters/v50/" in text
+    assert text.index("build-engine.sh show") < text.index("docker run -d --name zeroad-vllm")
+    assert text.index("load_lora_adapter") < text.index("pilot.smoke") < text.index("test_paced_engine")
+    assert not aws_calls(stubs)  # nothing was called: forbid_aws would have made the stub exit 99
+
+
+def test_showcase_bootstrap_refuses_a_small_gpu(stubs):
+    write_exe(
+        stubs["bin"] / "nvidia-smi",
+        "#!/bin/sh\ncase $1 in -L) echo 'GPU 0: NVIDIA L4 (UUID: x)' ;; *) echo 23034 ;; esac\n",
+    )
+    touched = stubs["tmp"] / "touched"
+    for cmd in ("apt-get", "systemctl", "docker", "curl", "fuser"):
+        write_exe(stubs["bin"] / cmd, f"#!/bin/sh\necho {cmd} >> {touched}\n")
+    out = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo")
+    assert out.returncode == 1 and "40 GB" in out.stderr
+    assert not touched.exists()  # refused before it changed anything
+    write_exe(
+        stubs["bin"] / "nvidia-smi",
+        "#!/bin/sh\ncase $1 in -L) printf 'GPU 0: NVIDIA L40S (UUID: x)\\nGPU 1: NVIDIA L40S (UUID: y)\\n' ;;"
+        " *) echo 46068 ;; esac\n",
+    )
+    out = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo")
+    assert out.returncode == 1 and "one GPU" in out.stderr and not touched.exists()
+
+
+@pytest.mark.parametrize("other", ["--pilot", "--train", "--cpu"])
+def test_showcase_and_train_are_exclusive(stubs, other):
+    out = run(showcase_stubs(stubs), "bootstrap.sh", ID, "--showcase", other, forbid_aws=True)
+    assert out.returncode != 0 and "--showcase is not combined" in out.stderr
+    assert "Next:" not in out.stderr
+
+
+def test_showcase_vllm_flags_match_run1_but_memory(stubs):
+    train = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    show = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert train.returncode == 0 and show.returncode == 0, show.stderr
+    run1 = vllm_flags(train.stdout, "zeroad-vllm-0")
+    shown = vllm_flags(show.stdout, "zeroad-vllm")
+    assert (run1["--gpu-memory-utilization"], run1["--max-loras"]) == ("0.9", "8")
+    assert (shown["--gpu-memory-utilization"], shown["--max-loras"]) == ("0.55", "1")
+    for flags in (run1, shown):
+        del flags["--gpu-memory-utilization"], flags["--max-loras"]
+    assert shown == run1 and shown["--max-model-len"] == "8192" and shown["--dtype"] == "bfloat16"
+
+
+def test_the_showcase_bootstrap_keeps_the_key_in_a_root_only_file_and_never_prints_the_bucket(stubs):
+    text = run_box(stubs, "showcase-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1").stdout
+    assert "vllm.env (0600)" in text and "VLLM_API_KEY=<random>" in text
+    assert "docker run" in text and "--env-file" in text and "sk-" not in text
+
+
+def vllm_run_lines(out: str) -> list[str]:
+    return [x for x in out.splitlines() if x.startswith("+ docker run -d --name zeroad-vllm")]
+
+
+def expected_vllm_run(state, name, devices, port, tp, mount, max_len, rest):
+    return (
+        f'+ docker run -d --name {name} --restart unless-stopped --gpus \\"device={devices}\\" --ipc=host '
+        f"--env-file /etc/zeroad-live/vllm.env -e VLLM_ALLOW_RUNTIME_LORA_UPDATING=True "
+        f"-p 172.17.0.1:{port}:8000 -p 127.0.0.1:{port}:8000 -v {state}/hf:/root/.cache/huggingface -v {state}/{mount} "
+        f"{VLLM_IMAGE} --model Qwen/Qwen3-8B --served-model-name local/qwen-base --tensor-parallel-size {tp} "
+        f"--max-model-len {max_len} --gpu-memory-utilization 0.9 --enable-lora --max-lora-rank 32 {rest} "
+        "--enable-auto-tool-choice --tool-call-parser hermes --enable-prefix-caching"
+    )
+
+
+def test_the_train_and_pilot_bootstraps_start_vllm_with_these_exact_docker_run_lines(stubs):
+    state = str(stubs["tmp"] / "state")
+    train = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", "--train", DRY_RUN="1")
+    rest = "--dtype bfloat16 --generation-config vllm --max-loras 8 --max-cpu-loras 32"
+    assert vllm_run_lines(train.stdout) == [
+        expected_vllm_run(state, "zeroad-vllm-0", "0", 8000, 1, "train:/train:ro", 8192, rest),
+        expected_vllm_run(state, "zeroad-vllm-1", "1", 8001, 1, "train:/train:ro", 8192, rest),
+    ]
+    plain = run_box(stubs, "pilot-bootstrap.sh", "https://payload", "https://repo", DRY_RUN="1")
+    assert vllm_run_lines(plain.stdout) == [
+        expected_vllm_run(
+            state,
+            "zeroad-vllm",
+            "0\\,1",
+            8000,
+            2,
+            "pilot/adapters:/adapters:ro",
+            12288,
+            "--max-loras 4 --max-cpu-loras 16",
+        )
+    ]
+
+
+def test_a_laptop_aws_error_that_quotes_the_bucket_is_redacted_for_the_showcase(stubs):
+    write_exe(
+        stubs["bin"] / "aws",
+        "#!/bin/sh\necho 'upload failed: x to s3://bucket-1/zeroad-train/box/payload.tgz' >&2\necho out-1\nexit 7\n",
+    )
+    script = f'source {LIVE}/lib/common.sh; DRY_RUN=0; AWS_CHECKED=1; aws_run "" s3 cp a b || echo "rc=$?"'
+    env = {**stubs["env"], "LIVE_REDACT_BUCKET": "1", "LIVE_BUCKET": "bucket-1"}
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+    assert "bucket-1" not in out.stderr and "s3://<bucket>/zeroad-train/box/payload.tgz" in out.stderr
+    assert out.stdout.splitlines() == ["out-1", "rc=7"]  # stdout and aws's exit status are untouched
+    env.pop("LIVE_REDACT_BUCKET")
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30)
+    assert "s3://bucket-1/" in out.stderr  # other modes print it as before
+
+
+@pytest.mark.parametrize(
+    ("output", "rc", "ok"),
+    [
+        ("1 passed in 40s", 0, True),
+        ("2 skipped in 1s", 0, False),
+        ("1 passed, 1 skipped in 40s", 0, False),
+        ("no tests ran in 1s", 0, False),
+        ("1 failed in 3s", 1, False),
+    ],
+)
+def test_the_engine_test_must_pass_with_nothing_skipped_or_the_bootstrap_dies(stubs, output, rc, ok):
+    write_exe(stubs["bin"] / "uv", f"#!/bin/sh\necho '{output}'\nexit {rc}\n")
+    script = f"source {BOX}/lib.sh; run_engine_test {ROOT} tests/engine/test_paced_engine.py; echo reached"
+    out = subprocess.run(["bash", "-c", script], env=box_env(stubs), capture_output=True, text=True, timeout=30)
+    assert (out.returncode == 0 and "reached" in out.stdout) == ok, (out.stdout, out.stderr)
+    assert ok or "ERROR:" in out.stderr
+
+
+SHOWCASE_SCRIPTS = (LIVE / "showcase.sh", BOX / "showcase.sh", BOX / "showcase-run.sh")
+LOOPBACK_RELAY = "rtmp://127.0.0.1:1935/zeroad"
+
+
+def showcase(stubs, *args: str, forbid_aws=True, **extra):
+    return run(showcase_stubs(stubs), "showcase.sh", ID, *args, forbid_aws=forbid_aws, extra=extra)
+
+
+def test_showcase_start_dry_run_prints_the_plan(stubs):
+    out = showcase(stubs, "start", "--hours", "2", "--max-games", "4", "--rotation", "opus,petra-3", "--mode", "live")
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "systemd-run --unit zeroad-showcase" in plan and "box/showcase-run.sh" in plan
+    for arg in ("--hours 2", "--max-games 4", "--rotation opus,petra-3", "--mode live", "--budget 60"):
+        assert arg in plan, arg
+    assert "2 h of box at $2.24/h = $4.48" in plan and "one frontier game's cap" in plan
+    assert "bucket-1" not in plan and "bucket-1" not in out.stdout
+    assert not aws_calls(stubs)  # nothing was called: forbid_aws would have made the stub exit 99
+    watch = showcase(stubs, "watch", "--dry-run")
+    assert watch.returncode == 0, watch.stderr
+    assert "AWS-StartPortForwardingSession" in watch.stderr and '"portNumber":["1935"]' in watch.stderr
+    assert LOOPBACK_RELAY in watch.stdout + watch.stderr
+
+
+def test_showcase_start_refuses_over_budget(stubs):
+    out = showcase(stubs, "start", "--hours", "24")  # 24 h at $2.24 and one game at $9 pass $60
+    assert out.returncode != 0 and "REFUSED" in out.stderr and "systemd-run" not in out.stderr
+
+
+def test_showcase_start_plans_the_box_hours_and_one_game_not_every_game(stubs):
+    out = showcase(stubs, "start")  # 6 h by default: $13.44 + $9 fits $60; 12 games at $9 each would not
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "--hours 6" in plan and "6 h of box at $2.24/h = $13.44" in plan and "one frontier game's cap of $9" in plan
+    assert "systemd-run --unit zeroad-showcase" in plan
+
+
+def test_showcase_start_refuses_short_poweroff(stubs):
+    deadline = stubs["tmp"] / "deadline"
+    deadline.write_text(str(1_800_000_000 + 3 * 3600))
+    env = {"ZEROAD_DEADLINE_FILE": str(deadline), "ZEROAD_NOW_EPOCH": "1800000000"}
+    out = showcase(stubs, "start", "--hours", "3", **env)  # needs 3 h + 1
+    assert out.returncode != 0 and "powers off in 3.00 h" in out.stderr and "extend-poweroff.sh" in out.stderr
+    assert "systemd-run" not in out.stderr
+    deadline.write_text(str(1_800_000_000 + 4 * 3600))
+    ok = showcase(stubs, "start", "--hours", "3", **env)
+    assert ok.returncode == 0 and "systemd-run --unit zeroad-showcase" in ok.stderr
+
+
+def uid1000_stubs(stubs):
+    """install and chgrp as a non-root test user cannot run them: install -d makes the folder, both log their calls."""
+    log = stubs["tmp"] / "perm.log"
+    write_exe(
+        stubs["bin"] / "install",
+        f'#!/bin/sh\necho "install $*" >> {log}\nfor last; do :; done\nmkdir -p "$last"\n',
+    )
+    write_exe(stubs["bin"] / "chgrp", f'#!/bin/sh\necho "chgrp $*" >> {log}\n')
+    return log
+
+
+def showcase_box(stubs, *args: str, sleeps=False, stop_fails=0, rules=(), exit_code=0, finished=1, **extra):
+    """Run box/showcase-run.sh for real against stubs: docker, shutdown and aws (which holds the key rule). The
+    stub runner exits `exit_code` and leaves a session.json with `finished` finished rows (none: no file)."""
+    tmp = stubs["tmp"]
+    etc = tmp / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.env").write_text("VLLM_API_KEY=vllm-secret-value\n")
+    (etc / "vllm.url").write_text("http://172.20.0.1:8000\n")
+    (etc / "deadline").write_text("1900000000\n")
+    uid1000_stubs(stubs)
+    seg = tmp / "state" / "rec" / "zeroad"
+    seg.mkdir(parents=True, exist_ok=True)
+    for name in ("2026-11-19_11-59-59-000001.mp4", "2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"):
+        (seg / name).write_text("x")
+    wait = f"while [ ! -e {tmp}/stopped ]; do sleep 0.05; done; " if sleeps else ""
+    (tmp / "rows.json").write_text(
+        json.dumps({"rows": [{"result": "win"}] * (finished or 0) + [{"result": "pending"}]})
+    )
+    save = (
+        'out=; prev=; for a in "$@"; do [ "$prev" = --out ] && out=$a; prev=$a; done; '
+        f'[ -z "$out" ] || cp {tmp}/rows.json "$out/session.json"; '
+        if finished is not None
+        else ""
+    )
+    write_exe(
+        stubs["bin"] / "docker",
+        f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
+        f'case $1 in run) echo "key=$LITELLM_API_KEY" >> {tmp}/docker.env; {save}{wait}exit {exit_code} ;; '
+        f"stop) n=$(cat {tmp}/stops 2>/dev/null || echo 0); echo $((n + 1)) > {tmp}/stops; "
+        f"[ $n -ge {stop_fails} ] && touch {tmp}/stopped || exit 1 ;; esac\n",
+    )
+    write_exe(
+        stubs["bin"] / "shutdown",
+        f'#!/bin/sh\necho \'{{"argv": ["shutdown", "\'"$*"\'"]}}\' >> {stubs["log"]}\n',
+    )
+    all_rules = json.dumps([["ssm get-parameter", SECRET, 0], *rules])
+    return run_box(
+        stubs,
+        "showcase-run.sh",
+        *args,
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_S3_BUCKET="bucket-1",
+        ZEROAD_S3_PREFIX="zeroad-train",
+        STUB_AWS_RULES=all_rules,
+    )
+
+
+def test_showcase_run_uploads_before_shutdown(stubs):
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--hours", "2")
+    assert out.returncode == 0, out.stderr
+    prefix = "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    calls = aws_calls(stubs)
+    cps = [c["argv"] for c in calls if c["argv"][:2] == ["s3", "cp"]]
+    session = stubs["tmp"] / "state" / "showcase" / "20261119-120000"
+    assert (session / "stamp").read_text().strip() == "20261119-120000"
+    assert any(a[-2:] == [str(session), prefix] and "--recursive" in a for a in cps)
+    videos = sorted(a[-2].rsplit("/", 1)[1] for a in cps if a[-1].startswith(prefix + "video/"))
+    assert videos == ["2026-11-19_12-00-00-000002.mp4", "2026-11-19_13-00-00-000003.mp4"]  # none from before the start
+    assert calls[-1]["argv"] == ["shutdown", "-h now"], calls[-1]  # the last thing, after every upload
+    docker = (stubs["tmp"] / "docker.log").read_text()
+    assert (
+        f"--entrypoint python zeroad-showcase -m agentenv_zeroad.showcase run --out {session} --config" in docker
+        and "--hours 2" in docker
+    )
+    assert "--config live/showcase/showcase.toml" in docker and "--name zeroad-showcase" in docker
+    assert LOOPBACK_RELAY in docker and "--gpus all" in docker and "DISPLAY=:0" in docker
+    state = stubs["tmp"] / "state"
+    assert f"-e ZEROAD_SPEND_LEDGER={state}/spend.jsonl" in docker  # the runner books each game in the box's ledger
+    ledger = f"{state}/spend.jsonl"
+    # the container (uid 1000) writes only its session folder and the one ledger file: the state folder is read-only
+    assert (
+        f"-v {state}:{state}:ro " in docker
+        and f"-v {session}:{session} " in docker
+        and f"-v {ledger}:{ledger} " in docker
+    )
+    assert f"-v {state}:{state} " not in docker and "source=/" in docker and ",readonly" in docker
+    perm = (stubs["tmp"] / "perm.log").read_text().splitlines()
+    assert f"install -d -o 1000 -g 1000 -m 755 {session}" in perm and f"chgrp 1000 {ledger}" in perm
+    assert oct((state / "spend.jsonl").stat().st_mode & 0o777) == "0o664"
+    assert SECRET not in docker and "vllm-secret-value" not in docker  # the keys travel in the environment only
+    assert f"key={SECRET}" in (stubs["tmp"] / "docker.env").read_text()  # with-model.sh gave the child the key
+    assert "bucket-1" not in out.stdout + out.stderr
+
+
+def test_showcase_session_folders_are_siblings_under_one_parent_and_never_reused(stubs):
+    first = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--no-shutdown")
+    assert first.returncode == 0, first.stderr
+    parent = stubs["tmp"] / "state" / "showcase"
+    assert [p.name for p in parent.iterdir()] == ["20261119-120000"]
+    again = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", "--no-shutdown")
+    assert again.returncode != 0 and "never reused" in again.stderr
+    later = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-150000", "--no-shutdown")
+    assert later.returncode == 0, later.stderr
+    assert sorted(p.name for p in parent.iterdir()) == ["20261119-120000", "20261119-150000"]  # the first is untouched
+
+
+@pytest.mark.parametrize("how", ["upload fails", "--no-shutdown"])
+def test_showcase_run_no_shutdown_when_upload_fails(stubs, how):
+    failing = [["s3 cp", "", 1]] if how == "upload fails" else []
+    extra = ["--no-shutdown"] if how == "--no-shutdown" else []
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", *extra, rules=failing)
+    calls = aws_calls(stubs)
+    assert [c for c in calls if c["argv"][:2] == ["s3", "cp"]]  # the upload was tried either way
+    assert not [c for c in calls if c["argv"][0] == "shutdown"]
+    assert (out.returncode != 0) == (how == "upload fails")
+    if how == "upload fails":
+        assert "not shutting down" in out.stderr + out.stdout
+
+
+@pytest.mark.parametrize(
+    "stop_fails", [0, 2]
+)  # 2: the stop lands before the container exists, so docker stop fails twice
+def test_showcase_run_stopped_by_hand_uploads_and_leaves_the_box_up(stubs, stop_fails):
+    import threading
+
+    result = {}
+    thread = threading.Thread(
+        target=lambda: result.update(
+            out=showcase_box(
+                stubs,
+                "--budget",
+                "60",
+                "--stamp",
+                "20261119-120000",
+                "--hours",
+                "7.77",
+                sleeps=True,
+                stop_fails=stop_fails,
+            )
+        )
+    )
+    thread.start()  # the stub docker waits for `docker stop`; the unit's stop is SIGTERM to the script
+    docker_log = stubs["tmp"] / "docker.log"
+    for _ in range(200):
+        if (stubs["tmp"] / "docker.env").exists():
+            break
+        time.sleep(0.05)
+    pids = subprocess.run(["pgrep", "-f", "showcase-run.sh --budget 60"], capture_output=True, text=True).stdout.split()
+    assert pids
+    os.kill(int(pids[0]), signal.SIGTERM)
+    thread.join(timeout=30)
+    out = result["out"]
+    assert out.returncode == 0, out.stderr
+    assert "docker stop" in docker_log.read_text()
+    calls = aws_calls(stubs)
+    assert any(c["argv"][:2] == ["s3", "cp"] for c in calls)  # the session still uploaded
+    assert not [c for c in calls if c["argv"][0] == "shutdown"]  # and the box stays up
+
+
+def test_showcase_output_redacts_the_bucket(stubs):
+    for args in (("start", "--hours", "1"), ("stop",), ("fetch",), ("watch", "--dry-run"), ("status", "--dry-run")):
+        out = showcase(stubs, *args)
+        assert out.returncode == 0, (args, out.stderr)
+        assert "bucket-1" not in out.stdout + out.stderr, args
+    fetch = showcase(stubs, "fetch")
+    assert "s3://<bucket>/zeroad-train/run/showcase-" in fetch.stderr
+    box = run_box(
+        stubs,
+        "showcase-run.sh",
+        "--budget",
+        "60",
+        "--stamp",
+        "20261119-120000",
+        DRY_RUN="1",
+        ZEROAD_S3_BUCKET="bucket-1",
+    )
+    assert box.returncode == 0, box.stderr
+    assert "bucket-1" not in box.stdout + box.stderr
+    assert "s3://<bucket>/zeroad-train/run/showcase-20261119-120000/" in box.stdout
+
+
+def test_showcase_fetch_reads_the_newest_session_without_video_unless_asked(stubs):
+    fetched = stubs["tmp"] / "fetched"
+    fetched.mkdir()
+    listing = "".join(f"{' ' * 27}PRE showcase-{stamp}/\n" for stamp in ("20261118-090000", "20261119-120000"))
+    rules = [["sts get-caller-identity", "123456789012\n", 0], ["s3 ls", listing, 0]]
+    extra = {"STUB_AWS_RULES": json.dumps(rules), "LIVE_FETCHED_DIR": str(fetched)}
+    out = showcase(stubs, "fetch", "--yes", forbid_aws=False, **extra)
+    assert out.returncode == 0, out.stderr
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    assert sync[3].endswith("showcase-20261119-120000") and "video/*" in sync and "--exclude" in sync
+    assert "broadcast/recording*.mp4" in sync  # the recording is uploaded but not fetched unless asked
+    assert "bucket-1" not in out.stdout + out.stderr
+    stubs["log"].unlink()
+    showcase(stubs, "fetch", "--with-video", "--yes", forbid_aws=False, **extra)
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert "--exclude" not in sync
+
+
+def test_showcase_never_pushes(stubs):
+    for script in SHOWCASE_SCRIPTS:
+        text = script.read_text()
+        assert "push.sh" not in text and "zeroad-push" not in text, script
+        assert set(re.findall(r"rtmps?://[^\s\"']+", text)) <= {LOOPBACK_RELAY}, script
+    out = showcase(stubs, "start", "--hours", "1")
+    assert "push" not in out.stderr.lower()
+    assert set(re.findall(r"rtmps?://[^\s\"']+", out.stderr)) <= {LOOPBACK_RELAY}
+
+
+def showcase_start_box(box_stubs, *args: str, preflight_ok=True, adapter_loaded=False, **extra):
+    """Run box/showcase.sh start for real against stubs (systemctl, docker, curl, budget.sh's clock)."""
+    tmp = box_stubs["tmp"]
+    etc = tmp / "etc"
+    etc.mkdir(exist_ok=True)
+    (etc / "vllm.env").write_text("VLLM_API_KEY=vllm-secret-value\n")
+    (etc / "vllm.url").write_text("http://172.20.0.1:8000\n")
+    (etc / "deadline").write_text(str(1_800_000_000 + 20 * 3600))
+    uid1000_stubs(box_stubs)
+    if adapter_loaded:
+        (tmp / "loaded").touch()
+    write_exe(
+        box_stubs["bin"] / "curl",
+        f'#!/bin/sh\necho "curl $*" >> {tmp}/curl.log\n'
+        f'case "$*" in *v1/models*) if [ -e {tmp}/loaded ]; then echo \'{{"data":[{{"id":"local/policy-v1"}}]}}\'; '
+        f"else echo '{{\"data\":[]}}'; fi ;; *load_lora_adapter*) touch {tmp}/loaded ;; esac\n",
+    )
+    write_exe(
+        box_stubs["bin"] / "docker",
+        f'#!/bin/sh\necho "docker $*" >> {tmp}/docker.log\n'
+        f'case "$*" in *"--entrypoint sh"*) exit {0 if preflight_ok else 1} ;; esac\n',
+    )
+    return run_box(
+        box_stubs,
+        "showcase.sh",
+        "start",
+        "--budget",
+        "60",
+        *args,
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_NOW_EPOCH="1800000000",
+        ZEROAD_BOOT_EPOCH="1799990000",
+        **extra,
+    )
+
+
+def test_showcase_start_loads_the_adapter_starts_the_stream_units_and_probes_the_container(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2")
+    assert out.returncode == 0, out.stderr + out.stdout
+    curl = (box_stubs["tmp"] / "curl.log").read_text()
+    assert curl.count("load_lora_adapter") == 1 and '"lora_name": "local/policy-v1"' in curl  # a restart lost it
+    assert "vllm-secret-value" not in curl
+    calls = systemctl_calls(box_stubs)
+    assert (
+        calls.index("start zeroad-x")
+        < calls.index("start zeroad-relay")
+        < next(i for i, c in enumerate(calls) if c.startswith("systemd-run"))
+    )
+    docker = (box_stubs["tmp"] / "docker.log").read_text()
+    state = box_stubs["tmp"] / "state"
+    assert "--entrypoint sh" in docker and ': >> "$2"' in docker and f"-v {state}:{state}:ro" in docker
+    perm = (box_stubs["tmp"] / "perm.log").read_text()
+    assert "chgrp 1000" in perm and "install -d -o 1000 -g 1000 -m 755" in perm
+    assert "powers off when a session that ran ends on its own" in out.stdout
+    assert not list((state / "showcase").glob(".preflight-*"))  # the probe folder is gone
+
+
+def test_showcase_start_leaves_a_loaded_adapter_alone(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2", adapter_loaded=True)
+    assert out.returncode == 0, out.stderr
+    assert "load_lora_adapter" not in (box_stubs["tmp"] / "curl.log").read_text()
+
+
+def test_showcase_start_dies_when_the_container_cannot_write(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2", preflight_ok=False)
+    assert out.returncode != 0 and "cannot write its session folder or open the spend ledger" in out.stderr
+    assert not [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+
+
+def test_showcase_start_needs_vllm_url_and_the_deadline_file(box_stubs):
+    out = showcase_start_box(box_stubs, "--hours", "2")
+    assert out.returncode == 0
+    etc = box_stubs["tmp"] / "etc"
+    (etc / "deadline").unlink()
+    out = run_box(
+        box_stubs,
+        "showcase.sh",
+        "start",
+        "--budget",
+        "60",
+        ZEROAD_PILOT_ETC=str(etc),
+        ZEROAD_BOOT_EPOCH="1799990000",
+    )
+    assert out.returncode != 0 and "no power-off deadline file" in out.stderr
+    (etc / "deadline").write_text("1900000000\n")
+    (etc / "vllm.url").unlink()
+    out = run_box(box_stubs, "showcase.sh", "start", "--budget", "60", ZEROAD_PILOT_ETC=str(etc))
+    assert out.returncode != 0 and "no " in out.stderr and "vllm.url" in out.stderr
+
+
+def test_budget_check_no_record_leaves_boxtime_alone_and_still_refuses(box_stubs):
+    now = 1_800_000_000
+    clock = {"ZEROAD_NOW_EPOCH": str(now), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    assert run_box(box_stubs, "budget.sh", "tick", **clock).returncode == 0
+    boxtime = box_stubs["tmp"] / "state" / "boxtime.json"
+    before = boxtime.read_bytes()
+    later = {"ZEROAD_NOW_EPOCH": str(now + 600), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    ok = run_box(box_stubs, "budget.sh", "check", "--no-record", "--budget", "50", **later)
+    assert ok.returncode == 0 and boxtime.read_bytes() == before
+    refused = run_box(box_stubs, "budget.sh", "check", "--no-record", "--planned-usd", "99", "--budget", "50", **later)
+    assert refused.returncode == 1 and "REFUSED" in refused.stdout and boxtime.read_bytes() == before
+    assert run_box(box_stubs, "budget.sh", "check", "--budget", "50", **later).returncode == 0
+    assert boxtime.read_bytes() != before  # without the flag it still records
+    assert run_box(box_stubs, "budget.sh", "show", "--no-record", **later).returncode != 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores a read-only folder")
+def test_budget_check_no_record_runs_against_a_read_only_state_folder(box_stubs):
+    now = 1_800_000_000
+    clock = {"ZEROAD_NOW_EPOCH": str(now), "ZEROAD_BOOT_EPOCH": str(now - 3600)}
+    assert run_box(box_stubs, "budget.sh", "tick", **clock).returncode == 0
+    state = box_stubs["tmp"] / "state"
+    (state / "spend.jsonl").write_text('{"what": "g", "usd_est": 4}\n')
+    state.chmod(0o555)
+    try:
+        out = run_box(box_stubs, "budget.sh", "check", "--no-record", "--planned-usd", "9", "--budget", "50", **clock)
+        assert out.returncode == 0, out.stderr
+        assert "model $4.00" in out.stdout
+    finally:
+        state.chmod(0o755)
+
+
+def test_showcase_fetch_takes_a_stamp_and_says_so_when_there_is_no_session(stubs):
+    fetched = stubs["tmp"] / "fetched"
+    fetched.mkdir()
+    rules = [["sts get-caller-identity", "123456789012\n", 0], ["s3 ls", "", 0]]
+    extra = {"STUB_AWS_RULES": json.dumps(rules), "LIVE_FETCHED_DIR": str(fetched)}
+    out = showcase(stubs, "fetch", "--yes", forbid_aws=False, **extra)
+    assert out.returncode != 0 and "no showcase session on S3 yet" in out.stderr and "bucket-1" not in out.stderr
+    out = showcase(stubs, "fetch", "20261119-120000", "--yes", forbid_aws=False, **extra)
+    assert out.returncode == 0, out.stderr
+    assert len([c for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "ls"]]) == 1  # only the first fetch listed
+    [sync] = [c["argv"] for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "sync"]]
+    assert sync[2] == "s3://bucket-1/zeroad-train/run/showcase-20261119-120000/"
+    assert (
+        "the box powers off when a session that ran ends on its own" in showcase(stubs, "start", "--hours", "1").stderr
+    )
+
+
+def shutdowns(stubs) -> list[dict]:
+    return [c for c in aws_calls(stubs) if c["argv"][0] == "shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("why", "kwargs", "returncode", "reason"),
+    [
+        ("a refusal before game 1", {"exit_code": 1, "finished": None}, 1, "a refusal before the first game"),
+        ("a crash after games", {"exit_code": 1, "finished": 2}, 1, "a refusal before the first game, or a crash"),
+        ("a clean exit with no finished game", {"exit_code": 0, "finished": 0}, 0, "holds no finished game"),
+    ],
+)
+def test_showcase_run_leaves_the_box_up_unless_a_session_ran_and_ended_normally(stubs, why, kwargs, returncode, reason):
+    out = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", **kwargs)
+    assert [c for c in aws_calls(stubs) if c["argv"][:2] == ["s3", "cp"]]  # it uploaded all the same
+    assert not shutdowns(stubs), why
+    assert out.returncode == returncode, out.stderr
+    assert reason in out.stdout + out.stderr and "the box stays up" in out.stdout
+    session = stubs["tmp"] / "state" / "showcase" / "20261119-120000"
+    assert reason in (session / "box.txt").read_text()  # which `status` prints
+
+
+def test_showcase_run_shuts_down_after_a_finished_session_and_not_after_a_pending_one(stubs):
+    ran = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-120000", finished=1)
+    assert ran.returncode == 0 and len(shutdowns(stubs)) == 1
+    stubs["log"].unlink()
+    showcase_box(stubs, "--budget", "60", "--stamp", "20261119-130000", finished=0)  # only a pending row
+    assert not shutdowns(stubs)
+
+
+def test_showcase_no_shutdown_and_continue_pass_through_every_script(stubs):
+    out = showcase(stubs, "start", "--hours", "1", "--continue", "20261119-100000", "--no-shutdown")
+    assert out.returncode == 0, out.stderr
+    plan = out.stderr.replace("\\", "")
+    assert "--continue 20261119-100000" in plan and "--no-shutdown" in plan  # laptop to box script
+    assert "--continue /" in plan and "/showcase/20261119-100000" in plan  # box script to the runner: the folder
+    bad = showcase(stubs, "start", "--continue", "last")
+    assert bad.returncode != 0 and "--continue needs a STAMP" in bad.stderr
+
+
+def test_showcase_run_passes_the_earlier_session_folder_to_the_container_and_refuses_other_paths(stubs):
+    state = stubs["tmp"] / "state"
+    earlier = state / "showcase" / "20261119-100000"
+    out = showcase_box(
+        stubs, "--budget", "60", "--stamp", "20261119-120000", "--continue", str(earlier), "--no-shutdown"
+    )
+    assert out.returncode == 0, out.stderr
+    docker = (stubs["tmp"] / "docker.log").read_text()
+    assert f"--continue {earlier}" in docker and "--no-shutdown" not in docker  # the shell's own flag stays here
+    assert not shutdowns(stubs)
+    other = showcase_box(stubs, "--budget", "60", "--stamp", "20261119-130000", "--continue", "/etc")
+    assert other.returncode != 0 and "--continue needs an earlier session folder" in other.stderr
+
+
+def test_showcase_box_start_continue_needs_the_earlier_session_and_hands_over_its_folder(box_stubs):
+    missing = showcase_start_box(box_stubs, "--hours", "2", "--continue", "20261119-100000")
+    assert missing.returncode != 0 and "no earlier session 20261119-100000" in missing.stderr
+    earlier = box_stubs["tmp"] / "state" / "showcase" / "20261119-100000"
+    earlier.mkdir(parents=True)
+    (earlier / "session.json").write_text('{"rows": []}')
+    out = showcase_start_box(box_stubs, "--hours", "2", "--continue", "20261119-100000", "--no-shutdown")
+    assert out.returncode == 0, out.stderr
+    [run_call] = [c for c in systemctl_calls(box_stubs) if c.startswith("systemd-run")]
+    assert f"--continue {earlier}" in run_call and "--no-shutdown" in run_call
+
+
+def test_showcase_status_reads_session_json_for_the_table_and_the_last_game(box_stubs):
+    session = box_stubs["tmp"] / "state" / "showcase" / "20261119-100000"
+    session.mkdir(parents=True)
+    rows = [
+        {"index": 0, "opponent": "Opus", "result": "win", "game_id": "g0"},
+        {"index": 1, "opponent": "Astra", "result": "no_result", "game_id": "g1"},
+        {"index": 2, "opponent": "Opus", "result": "loss", "game_id": "g2"},
+    ]
+    (session / "session.json").write_text(json.dumps({"rows": rows, "ended": None, "ended_why": None}))
+    (session / "box.txt").write_text("stopped by hand")
+    out = run_box(box_stubs, "showcase.sh", "status", "5")
+    assert out.returncode == 0, out.stderr
+    assert '"games":3' in out.stdout and '{"opponent":"Opus","w":1,"l":1,"d":0,"nr":0}' in out.stdout
+    assert '{"opponent":"Astra","w":0,"l":0,"d":0,"nr":1}' in out.stdout
+    assert '"game_id":"g2"' in out.stdout.split("--- last game")[1]
+    assert "state.json" not in (BOX / "showcase.sh").read_text() and "stopped by hand" in out.stdout
+
+
+def test_the_logs_redaction_does_not_buffer_and_still_hides_the_stream_url():
+    assert "sed -u -E" in (BOX / "lib.sh").read_text()
+    out = subprocess.run(
+        ["bash", "-c", f"source {BOX}/lib.sh; echo 'push to rtmps://live.example/app/KEY ok' | redact"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert out.returncode == 0 and out.stdout.strip() == "push to <rtmp url> ok"

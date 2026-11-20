@@ -1,0 +1,24 @@
+# The showcase engine, zeroad-engine:0.28-show: the rt engine plus patches/rl-paced-render.patch, layered onto
+# zeroad-engine:0.28. With -rl-paced (visual mode only) a reset game waits at turn 0 and every /step allows exactly one
+# 200 ms turn, run at once (as in training); the frame loop only renders, blending the view over the turn and then
+# holding at its end, so sim time does not move between steps. That makes a rendered match follow training's lockstep
+# rules turn for turn, at the pace the caller steps it. Without -rl-paced the binary behaves as the rt image's. Training's image
+# (zeroad-engine:0.28-rt) is never rebuilt with this patch.
+# Build with `scripts/build-engine.sh show` (context: patches/). The build stage's lines up to the COPY match
+# Dockerfile.rt's, so the build-dep layer is reused from the docker cache; the package build takes ~15 min.
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common gpg-agent ca-certificates dpkg-dev devscripts \
+ && add-apt-repository -y -s ppa:wfg/0ad && apt-get update && apt-get build-dep -y 0ad && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN apt-get update && apt-get source 0ad && ls
+COPY rl-realtime.patch rl-idle-wait.patch rl-paced-render.patch /src/
+RUN cd /src/0ad-0.28.0* && patch -p1 -F0 < /src/rl-realtime.patch && patch -p1 -F0 < /src/rl-idle-wait.patch \
+ && patch -p1 -F0 < /src/rl-paced-render.patch \
+ && DEB_BUILD_OPTIONS="parallel=$(nproc) nocheck" dpkg-buildpackage -b -uc -us 2>&1 | tail -40 && ls -la /src/*.deb
+
+FROM zeroad-engine:0.28
+COPY --from=build /src/0ad_*_amd64.deb /tmp/
+RUN dpkg -i /tmp/0ad_*_amd64.deb && rm /tmp/*.deb \
+ && grep -qa rl-paced /usr/games/pyrogenesis
+LABEL zeroad.patches="rl-realtime rl-idle-wait rl-paced-render"

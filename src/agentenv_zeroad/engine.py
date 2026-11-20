@@ -201,13 +201,17 @@ class Engine:
 class EngineOptions:
     """How to start pyrogenesis. `visual` needs a `display`; `realtime` needs the patched engine
     (`zeroad-engine:0.28-rt`, patches/rl-realtime.patch): the frame loop then advances the game in real time once the
-    first `/step` arrives, and `/step` only posts commands and returns the state."""
+    first `/step` arrives, and `/step` only posts commands and returns the state. `paced` needs the showcase engine
+    (`zeroad-engine:0.28-show`, patches/rl-paced-render.patch) and `visual`, and excludes `realtime`: every `/step` then
+    runs exactly one 200 ms turn, as in training; the frame loop only renders (the view blends over the turn, then
+    holds at its end), and sim time does not move between steps."""
 
     port: int = 6000
     host: str = "127.0.0.1"
     visual: bool = False
     display: str | None = None
     realtime: bool = False
+    paced: bool = False
     extra_args: tuple[str, ...] = ()
 
     @property
@@ -219,12 +223,16 @@ def pyrogenesis_args(options: EngineOptions) -> list[str]:
     """Command-line arguments for pyrogenesis (without the binary)."""
     if options.visual and not options.display:
         raise ValueError("visual mode needs a display (e.g. ':99')")
+    if options.paced and (options.realtime or not options.visual):
+        raise ValueError("paced needs visual mode and cannot be combined with realtime")
     args = [f"--rl-interface={options.host}:{options.port}"]
     if not options.visual:
         args += ["-autostart-nonvisual", "-autostart=random/mainland", "-autostart-size=128"]
     args.append("-mod=public")
     if options.realtime:
         args.append("-rl-realtime")
+    if options.paced:
+        args.append("-rl-paced")
     args += options.extra_args
     return args
 
@@ -282,6 +290,18 @@ class Launcher(Protocol):
         ...
 
 
+async def stop_process(proc: asyncio.subprocess.Process | None, timeout: float = 5.0) -> None:
+    """Terminate `proc`, and kill it if it has not exited after `timeout` seconds; nothing if it is gone."""
+    if proc is None or proc.returncode is not None:
+        return
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
 @dataclass
 class LocalLauncher:
     """Runs pyrogenesis from PATH (inside the env container). `home` gives this engine its own HOME (and so its own
@@ -313,14 +333,7 @@ class LocalLauncher:
 
     async def stop(self) -> None:
         proc, self._proc = self._proc, None
-        if proc is None or proc.returncode is not None:
-            return
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), self.stop_timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
+        await stop_process(proc, self.stop_timeout)
 
     def _replays(self) -> Path:
         home = self.home if self.home is not None else Path(os.environ.get("HOME", "~")).expanduser()

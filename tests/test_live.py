@@ -3,6 +3,7 @@ recorder's commands (display, Chrome, ffmpeg with RTMP only behind its flag)."""
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -499,6 +500,8 @@ class FakeProc:
         *,
         xvfb_fails: bool = False,
         ffmpeg_fails: bool = False,
+        focused: str = "game",
+        no_game: bool = False,
     ):
         self.argv, self.events, self.tmp = argv, events, tmp
         self.name = Path(argv[0]).name
@@ -507,8 +510,10 @@ class FakeProc:
         self.stdin = self
         self.stderr = self._lines()
         self.got_q = False
+        self.focused = focused
+        search = self.name == "xdotool" and "search" in argv
         if self.name == "xdotool" or (self.name == "ffmpeg" and ffmpeg_fails):
-            self._exit(0 if self.name == "xdotool" else 1)
+            self._exit(1 if (search and no_game) or self.name == "ffmpeg" else 0)
         elif self.name == "Xvfb":
             if xvfb_fails:
                 self._exit(1)
@@ -518,6 +523,16 @@ class FakeProc:
     def _exit(self, code: int) -> None:
         self.returncode = code
         self._done.set()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        ids = {"game": "111", "chrome": "222"}
+        if "getwindowfocus" in self.argv:
+            out = ids[self.focused]
+        elif "getwindowname" in self.argv:
+            out = {"111": "pyrogenesis", "222": "Google-chrome"}[self.argv[-1]]
+        else:  # search --class
+            out = "" if self.returncode else "111"
+        return f"{out}\n".encode(), b""
 
     async def _lines(self):
         yield b"ffmpeg: frame=1\n"
@@ -550,7 +565,7 @@ class FakeProc:
 def fake_processes(tmp_path, monkeypatch):
     events: list[str] = []
     procs: list[FakeProc] = []
-    options = {"xvfb_fails": False, "ffmpeg_fails": False}
+    options = {"xvfb_fails": False, "ffmpeg_fails": False, "focused": "game", "no_game": False}
     (tmp_path / "x11").mkdir()
     monkeypatch.setattr(live, "X11_DIR", tmp_path / "x11")
     monkeypatch.setattr(live.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -641,3 +656,99 @@ async def test_an_engine_log_older_than_the_broadcast_is_not_kept_as_this_matchs
     old.write_text("<p>this match's log</p>")
     await b.stop()
     assert b.engine_log is not None and "this match" in b.engine_log.read_text()
+
+
+async def test_attach_game_moves_and_focuses_the_new_window(tmp_path, fake_processes):
+    events, _, _, _ = fake_processes
+    b = live.Broadcast(BroadcastSettings(display=":0"), tmp_path / "out")
+    await b.open_display()
+    await b.attach_game()
+    assert events == ["xdotool search --sync --class pyrogenesis", "xdotool search --class pyrogenesis windowfocus"]
+
+
+REFOCUS = "xdotool search --class pyrogenesis windowfocus"
+
+
+async def _until(done, turns: int = 500) -> None:
+    for _ in range(turns):
+        if done():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the focus keeper did not get there")
+
+
+def _broadcast(tmp_path) -> live.Broadcast:
+    return live.Broadcast(BroadcastSettings(), tmp_path / "out", overlay_draw_s=0, ffmpeg_check_s=0, focus_check_s=0)
+
+
+def _messages(caplog, level: int) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
+
+
+async def test_the_broadcast_refocuses_the_game_when_another_window_holds_the_focus(tmp_path, fake_processes, caplog):
+    events, _, options, _ = fake_processes
+    options["focused"] = "chrome"
+    b = _broadcast(tmp_path)
+    await b.open_display()
+    with caplog.at_level(logging.INFO, logger=live.log.name):
+        await b.start("http://127.0.0.1:18765/live?stream")
+        await _until(lambda: events.count(REFOCUS) >= 3)
+        await b.stop()
+    warnings = _messages(caplog, logging.WARNING)
+    assert len(warnings) == 1 and "Google-chrome" in warnings[0] and "focused it again" in warnings[0]
+
+
+async def test_the_focus_keeper_leaves_a_focused_game_alone(tmp_path, fake_processes, caplog):
+    events, _, _, _ = fake_processes
+    b = _broadcast(tmp_path)
+    await b.open_display()
+    with caplog.at_level(logging.INFO, logger=live.log.name):
+        await b.start("http://127.0.0.1:18765/live?stream")
+        await _until(lambda: events.count("xdotool getwindowfocus") >= 3)
+        await b.stop()
+    assert events.count(REFOCUS) == 1
+    assert _messages(caplog, logging.INFO).count("the game's window has the X focus") == 1
+    assert not _messages(caplog, logging.WARNING)
+
+
+async def test_the_focus_keeper_does_nothing_while_there_is_no_game_window(tmp_path, fake_processes, caplog):
+    events, _, options, _ = fake_processes
+    options["no_game"] = True
+    b = _broadcast(tmp_path)
+    await b.open_display()
+    with caplog.at_level(logging.INFO, logger=live.log.name):
+        await b.start("http://127.0.0.1:18765/live?stream")
+        await _until(lambda: events.count("xdotool search --class pyrogenesis") >= 4)
+        await b.stop()
+    assert events.count(REFOCUS) == 1 and "xdotool getwindowfocus" not in events
+    assert not [m for m in _messages(caplog, logging.WARNING) if "lost the X focus" in m]
+    assert _messages(caplog, logging.INFO).count("no game window to focus") == 1
+
+
+async def test_stop_ends_the_focus_keeper(tmp_path, fake_processes):
+    events, _, _, _ = fake_processes
+    b = _broadcast(tmp_path)
+    await b.open_display()
+    await b.start("http://127.0.0.1:18765/live?stream")
+    await _until(lambda: "xdotool getwindowfocus" in events)
+    await b.stop()
+    seen = len(events)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert len(events) == seen
+
+
+def test_every_xdotool_command_is_one_the_boxs_xdotool_3_20160805_has():
+    has = {
+        "getactivewindow", "getwindowfocus", "getwindowname", "getwindowpid", "getwindowgeometry", "search",
+        "windowfocus", "windowsize", "windowmove",
+    }  # fmt: skip
+    commands = [
+        live.window_move_command(),
+        live.window_focus_command(),
+        live.game_windows_command(),
+        live.focused_window_command(),
+        live.window_name_command("222"),
+    ]
+    used = {t for cmd in commands for t in cmd[1:] if t.isalpha() and t.islower() and t != live.GAME_WINDOW_CLASS}
+    assert used <= has and "getwindowclassname" not in used

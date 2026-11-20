@@ -55,6 +55,7 @@ class LockstepMatch(LiveMatch):
         *,
         latency_ms: int = DEFAULT_LATENCY_MS,
         brain_timeout_s: float = BRAIN_TIMEOUT_S,
+        pace_s: float | None = None,
         **kwargs: Any,
     ):
         if any(seat.reflex for seat in config.seats):
@@ -66,6 +67,7 @@ class LockstepMatch(LiveMatch):
             done=lambda: self.over,
             latency_ms=latency_ms,
             brain_timeout_s=brain_timeout_s,
+            pace_s=pace_s,
         )
         super().__init__(handle, config, clock=self.lockstep, **kwargs)
         self.extra: dict[str, Any] = {}
@@ -158,12 +160,17 @@ async def play_game(
     model_for: ModelFactory | None = None,
     brain_timeout_s: float = BRAIN_TIMEOUT_S,
     match_options: Mapping[str, Any] | None = None,
+    pace_s: float | None = None,
+    on_match: Callable[[LockstepMatch], None] | None = None,
 ) -> dict[str, Any]:
     """Play `spec` on `handle` in lockstep and return its results (also written to `out_dir/results.json`).
 
     `tools` are the tool schemas every LLM seat shows its model (`server.tool_specs()`); `model_for(seat, slot)` builds
     a seat's model (by default `build_model` with the process environment). An error before or during the game stops
     the match, which still writes what it has, and is re-raised.
+
+    `pace_s` (showcase streams only) floors the wall time of a step; `on_match(match)` is called once, after `setup()`
+    and before `start()`, so a caller can watch the match.
     """
     model_for = model_for or build_model
     match = LockstepMatch(
@@ -172,6 +179,7 @@ async def play_game(
         out_dir=out_dir,
         latency_ms=spec.latency_ms,
         brain_timeout_s=brain_timeout_s,
+        pace_s=pace_s,
         **dict(match_options or {}),
     )
     match.extra["spec"] = spec.to_json()
@@ -183,6 +191,8 @@ async def play_game(
                 match.models[str(slot)] = model_for(seat, str(slot))
                 brains.append(await _commander_seat(match, str(slot), seat, match.models[str(slot)], tools))
                 match.lockstep.add_brain(brains[-1])
+        if on_match is not None:
+            on_match(match)
         match.start()
         await match.wait_end()
     except BaseException:

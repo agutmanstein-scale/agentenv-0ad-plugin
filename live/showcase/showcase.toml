@@ -1,0 +1,6 @@
+# The showcase starts from the 13-3's config: its rules, teachers and positions, on fresh [held_out] indices.
+rules_config = "live/s2/run1-frontier.toml"
+panel = "frontier-final"
+rotation = ["opus", "astra", "petra-3"]
+first_index = 400
+adapter_version = 1
