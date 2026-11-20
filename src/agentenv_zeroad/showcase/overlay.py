@@ -4,7 +4,7 @@ backstory card and the intermission card, served on loopback to the stream's own
 import hmac
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 import uvicorn
@@ -34,13 +34,14 @@ class SessionView(Protocol):
     def table(self) -> list[dict]: ...
 
 
-def hold_of(match: Any) -> dict | None:
-    """The seat the lockstep clock is holding for: its model and how long the hold has lasted."""
+def hold_of(match: Any, names: Mapping[str, str] | None = None) -> dict | None:
+    """The seat the lockstep clock is holding for: its name on the board (`names` maps slot to it: never a raw model id)
+    and how long the hold has lasted."""
     holding = getattr(getattr(match, "lockstep", None), "holding", None)
     if not holding:
         return None
-    model = next((s["model"] for s in overlay_state(match)["seats"] if s["slot"] == holding["slot"]), None)
-    return {"model": model, "waited_s": round(max(0.0, match.now() - holding["since"]), 1)}
+    name = (names or {}).get(str(holding["slot"]))
+    return {"name": name, "waited_s": round(max(0.0, match.now() - holding["since"]), 1)}
 
 
 def _latest_no_result_reason(session: SessionView) -> str | None:

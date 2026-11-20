@@ -286,3 +286,24 @@ def test_a_pending_row_round_trips_and_is_not_counted() -> None:
     session.add(row)
     assert session.table() == [{"opponent": "Opus", "w": 0, "l": 0, "d": 0, "nr": 0}]
     assert session.dropped() == set()
+
+
+def test_only_exception_like_names_are_kept_in_an_engine_reason() -> None:
+    from agentenv_zeroad.showcase.results import _engine_reason
+
+    assert _engine_reason("OSError: no display") == "engine failed (OSError)"
+    assert _engine_reason("httpx.ConnectTimeout: x") == "engine failed (httpx.ConnectTimeout)"
+    assert _engine_reason("MyException: x") == "engine failed (MyException)"
+    assert _engine_reason("stopped: ") == "engine failed"
+    assert _engine_reason("bucket-name-7: gone") == "engine failed"
+    assert _engine_reason("Connection refused by s3-host: x") == "engine failed"
+
+
+def test_an_opponent_that_could_not_be_reached_is_a_no_result_that_blames_it_with_no_lockstep_problems() -> None:
+    results = {
+        "status": "failed",
+        "spec": json.loads(FIXTURE.read_text())["spec"],
+        "showcase": {"unreachable": "Opus unreachable"},
+    }
+    row = classify(results, index=2, opponent="Opus", policy_slot="1")
+    assert (row.result, row.reason, row.blame, row.problems) == ("no_result", "Opus unreachable", "opponent", [])

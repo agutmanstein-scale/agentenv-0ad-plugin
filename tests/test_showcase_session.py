@@ -8,15 +8,26 @@ import asyncio
 import json
 import os
 import signal
+import threading
 from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from agentenv_zeroad.showcase import __main__ as main_mod
 from agentenv_zeroad.showcase import session as session_mod
-from agentenv_zeroad.showcase.__main__ import _check, budget_ok, check_with_retries, main, unwritable
+from agentenv_zeroad.showcase.__main__ import (
+    _check,
+    budget_ok,
+    check_with_retries,
+    exit_code,
+    game_problems,
+    main,
+    unwritable,
+)
 from agentenv_zeroad.showcase.results import GameRow, Session
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
@@ -31,6 +42,37 @@ FIXTURE = Path(__file__).parent / "fixtures" / "showcase_results_frontier.json"
 ROTATION = ("opus", "astra", "petra-3")
 GAME_S = 100.0
 FAST_PACE_S = 0.001
+
+
+class RelayStub:
+    """mediamtx's API on loopback: `GET /v3/paths/get/zeroad` says whether the path has a stream."""
+
+    def __init__(self) -> None:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = json.dumps({"name": "zeroad", "ready": stub.ready}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:
+                return None
+
+        self.ready = True
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v3/paths/get/zeroad"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+RELAY = RelayStub()
+
+
+@pytest.fixture(autouse=True)
+def relay_up() -> None:
+    RELAY.ready = True
 
 
 class CountingModel(FakeStrategist):
@@ -85,6 +127,8 @@ class World:
         self.preflights = 0
         self.skipped: list[set[str]] = []
         self.policy_fails = False
+        self.game_checks: list[str] = []
+        self.game_problems: dict[str, dict[str, str]] = {}
         self.spend: list[tuple[str, float]] = []
         self.on_call: Any = None
         self.cap_minutes = cap_minutes
@@ -112,6 +156,7 @@ class World:
             "intermission_s": 5.0,
             "hours": 6.0,
             "pace_s": FAST_PACE_S,
+            "relay_status_url": RELAY.url,
         }
         return SessionOptions(**{**args, **over})
 
@@ -138,6 +183,10 @@ class World:
             self.skipped.append(set(skip))
             return self.preflight
 
+        async def check_game(opponent: str) -> dict[str, str]:
+            self.game_checks.append(opponent)
+            return self.game_problems.get(opponent, {})
+
         def model_for(seat, slot):
             self.seen.append((seat, slot))
             if seat.trainable:
@@ -156,6 +205,7 @@ class World:
             record_spend=lambda what, usd: self.spend.append((what, usd)),
             now=lambda: self.t,
             sleep=sleep or fake_sleep,
+            check_game=check_game,
         )
 
     def run(self, opts: SessionOptions | None = None, broadcast: Any = None) -> Session:
@@ -316,9 +366,15 @@ def test_games_are_paced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 class FakeBroadcast:
-    def __init__(self) -> None:
+    record_path = Path("/nonexistent/recording.mp4")
+
+    def __init__(self, *, start_fails_after: int | None = None) -> None:
         self.calls: list[str] = []
         self.url = ""
+        self.recording = False
+        self.overlay_alive = False
+        self.starts = 0
+        self.start_fails_after = start_fails_after
 
     async def open_display(self) -> str:
         self.calls.append("open")
@@ -327,12 +383,17 @@ class FakeBroadcast:
     async def start(self, url: str) -> None:
         self.calls.append("start")
         self.url = url
+        self.starts += 1
+        if self.start_fails_after is not None and self.starts > self.start_fails_after:
+            raise RuntimeError("ffmpeg exited with 1 at start")
+        self.recording = self.overlay_alive = True
 
     async def attach_game(self) -> None:
         self.calls.append("attach")
 
     async def stop(self) -> None:
         self.calls.append("stop")
+        self.recording = self.overlay_alive = False
 
 
 class FakeOverlay:
@@ -369,6 +430,8 @@ def test_broadcast_starts_once_and_the_overlay_shows_the_intermission(
     assert len(token) >= 24 and f"token={token}" in broadcast.url and broadcast.url.startswith("http://127.0.0.1:")
     assert FakeOverlay.last.running is False
     first = shots[0]
+    headline = first["intermission"]["last"]["headline"]
+    assert "net_worth" not in headline
     assert first["phase"] == "intermission" and first["intermission"]["next"] == "Astra"
     assert first["series"]["opponent"] == "Opus" and first["series"]["game"] == 1
     assert [row["opponent"] for row in first["session"]["table"]] == ["Opus", "Astra", "Petra-3"]
@@ -419,9 +482,12 @@ def test_verify_cli_exits_1_on_a_problem(tmp_path: Path, capsys: pytest.CaptureF
     assert results["spec"]["game_id"] in out and "landed 5200 ms later, not 5000" in out
 
 
-def test_preflight_runs_before_every_game(world: World) -> None:
-    world.run(world.opts(max_games=2))
-    assert world.preflights >= 2
+def test_every_rotation_model_is_checked_before_game_1_and_only_that_games_seats_before_later_ones(
+    world: World,
+) -> None:
+    world.run(world.opts(max_games=3))
+    assert world.preflights == 1
+    assert world.game_checks == ["astra", "petra-3"]
 
 
 def test_preflight_refuses_a_200_without_the_model_and_a_bad_key() -> None:
@@ -436,10 +502,34 @@ def test_preflight_refuses_a_200_without_the_model_and_a_bad_key() -> None:
 
     served = lambda ids: lambda request: httpx.Response(200, json={"data": [{"id": i} for i in ids]})  # noqa: E731
     assert check(served(["local/policy-v1"])) is None
-    assert "not among the models" in check(served(["local/qwen-base"]))
     assert check(lambda request: httpx.Response(401)) == "local/policy-v1: HTTP 401"
-    assert "could not be read" in check(lambda request: httpx.Response(200, text="<html>"))
-    assert "secret-key" not in (check(served([])) or "")
+    assert "secret-key" not in (check(lambda request: httpx.Response(500)) or "")
+
+
+def test_a_model_the_list_omits_passes_on_one_token_chat_completion_that_answers_200() -> None:
+    seat = SeatSpec(kind="llm", civ="rome", model="openai/gpt-6-astra", base_url="http://v.invalid/v1", api_key_env="K")
+    seen: list[httpx.Request] = []
+
+    def check(completion: int, listing: Any = None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if request.method == "GET":
+                return listing or httpx.Response(200, json={"data": [{"id": "other"}]})
+            return httpx.Response(completion, json={})
+
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                return await _check(seat, {"K": "secret-key"}, http)
+
+        return asyncio.run(go())
+
+    assert check(200) is None
+    post = next(r for r in seen if r.method == "POST")
+    assert json.loads(post.content)["max_tokens"] == 1 and json.loads(post.content)["model"] == "openai/gpt-6-astra"
+    assert post.url.path.endswith("/v1/chat/completions")
+    for answer in (check(401), check(503, httpx.Response(200, text="<html>"))):
+        assert answer is not None and "secret-key" not in answer and "v.invalid" not in answer
+    assert check(401) == "openai/gpt-6-astra: HTTP 401"
 
 
 def test_two_policy_no_results_in_a_row_end_the_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -459,12 +549,15 @@ def test_an_interrupted_game_is_a_no_result_and_its_start_is_not_replayed(world:
 
     asyncio.run(interrupted())
     saved = json.loads((world.out / "session.json").read_text())
-    assert [r["result"] for r in saved["rows"]] == ["pending"]
+    assert [(r["result"], r["reason"], r["blame"]) for r in saved["rows"]] == [
+        ("no_result", "the runner failed", "engine")
+    ]
+    assert saved["ended"] == "crashed"
     assert len(world.spend) == 1 and world.spend[0][1] == 9.0  # booked at its caps
     world.on_call = None
     again = world.run(world.opts(max_games=1))
     first, second = again.rows
-    assert (first.result, first.blame, first.reason) == ("no_result", "engine", "the box or the runner failed")
+    assert (first.result, first.blame) == ("no_result", "engine")
     assert second.seed != first.seed and second.opponent == "Astra"
 
 
@@ -543,7 +636,8 @@ def test_preflight_skips_dropped_opponents(tmp_path: Path, monkeypatch: pytest.M
     world = World(tmp_path, monkeypatch, cap_minutes=3.0)
     world.failing = {"astra"}
     world.run(world.opts(max_games=6))
-    assert world.skipped[0] == set() and world.skipped[-1] == {"astra"}
+    assert world.skipped == [set()]  # the strict check runs once, before game 1; astra's later games are checked alone
+    assert world.game_checks.count("astra") == 2  # then it is dropped and never checked again
 
 
 def test_sigterm_interrupts_a_preflight_in_progress(world: World) -> None:
@@ -592,7 +686,7 @@ def test_preflight_retries_each_model_three_times_ten_seconds_apart() -> None:
         sleeps.append(seconds)
 
     def handler(request):
-        code = next(answers)
+        code = next(answers) if request.method == "GET" else 503
         return httpx.Response(code, json={"data": [{"id": "m"}]})
 
     async def go(h):
@@ -602,6 +696,43 @@ def test_preflight_retries_each_model_three_times_ten_seconds_apart() -> None:
     assert asyncio.run(go(handler)) is None and sleeps == [10.0, 10.0]
     sleeps.clear()
     assert asyncio.run(go(lambda request: httpx.Response(503))) == "m: HTTP 503" and sleeps == [10.0, 10.0]
+
+
+def test_a_later_games_seats_are_tried_five_times_fifteen_seconds_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    seat = SeatSpec(kind="llm", civ="rome", model="m", base_url="http://v.invalid/v1", api_key_env="K")
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))) as http:
+            return await check_with_retries(seat, {"K": "k"}, http, sleep, tries=5, retry_s=15.0)
+
+    assert asyncio.run(go()) == "m: HTTP 503" and sleeps == [15.0] * 4
+
+
+def test_game_problems_names_the_unreachable_role_and_leaves_petra_unchecked(monkeypatch: pytest.MonkeyPatch) -> None:
+    opts = SessionOptions(out=Path("unused"), rotation=ROTATION, policy_url="http://vllm.invalid:8000")
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "vllm.invalid" in str(request.url):
+            return httpx.Response(200, json={"data": [{"id": "local/policy-v1"}]})
+        return httpx.Response(503)
+
+    async def go(opponent: str):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            return await game_problems(CFG, opts, http, opponent, sleep)
+
+    for var in ("LITELLM_API_KEY", "VLLM_API_KEY"):
+        monkeypatch.setenv(var, "k")
+    found = asyncio.run(go("opus"))
+    assert list(found) == ["opponent"] and "HTTP 503" in found["opponent"] and sleeps == [15.0] * 4
+    assert asyncio.run(go("petra-3")) == {}
 
 
 def test_budget_check_is_called_without_recording(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -653,3 +784,225 @@ def test_a_pending_row_is_a_verify_problem(tmp_path: Path, capsys: pytest.Captur
     session.save()
     assert main(["verify", str(tmp_path)]) == 1
     assert "g-pending: the game never finished (pending)" in capsys.readouterr().out
+
+
+def test_an_unreachable_opponent_is_a_no_result_that_books_no_spend_and_the_rotation_moves_on(world: World) -> None:
+    world.game_problems = {"astra": {"opponent": "openai/gpt-6-astra: no answer (ConnectTimeout)"}}
+    session = world.run(world.opts(max_games=3))
+    opus, astra, petra = session.rows
+    assert (astra.opponent, astra.result, astra.reason, astra.blame) == (
+        "Astra",
+        "no_result",
+        "Astra unreachable",
+        "opponent",
+    )
+    assert astra.problems == [] and astra.seed not in {opus.seed, petra.seed}
+    assert opus.result in ("win", "loss", "draw") and petra.opponent == "Petra-3"
+    assert dict(world.spend)[astra.game_id] == 0.0 and len(world.handles) == 2  # no engine for it
+    assert "openai" not in json.dumps([r.to_json() for r in session.rows])
+
+
+def test_an_opponent_unreachable_twice_is_dropped(world: World) -> None:
+    world.game_problems = {"astra": {"opponent": "x"}}
+    session = world.run(world.opts(max_games=8))
+    assert session.dropped() == {"Astra"}
+    assert names(session).count("Astra") == 2
+
+
+def test_an_unreachable_policy_ends_the_session_as_policy(world: World) -> None:
+    world.game_problems = {"astra": {"policy": "local/policy-v1: no answer (ConnectError)"}}
+    session = world.run(world.opts(max_games=3))
+    assert [r.opponent for r in session.rows] == ["Opus"] and session.ended == "policy"
+    assert "policy" in (session.ended_why or "")
+
+
+def test_exit_code_is_0_only_when_a_session_ran_and_ended_normally() -> None:
+    def session(ended: str | None, rows: list[GameRow]) -> Session:
+        s = Session(Path("unused.json"))
+        s.rows, s.ended = rows, ended
+        return s
+
+    def row(**over: Any) -> GameRow:
+        base: dict[str, Any] = {
+            "index": 0, "game_id": "g", "opponent": "Opus", "seed": 1, "policy_slot": "1", "result": "win",
+            "how": "conquest", "reason": None, "failed": {}, "decisions": {}, "played_at": 0.0,
+        }  # fmt: skip
+        return GameRow(**{**base, **over})
+
+    for refusal in ("preflight", "budget", "poweroff", "starts", "opponents"):
+        assert exit_code(session(refusal, [])) == 1, refusal
+        assert exit_code(session(refusal, [row(carried_from="20261119-100000")])) == 1, refusal  # none of its own
+        assert exit_code(session(refusal, [row()])) == 0, refusal  # a per-game refusal after a game
+    for normal in ("hours", "max_games", "stopped"):
+        assert exit_code(session(normal, [])) == 0, normal
+
+
+def test_the_runner_exits_non_zero_on_a_refusal_before_game_1_and_zero_after_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, world: World
+) -> None:
+    ledger = tmp_path / "spend.jsonl"
+    monkeypatch.setenv("ZEROAD_SPEND_LEDGER", str(ledger))
+    monkeypatch.setenv("LIVE_BUDGET_USD", "60")
+    out = tmp_path / "run"
+    plan = {"session": None}
+
+    async def fake_run_session(opts: Any, cfg: Any, deps: Any, broadcast: Any) -> Session:
+        return plan["session"]
+
+    monkeypatch.setattr(main_mod, "run_session", fake_run_session)
+    argv = ["run", "--out", str(out), "--config", str(ROOT / "live" / "showcase" / "showcase.toml")]
+    plan["session"] = world.run(world.opts(max_games=0, hours=6.0))
+    plan["session"].ended = "preflight"
+    assert main(argv) == 1
+    plan["session"] = world.run(world.opts(max_games=1))
+    assert main(argv) == 0
+
+
+def test_a_crash_raises_and_leaves_no_pending_row(world: World) -> None:
+    async def explode(skip) -> list[str]:
+        raise RuntimeError("boom")
+
+    deps = replace(world.deps(), preflight=explode)
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_session(world.opts(), CFG, deps, None))
+    saved = json.loads((world.out / "session.json").read_text())
+    assert saved["ended"] == "crashed" and saved["rows"] == []
+
+
+def _earlier_session_with_a_pending_row(world: World) -> Path:
+    earlier = world.run(world.opts(max_games=2))
+    path = world.out / "session.json"
+    data = json.loads(path.read_text())
+    data["rows"][-1]["result"] = "pending"  # a SIGKILL leaves the claimed row as it was
+    data["rows"][-1].update(how=None, reason=None, blame=None)
+    path.write_text(json.dumps(data))
+    assert len(earlier.rows) == 2
+    return world.out
+
+
+def test_continue_starts_the_table_from_the_earlier_sessions_rows_and_marks_them_carried(world: World) -> None:
+    folder = _earlier_session_with_a_pending_row(world)
+    later = world.out.parent / "later"
+    session = world.run(world.opts(out=later, max_games=1, continue_from=folder))
+    carried, mine = session.rows[:2], session.rows[2:]
+    assert [r.carried_from for r in carried] == [folder.name] * 2 and [r.carried_from for r in mine] == [None]
+    assert carried[0].result in ("win", "loss", "draw")
+    assert (carried[1].result, carried[1].reason, carried[1].blame) == (
+        "no_result",
+        "the box or the runner failed",
+        "engine",
+    )
+    assert [r.index for r in session.rows] == [0, 1, 2] and len({r.seed for r in session.rows}) == 3
+    assert mine[0].opponent == "Petra-3"  # the rotation goes on after the carried games
+    saved = json.loads((later / "session.json").read_text())
+    assert [r["carried_from"] for r in saved["rows"]] == [folder.name, folder.name, None]
+    table = {t["opponent"]: t for t in session.table()}
+    assert table["Opus"]["w"] + table["Opus"]["l"] + table["Opus"]["d"] == 1 and table["Astra"]["nr"] == 1
+
+
+def test_without_continue_a_new_session_starts_at_0_0(world: World) -> None:
+    _earlier_session_with_a_pending_row(world)
+    session = world.run(world.opts(out=world.out.parent / "later", max_games=1))
+    assert len(session.rows) == 1 and session.rows[0].carried_from is None
+    assert session.rows[0].opponent == "Opus"
+    assert sum(t["w"] + t["l"] + t["d"] + t["nr"] for t in session.table()) == 1
+
+
+def test_continue_needs_the_earlier_sessions_file(world: World) -> None:
+    with pytest.raises(ValueError, match="cannot continue"):
+        world.run(world.opts(out=world.out.parent / "later", continue_from=world.out.parent / "never-was"))
+
+
+def _boundary_broadcast(world: World, monkeypatch: pytest.MonkeyPatch, broadcast: FakeBroadcast, *, break_it: Any):
+    """Run 2 games on `broadcast`; `break_it(broadcast)` runs in the first intermission."""
+    monkeypatch.setattr(session_mod, "OverlayServer", FakeOverlay)
+
+    async def sleep(seconds: float) -> None:
+        if seconds == 5.0:
+            if broadcast.calls.count("attach") + broadcast.starts == 1:
+                break_it(broadcast)
+            world.t += seconds
+        await asyncio.sleep(0.001)
+
+    return asyncio.run(run_session(world.opts(max_games=2), CFG, world.deps(sleep=sleep), broadcast))  # type: ignore[arg-type]
+
+
+def test_a_dead_ffmpeg_is_restarted_at_the_game_boundary(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    broadcast = FakeBroadcast()
+    session = _boundary_broadcast(world, monkeypatch, broadcast, break_it=lambda b: setattr(b, "recording", False))
+    assert broadcast.calls == ["open", "start", "stop", "open", "start", "attach", "stop"]
+    assert len(session.rows) == 2 and session.ended == "max_games"
+
+
+def test_a_dead_chrome_or_a_relay_without_the_stream_is_restarted_too(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chrome = FakeBroadcast()
+    _boundary_broadcast(world, monkeypatch, chrome, break_it=lambda b: setattr(b, "overlay_alive", False))
+    assert chrome.calls.count("start") == 2
+    relay = FakeBroadcast()
+
+    def relay_drops(b: FakeBroadcast) -> None:
+        RELAY.ready = False
+        original = b.start
+
+        async def start(url: str) -> None:
+            await original(url)
+            RELAY.ready = True  # the restarted ffmpeg publishes again
+
+        b.start = start  # type: ignore[method-assign]
+
+    _boundary_broadcast(world, monkeypatch, relay, break_it=relay_drops)
+    assert relay.calls.count("start") == 2
+
+
+def test_a_failed_restart_ends_the_session_as_broadcast(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    broadcast = FakeBroadcast(start_fails_after=1)
+    session = _boundary_broadcast(world, monkeypatch, broadcast, break_it=lambda b: setattr(b, "recording", False))
+    assert session.ended == "broadcast" and len(session.rows) == 1
+    assert len(world.handles) == 1  # no second engine started
+    assert broadcast.calls[-1] == "stop"
+
+
+def test_checks_that_still_fail_after_the_restart_end_the_session_as_broadcast(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broadcast = FakeBroadcast()
+
+    def relay_never_comes_back(b: FakeBroadcast) -> None:
+        RELAY.ready = False
+
+    session = _boundary_broadcast(world, monkeypatch, broadcast, break_it=relay_never_comes_back)
+    assert session.ended == "broadcast" and broadcast.calls.count("start") == 2
+
+
+def test_the_hold_line_names_the_seat_not_the_model_id(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session_mod, "OverlayServer", FakeOverlay)
+    seen: list[Any] = []
+    world.on_call = lambda: seen.append(FakeOverlay.last.state()["hold"])
+    world.run(world.opts(max_games=1), FakeBroadcast())
+    for hold in (h for h in seen if h):
+        assert hold["name"] in ("Qwen3-8B + RL", "Opus 5.5")
+
+
+def test_verify_does_not_count_a_game_with_no_decision_as_a_problem_when_the_engine_failed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = Session(tmp_path / "session.json")
+    for blame, n in (("engine", 0), ("opponent", 1)):
+        session.add(
+            GameRow(n, f"g{n}", "Opus", n, "1", "no_result", None, "x", {}, {}, 0.0,
+                    problems=["no decision was applied"], blame=blame)  # type: ignore[arg-type]
+        )  # fmt: skip
+    session.save()
+    assert main(["verify", str(tmp_path)]) == 1
+    assert capsys.readouterr().out.splitlines() == ["g1: no decision was applied"]
+
+
+def test_the_intermission_card_words_how_a_game_was_won_never_the_raw_rule() -> None:
+    def card(how: str) -> dict[str, Any]:
+        row = GameRow(0, "g", "Opus", 1, "1", "win", how, None, {}, {}, 0.0)  # type: ignore[arg-type]
+        return session_mod._Runner._card(None, row, "Astra", [])  # type: ignore[arg-type]
+
+    assert card("conquest")["last"]["how"] == "conquest"
+    assert card("net_worth")["last"]["how"] == "ahead on net worth at 30:00"

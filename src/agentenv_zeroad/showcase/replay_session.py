@@ -243,7 +243,8 @@ class _ReplayRunner(_Runner):
         row, screen = played.row, self.screen
         if played.commands is None:
             log.error("game %s has no replay to show", row.game_id)
-            return None if row.blame == "engine" else False
+            unplayed = row.blame == "engine" or "unreachable" in (played.results.get("showcase") or {})
+            return None if unplayed else False
         assert self.deps.start_replay is not None
         process: ReplayHandle | None = None
         try:

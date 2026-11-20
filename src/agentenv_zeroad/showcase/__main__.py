@@ -1,12 +1,14 @@
 """The showcase's command line.
 
     python -m agentenv_zeroad.showcase run --out DIR --config live/showcase/showcase.toml [--hours H] [--max-games N]
-        [--rotation a,b,c] [--mode live|replay]
+        [--rotation a,b,c] [--mode live|replay] [--continue EARLIER_SESSION_DIR]
     python -m agentenv_zeroad.showcase verify DIR
 
 `run` plays a session on this box (`session.run_session`) with the box's real engine, budget guard, power-off deadline
 and broadcast; `verify` re-checks every game of a finished session against the 13-3's lockstep rules and exits 1 if any
-game has a problem. Nothing here prints a key, an endpoint or a prompt.
+game has a problem. `run` exits 0 only when the session ran and ended normally (hours, games, a stop by hand, or
+a refusal after at least one game) and non-zero on a refusal before the first game or a crash: the script that
+runs it powers the box off on 0 alone. Nothing here prints a key, an endpoint or a prompt.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from agentenv_zeroad import live
 from agentenv_zeroad.engine import EngineOptions, RunningEngine, free_port, start_engine
 from agentenv_zeroad.llm import DEFAULT_TIMEOUT_S, base_of
 from agentenv_zeroad.showcase.replay import start_headless_engine, start_replay_process
-from agentenv_zeroad.showcase.results import GameRow, verify_lockstep
+from agentenv_zeroad.showcase.results import NO_DECISION, GameRow, Session, verify_lockstep
 from agentenv_zeroad.showcase.session import SessionDeps, SessionOptions, game_spec, run_session
 from agentenv_zeroad.showcase.specs import ShowcaseConfig
 from agentenv_zeroad.spend import append_ledger
@@ -48,6 +50,10 @@ DEFAULT_VLLM_URL = "http://127.0.0.1:8000"
 READY_TIMEOUT_S = 180.0
 PREFLIGHT_TRIES = 3
 PREFLIGHT_RETRY_S = 10.0
+GAME_PREFLIGHT_TRIES = 5  # a later game's two seats: more patience, since a game is at stake
+GAME_PREFLIGHT_RETRY_S = 15.0
+NORMAL_ENDS = frozenset({"hours", "max_games", "stopped"})
+PING_BODY = {"messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
 
 log = logging.getLogger("agentenv_zeroad.showcase")
 
@@ -62,6 +68,13 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--max-games", type=int, default=None)
     run.add_argument("--rotation", default=None, help="opponents in turn, comma separated (default: the config's)")
     run.add_argument("--mode", choices=("live", "replay"), default="live")
+    run.add_argument(
+        "--continue",
+        dest="continue_from",
+        type=Path,
+        default=None,
+        help="an earlier session's folder: its rows start this session's table (default: start at 0-0)",
+    )
     verify = sub.add_parser("verify", help="check a finished session's games against the lockstep rules")
     verify.add_argument("dir", type=Path)
     return p
@@ -100,7 +113,7 @@ def verify_dir(directory: Path) -> int:
     found = 0
     for raw in data.get("rows", []):
         row = GameRow.from_json(raw)
-        problems = list(row.problems)
+        problems = [p for p in row.problems if not (row.blame == "engine" and p == NO_DECISION)]
         results = directory / "games" / row.game_id / "results.json"
         if row.result == "pending":
             problems.append("the game never finished (pending)")
@@ -130,6 +143,7 @@ async def run_command(args: argparse.Namespace) -> int:
         mode=args.mode,
         policy_url=os.environ.get(VLLM_URL_ENV, DEFAULT_VLLM_URL),
         teacher_url=os.environ.get(LITELLM_URL_ENV, UNSET_URL),
+        continue_from=args.continue_from,
     )
     broadcast = live.Broadcast(
         live.BroadcastSettings(
@@ -147,6 +161,7 @@ async def run_command(args: argparse.Namespace) -> int:
             poweroff_left_s=poweroff_left_s,
             model_for=lambda seat, slot: build_model(seat, slot, http=http, cap_usd=opts.seat_cap_usd),
             preflight=lambda skip: preflight_problems(cfg, opts, http, skip),
+            check_game=lambda opponent: game_problems(cfg, opts, http, opponent),
             record_spend=lambda what, usd: append_ledger(Path(ledger), what, usd),
             now=time.monotonic,
             sleep=asyncio.sleep,
@@ -155,7 +170,14 @@ async def run_command(args: argparse.Namespace) -> int:
         )
         session = await run_session(opts, cfg, deps, broadcast)
     print(f"session ended: {session.ended} ({session.ended_why}); {len(session.rows)} games in {opts.out}")
-    return 0
+    return exit_code(session)
+
+
+def exit_code(session: Session) -> int:
+    """0 if the session ran and ended normally, else 1 (a refusal before its first game of its own). A crash never gets
+    here: it raises."""
+    own = [r for r in session.rows if r.carried_from is None]
+    return 0 if session.ended in NORMAL_ENDS or own else 1
 
 
 async def start_paced_engine() -> RunningEngine:
@@ -208,17 +230,40 @@ async def preflight_problems(
     skip: Collection[str] = (),
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> list[str]:
-    """One check per model in the rotation (and the policy's): `GET /v1/models` with the seat's key lists the model.
-    A model call would spend, and the first game's own calls find anything this misses."""
+    """One check per model in the rotation (and the policy's), before the first game: `check_with_retries` of each."""
     seats: dict[str, SeatSpec] = {}
-    run_cfg = cfg.run_config()
-    panel = next(p for p in run_cfg.panels if p.name == cfg.panel)
     for opponent in (o for o in opts.rotation if o not in skip):
-        for seat in game_spec(cfg, run_cfg, panel, opts, cfg.first_index, opponent).seats:
-            if seat.kind == "llm" and seat.model:
-                seats[seat.model] = seat
+        for _, seat in _llm_seats(cfg, opts, opponent):
+            seats[seat.model or ""] = seat
     found = [await check_with_retries(seat, os.environ, http, sleep) for seat in seats.values()]
     return [p for p in found if p]
+
+
+def _llm_seats(cfg: ShowcaseConfig, opts: SessionOptions, opponent: str) -> list[tuple[str, SeatSpec]]:
+    """The model seats of the game against `opponent`, each with its role (`policy` or `opponent`)."""
+    run_cfg = cfg.run_config()
+    panel = next(p for p in run_cfg.panels if p.name == cfg.panel)
+    spec = game_spec(cfg, run_cfg, panel, opts, cfg.first_index, opponent)
+    return [("policy" if s.trainable else "opponent", s) for s in spec.seats if s.kind == "llm" and s.model]
+
+
+async def game_problems(
+    cfg: ShowcaseConfig,
+    opts: SessionOptions,
+    http: httpx.AsyncClient,
+    opponent: str,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> dict[str, str]:
+    """The problems of one later game's two seats by role, each seat tried GAME_PREFLIGHT_TRIES times
+    GAME_PREFLIGHT_RETRY_S apart (a Petra seat has no model to check)."""
+    found: dict[str, str] = {}
+    for role, seat in _llm_seats(cfg, opts, opponent):
+        problem = await check_with_retries(
+            seat, os.environ, http, sleep, tries=GAME_PREFLIGHT_TRIES, retry_s=GAME_PREFLIGHT_RETRY_S
+        )
+        if problem:
+            found[role] = problem
+    return found
 
 
 async def check_with_retries(
@@ -226,35 +271,45 @@ async def check_with_retries(
     environ: Mapping[str, str],
     http: httpx.AsyncClient,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    *,
+    tries: int = PREFLIGHT_TRIES,
+    retry_s: float = PREFLIGHT_RETRY_S,
 ) -> str | None:
-    """`_check`, up to PREFLIGHT_TRIES times PREFLIGHT_RETRY_S apart: a model is reported only if every try fails."""
+    """`_check`, up to `tries` times `retry_s` apart: a model is reported only if every try fails."""
     problem = await _check(seat, environ, http)
-    for _ in range(PREFLIGHT_TRIES - 1):
+    for _ in range(tries - 1):
         if problem is None:
             break
-        await sleep(PREFLIGHT_RETRY_S)
+        await sleep(retry_s)
         problem = await _check(seat, environ, http)
     return problem
 
 
 async def _check(seat: SeatSpec, environ: Mapping[str, str], http: httpx.AsyncClient) -> str | None:
-    """None if the server answers with the seat's key and lists the seat's model, else the problem (never the key or
-    the endpoint)."""
+    """None if the server answers with the seat's key and serves the seat's model, else the problem (never the key or
+    the endpoint). The model is served if `/v1/models` lists it; a LiteLLM wildcard route may not list its ids, so a
+    model not listed is tried with one chat completion of one token, which must answer 200."""
     assert seat.base_url and seat.api_key_env
     key = environ.get(seat.api_key_env)
     if not key:
         return f"{seat.model}: the key variable {seat.api_key_env} is not set"
+    headers = {"Authorization": f"Bearer {key}"}
+    base = base_of(seat.base_url)
     try:
-        response = await http.get(base_of(seat.base_url) + "/v1/models", headers={"Authorization": f"Bearer {key}"})
+        response = await http.get(base + "/v1/models", headers=headers)
+        if response.status_code == 200 and seat.model in _listed(response):
+            return None
+        reply = await http.post(base + "/v1/chat/completions", headers=headers, json={"model": seat.model, **PING_BODY})
     except httpx.HTTPError as e:
         return f"{seat.model}: no answer ({type(e).__name__})"
-    if response.status_code != 200:
-        return f"{seat.model}: HTTP {response.status_code}"
+    return None if reply.status_code == 200 else f"{seat.model}: HTTP {reply.status_code}"
+
+
+def _listed(response: httpx.Response) -> set[str]:
     try:
-        served = {str(m["id"]) for m in response.json()["data"]}
+        return {str(m["id"]) for m in response.json()["data"]}
     except (ValueError, KeyError, TypeError):
-        return f"{seat.model}: its model list could not be read"
-    return None if seat.model in served else f"{seat.model}: not among the models the server lists"
+        return set()
 
 
 if __name__ == "__main__":

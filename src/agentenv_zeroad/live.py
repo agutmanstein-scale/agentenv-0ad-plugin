@@ -481,6 +481,11 @@ class Broadcast:
     def recording(self) -> bool:
         return self._ffmpeg is not None and self._ffmpeg.returncode is None
 
+    @property
+    def overlay_alive(self) -> bool:
+        """Chrome, which draws the overlay into the recording, is running."""
+        return self._chrome is not None and self._chrome.returncode is None
+
     async def stop(self) -> Path | None:
         """Finish the recording and stop everything this broadcast started; the MP4's path, if one was written."""
         ffmpeg, self._ffmpeg = self._ffmpeg, None

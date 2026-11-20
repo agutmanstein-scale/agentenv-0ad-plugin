@@ -29,7 +29,8 @@ INTERFACE = "v2"
 MAX_FAILED_SHARE = 0.1
 FAILURES_IN_A_ROW = 5
 POLICY_NAME = "Qwen"
-EXCEPTION_TYPE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):")
+EXCEPTION_TYPE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Timeout)):")
+NO_DECISION = "no decision was applied"
 RESULTS = {"won": "win", "lost": "loss", "drawn": "draw"}
 HOW = {"conquest": "conquest", "time_cap": "net_worth", "safety_cap": "net_worth"}
 
@@ -56,6 +57,7 @@ class GameRow:
     played_at: float
     problems: list[str] = field(default_factory=list)
     blame: Blame | None = None
+    carried_from: str | None = None  # the earlier session (its folder's name) this row was carried over from
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -95,10 +97,13 @@ def classify(results: Mapping[str, Any], *, index: int, opponent: str, policy_sl
 
     engine = results.get("failed") or (results.get("detail") if results.get("status") == "failed" else None)
     early = (results.get("showcase") or {}).get("ended_early")
+    unreachable = (results.get("showcase") or {}).get("unreachable")
     over = [
         role for role in ("policy", "opponent") if decisions[role] and failed[role] / decisions[role] > MAX_FAILED_SHARE
     ]
-    if engine:
+    if unreachable:
+        result, reason, blame = "no_result", str(unreachable), "opponent"
+    elif engine:
         result, reason, blame = "no_result", _engine_reason(str(engine)), "engine"
     elif early:
         result = "no_result"
@@ -131,7 +136,7 @@ def classify(results: Mapping[str, Any], *, index: int, opponent: str, policy_sl
         failed=failed,
         decisions=decisions,
         played_at=time.time(),
-        problems=verify_lockstep(results) if spec else [],
+        problems=verify_lockstep(results) if spec and not unreachable else [],
         blame=blame,
     )
 
@@ -148,7 +153,7 @@ def verify_lockstep(results: Mapping[str, Any]) -> list[str]:
     decisions = (results.get("lockstep") or {}).get("decisions") or []
     applied = [d for d in decisions if d.get("applied_ms") is not None]
     if not applied:
-        problems.append("no decision was applied")
+        problems.append(NO_DECISION)
     for d in applied:
         gap = d["applied_ms"] - d["frozen_ms"]
         if gap != LATENCY_MS:
