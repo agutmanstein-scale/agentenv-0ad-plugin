@@ -62,7 +62,7 @@
 </head>
 <body>
 <main>
-  <header><h1>0 A.D. Live Arena</h1><div><span class="clock" id="clock">--:--</span>
+  <header><h1 id="title">0 A.D. Live Arena</h1><div><span class="clock" id="clock">--:--</span>
     <span class="cap" id="cap"></span></div></header>
   <div class="replay" id="replay"></div>
   <div class="block" id="series"></div>
@@ -86,6 +86,7 @@ const clock = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return Strin
 const res = r => r ? ["food", "wood", "stone", "metal"].map(k => `<div><span>${k}</span>${r[k]}</div>`).join("") : "";
 
 function thinking(seat, elapsed) {
+  if (last.replay) return "";  // a replay shows no live model call
   if (seat.kind !== "agent") return `<span class="think">${esc(seat.model)}</span>`;
   if (seat.thinking_s != null && seat.thinking_s + elapsed >= 1)
     return `<span class="think on">thinking… ${Math.floor(seat.thinking_s + elapsed)} s</span>`;
@@ -100,6 +101,8 @@ const droppedLines = ss => ss ? (ss.dropped || []).map(t => `<div class="muted">
 // The showcase's blocks are drawn only when the state carries their keys; the env's overlay has none of them.
 function renderShowcase(elapsed) {
   const s = last.series, ss = last.session, im = last.intermission;
+  // the series header names the show: the env's own title, "Live Arena", would call a replay live
+  document.getElementById("title").style.display = s ? "none" : "";
   document.getElementById("replay").textContent = last.replay ? "replay · played " + last.replay.played_at : "";
   document.getElementById("series").innerHTML = s
     ? `<div class="line big"><span>${esc(s.policy)}</span><span>vs ${esc(s.opponent ?? "…")}</span></div>
@@ -107,7 +110,7 @@ function renderShowcase(elapsed) {
   document.getElementById("session").innerHTML = ss
     ? `<h2>Session</h2>${sessionRows(ss.table)}${ss.no_result_reason ? `<div class="muted">no result: ${esc(ss.no_result_reason)}</div>` : ""}${droppedLines(ss)}` : "";
   document.getElementById("hold").textContent = last.hold && !im
-    ? `⏸ waiting on ${last.hold.model ?? "a seat"} · ${(last.hold.waited_s + elapsed).toFixed(1)} s` : "";
+    ? `⏸ waiting on ${last.hold.name ?? "a seat"} · ${(last.hold.waited_s + elapsed).toFixed(1)} s` : "";
   document.getElementById("backstory").innerHTML = last.backstory
     ? last.backstory.map((l, i) => `<div class="${i ? "" : "big"}">${esc(l)}</div>`).join("") : "";
   const card = document.getElementById("intermission");

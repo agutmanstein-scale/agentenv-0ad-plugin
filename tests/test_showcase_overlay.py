@@ -83,10 +83,19 @@ def test_state_has_no_secrets(monkeypatch):
         assert needle not in raw
 
 
-def test_hold_line_names_the_model_and_seconds():
+def test_hold_line_names_the_seat_by_its_board_name_and_the_seconds():
     match = _match(now=100.0, holding={"slot": "2", "since": 93.8})
-    assert hold_of(match) == {"model": "Opus", "waited_s": 6.2}
+    names = {"1": "Qwen3-8B + RL", "2": "Opus 5.5"}
+    assert hold_of(match, names) == {"name": "Opus 5.5", "waited_s": 6.2}
+    assert hold_of(match) == {"name": None, "waited_s": 6.2}  # never the raw model id
+    assert "Opus" not in json.dumps(hold_of(match)) and "policy-v1" not in json.dumps(hold_of(match, names))
     assert hold_of(_match()) is None
+
+
+def test_the_page_hides_the_envs_live_title_in_showcase_states_and_shows_no_live_model_call_in_a_replay():
+    html = overlay_html()
+    assert 'id="title"' in html and 'getElementById("title").style.display = s ? "none" : ""' in html
+    assert "if (last.replay) return" in html and "last.hold.name" in html
 
 
 def test_intermission_replaces_panels():
