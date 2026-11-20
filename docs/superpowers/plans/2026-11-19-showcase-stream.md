@@ -55,7 +55,7 @@ the exact lockstep rules of the 13–3, for a 6-hour session on one g6e.2xlarge.
   loopback relay.
 - **Copy:** the backstory card's text is fixed (Task 6). The header says "replay · played HH:MM ET" in replay mode.
 - **Git:**
-  - branch `v2-showcase`, stacked on `v2-s2` with `gh stack`;
+  - branch `v2-showcase`, PR #9, stacked on `v2-actors` (PR #8) with `gh stack`;
   - push only with `gh stack push`, after the main session's leak grep over `git diff 059c1c2 HEAD` finds nothing
     (its patterns stay outside the repo);
   - commit trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -110,8 +110,9 @@ Tasks 9 and 10 both touch `tests/test_live_scripts.py`, so 10 rebases onto 9.
     is at least 9.8 s, and every gap between step starts is at least 0.2 s.
   - `test_unpaced_clock_never_sleeps_for_pace`: with `pace_s=None`, `metrics()["paced_wait_s"] == 0`, and an instant
     engine with an instant brain ends at virtual time 0.
-  - `test_paced_clock_does_not_burst_after_hold`: one seat answers its first decision in 3.0 s (wall). After the block,
-    the next 10 step-start gaps are all at least 0.2 s.
+  - `test_paced_clock_does_not_burst_after_hold`: one seat answers its first decision in 8.0 s (wall); at 0.2 s a turn
+    the 5 s deadline arrives at 4.8 s, so the block lasts 3.2 s. After it, the next 10 step-start gaps are all at least
+    0.2 s.
   - `test_holding_names_the_slot_during_a_block_and_clears_after`: sampled while blocked,
     `holding == {"slot": "1", "since": <the block's start>}`; `None` after.
   - `test_pacing_changes_nothing_a_seat_sees`: two seats, with deterministic fake decisions answering in 0.5, 4.0, 6.5
@@ -561,8 +562,8 @@ for every AWS write. Every script runs once without `--yes`, is read, then runs 
   - then `live/bootstrap.sh $ID --showcase`, read the plan, then run it with `--yes`.
   - Passes when the bootstrap's smoke call, adapter check and paced engine tests pass.
 - [ ] **Stage 1, the spike** (v50 vs Petra-3, $0 model spend):
-  - Run `live/showcase.sh $ID start --max-games 1 --rotation petra-3 --hours 1 --mode live`, read the plan, then run it
-    with `--yes`.
+  - Run `live/showcase.sh $ID start --max-games 1 --rotation petra-3 --hours 1 --mode live --no-shutdown`, read the plan,
+    then run it with `--yes`. `--no-shutdown` keeps the box up for the replay proof and any retry.
   - Fetch the game with `fetch --with-video` and watch it.
   - Passes when all of these hold:
     - Qwen and the renderer fit on the GPU;
@@ -573,19 +574,21 @@ for every AWS write. Every script runs once without `--yes`, is read, then runs 
     - units move smoothly;
     - `verify` finds no problems;
     - the result on screen matches `results.json`.
-  - Then render the same game in replay mode, and check stage 1's points plus the overlay clock (within 1 s). If live
-    mode fails and replay mode passes, stages 3–5 run in replay mode.
-- [ ] **Stage 3, the test game vs Opus** (go-ahead: restarting the box, then `extend-poweroff.sh`): `--max-games 1
-  --rotation opus`. Passes when all of these hold:
+  - Then prove replay mode on a fresh game (`--max-games 1 --rotation petra-3 --hours 1 --mode replay --no-shutdown`,
+    one more held-out start), and check stage 1's points plus the overlay clock (within 1 s). If live mode fails and
+    replay mode passes, stages 3–5 run in replay mode, where stage 3's hold-line check doesn't apply.
+- [ ] **Stage 3, the test game vs Opus** (go-ahead: restarting the box, then `extend-poweroff.sh` before `start`):
+  `--max-games 1 --rotation opus --hours 1`. Passes when all of these hold:
   - the hold line appears while Opus is late and clears when its reply lands;
   - `verify` finds every order at T + 5 s;
   - the result on screen matches `results.json`;
   - the spend is close to $2.45.
-- [ ] **Stage 4, the rehearsal:** `--hours 2`, one full round. Passes when all of these hold:
+- [ ] **Stage 4, the rehearsal:** `--hours 2 --max-games 3`, one full round. Passes when all of these hold:
   - it runs to the end with nothing done by hand;
   - the session table matches every `results.json`;
   - the upload and then the power-off happen;
   - `fetch --with-video` brings back segments that play.
-- [ ] **Stage 5, the session** (go-ahead: restarting the box, and the user's go): `--hours 6`.
+- [ ] **Stage 5, the session** (go-ahead: restarting the box, and the user's go): `--hours 6`. A restart after a crash
+  or a stop by hand uses `--continue STAMP`, so the record on screen carries on.
 - [ ] **Teardown** when the user says the showcase is done: `live/teardown.sh $ID --yes`. Confirm no `zeroad-showcase`
   instance is left, and report the box hours and the cost.
