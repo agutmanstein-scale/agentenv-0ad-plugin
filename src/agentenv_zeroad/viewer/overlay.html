@@ -21,6 +21,7 @@
   .detail { color: var(--gold); font-size: 14px; min-height: 1em; }
   .board { display: flex; flex-direction: column; gap: 4px; background: var(--panel); border: 1px solid var(--line);
            border-radius: 8px; padding: 8px 10px; }
+  .board:empty { display: none; }
   .board div { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
   .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
   .seat { background: var(--panel); border: 1px solid var(--line); border-left: 6px solid var(--c);
@@ -106,7 +107,7 @@ function renderShowcase(elapsed) {
   document.getElementById("replay").textContent = last.replay ? "replay · played " + last.replay.played_at : "";
   document.getElementById("series").innerHTML = s
     ? `<div class="line big"><span>${esc(s.policy)}</span><span>vs ${esc(s.opponent ?? "…")}</span></div>
-       <div class="line"><span>game ${s.game} · round ${s.round}</span><span>${esc(s.clock)}</span></div>` : "";
+       <div class="line"><span>game ${s.game} · round ${s.round}</span><span>${im ? "" : esc(s.clock)}</span></div>` : "";
   document.getElementById("session").innerHTML = ss
     ? `<h2>Session</h2>${sessionRows(ss.table)}${ss.no_result_reason ? `<div class="muted">no result: ${esc(ss.no_result_reason)}</div>` : ""}${droppedLines(ss)}` : "";
   document.getElementById("hold").textContent = last.hold && !im
@@ -126,8 +127,8 @@ function render() {
   last.seats ??= []; last.scoreboard ??= [];  // no match between games: the showcase blocks still draw
   const elapsed = last.status === "playing" ? (performance.now() - fetchedAt) / 1000 : 0;
   document.body.classList.toggle("compact", last.seats.length > 2);
-  document.getElementById("clock").textContent = clock((last.game_ms ?? 0) + elapsed * 1000);
-  document.getElementById("cap").textContent = last.cap ? "/ " + last.cap : "";
+  document.getElementById("clock").textContent = last.intermission ? "" : clock((last.game_ms ?? 0) + elapsed * 1000);
+  document.getElementById("cap").textContent = last.cap && !last.intermission ? "/ " + last.cap : "";
   document.getElementById("detail").textContent = last.detail || (last.status === "starting" ? "Starting…" : "");
   document.getElementById("board").innerHTML = last.scoreboard.map((s, i) =>
     `<div><span><span class="swatch" style="background:${esc(s.color)}"></span>${i + 1}. ${esc(s.name)}</span><b>${s.score}</b></div>`).join("");

@@ -110,6 +110,14 @@ def test_intermission_replaces_panels():
     assert "last.intermission" in html and 'id="seats"' in html
 
 
+def test_the_page_shows_no_clock_and_no_empty_board_between_games():
+    html = overlay_html()
+    assert 'textContent = last.intermission ? "" : clock(' in html
+    assert 'last.cap && !last.intermission ? "/ " + last.cap : ""' in html
+    assert '<span>${im ? "" : esc(s.clock)}</span>' in html
+    assert ".board:empty { display: none; }" in html
+
+
 def test_table_rows_in_rotation_order_with_no_result_reason():
     rows = [
         SimpleNamespace(result="win", reason=None),
