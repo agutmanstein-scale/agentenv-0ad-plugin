@@ -431,32 +431,76 @@ def test_a_failing_ledger_write_in_replay_mode_propagates_as_in_live_mode(rig: R
 
 def test_the_clock_starts_when_the_first_frame_was_seen_even_if_the_broadcast_starts_later(rig: Rig) -> None:
     events: list[str] = []
-    clocks: list[HeldClock] = []
+    now = [100.0]
+    at_start: list[tuple[float | None, int]] = []
 
     class Broadcast(FakeBroadcast):
         async def start(self, url: str) -> None:
             for _ in range(5):  # the window, Chrome and ffmpeg take seconds; the engine's map loads meanwhile
                 await asyncio.sleep(0.01)
+            now[0] = 105.0
             events.append("window")
 
     class Early(FakeReplay):
         async def first_frame(self, timeout_s: float) -> float | None:
             events.append("first_frame")
-            return 101.0  # seen long before the broadcast was up
+            return 101.0  # seen 4 s before the broadcast was up
 
-    def make_clock() -> HeldClock:
-        clocks.append(HeldClock(lambda: False))
-        return clocks[-1]
+    class Clock(WallReplayClock):
+        def start(self, at: float | None = None) -> None:
+            super().start(at)
+            at_start.append((at, self.game_ms()))
+            now[0] += 3600  # the game is over: let the session finish
 
     base = rig.deps()
 
     async def start_replay(commands: Path) -> Early:
         return Early(commands, rig.stopped)
 
-    deps = replace(base, start_replay=start_replay, replay_clock=make_clock)
+    deps = replace(base, start_replay=start_replay, replay_clock=lambda: Clock(lambda: now[0]))
     rig.run(deps=deps, broadcast=Broadcast(), max_games=1)
     assert events[:2] == ["first_frame", "window"]  # the watch runs while the broadcast starts
-    assert clocks[0].at == 101.0
+    assert at_start == [(101.0, 4000)]  # the game time is counted from the first frame, not from the broadcast
+
+
+def _stop_during_the_first_frame_watch(rig: Rig, *, in_show: bool) -> list[bool]:
+    cancelled: list[bool] = []
+
+    class Broadcast(FakeBroadcast):
+        async def start(self, url: str) -> None:
+            if in_show:
+                os.kill(os.getpid(), signal.SIGTERM)
+                await asyncio.sleep(3600)
+
+    class Waiting(FakeReplay):
+        async def first_frame(self, timeout_s: float) -> float | None:
+            if not in_show:
+                await asyncio.sleep(0.05)  # the broadcast is up by now
+                os.kill(os.getpid(), signal.SIGTERM)
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return None
+
+    base = rig.deps()
+
+    async def start_replay(commands: Path) -> Waiting:
+        return Waiting(commands, rig.stopped)
+
+    before = signal.getsignal(signal.SIGTERM)
+    session = rig.run(deps=replace(base, start_replay=start_replay), broadcast=Broadcast(), max_games=1)
+    assert session.ended == "stopped" and signal.getsignal(signal.SIGTERM) == before
+    return cancelled
+
+
+def test_a_stop_while_the_broadcast_starts_ends_the_session_and_cancels_the_first_frame_watch(rig: Rig) -> None:
+    assert _stop_during_the_first_frame_watch(rig, in_show=True) == [True]
+
+
+def test_a_stop_while_the_first_frame_is_awaited_ends_the_session_and_cancels_the_watch(rig: Rig) -> None:
+    assert _stop_during_the_first_frame_watch(rig, in_show=False) == [True]
 
 
 def test_the_first_frame_watch_is_cancelled_when_the_broadcast_fails_to_start(rig: Rig) -> None:
