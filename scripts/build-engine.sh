@@ -23,19 +23,29 @@ if [[ "${1:-}" == "rt" || "${1:-}" == "show" ]]; then
   shift
 fi
 docker build -t zeroad-engine:0.28 engine/ "$@"
-if [[ "$target" == "rt" ]]; then
-  have=$(docker image inspect -f '{{index .Config.Labels "zeroad.patches"}}' "$RT_IMAGE" 2>/dev/null || true)
-  if [[ "$have" == "$RT_PATCHES" && "${REBUILD:-}" != 1 ]]; then
-    echo "$RT_IMAGE already carries zeroad.patches=\"$have\"; not rebuilding (REBUILD=1 forces)"
+# A label of patch names cannot tell that a patch's content changed, so the image also carries a hash of the patch files
+# in the order the Dockerfile applies them.
+patch_sha() {
+  local name
+  for name in "$@"; do cat "patches/$name.patch"; done | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16
+}
+# build_patched IMAGE DOCKERFILE NAMES [docker build args]: skip only when names and hash both match.
+build_patched() {
+  local image=$1 dockerfile=$2 names=$3 have have_sha sha
+  shift 3
+  # shellcheck disable=SC2086  # NAMES is a space-separated list
+  sha=$(patch_sha $names)
+  have=$(docker image inspect -f '{{index .Config.Labels "zeroad.patches"}}' "$image" 2>/dev/null || true)
+  have_sha=$(docker image inspect -f '{{index .Config.Labels "zeroad.patches.sha256"}}' "$image" 2>/dev/null || true)
+  if [[ "$have" == "$names" && "$have_sha" == "$sha" && "${REBUILD:-}" != 1 ]]; then
+    echo "$image already carries zeroad.patches=\"$have\" and zeroad.patches.sha256=$have_sha; not rebuilding (REBUILD=1 forces)"
   else
-    docker build -t "$RT_IMAGE" -f engine/Dockerfile.rt patches/ "$@"
+    docker build -t "$image" -f "$dockerfile" --label zeroad.patches.sha256="$sha" patches/ "$@"
   fi
+}
+if [[ "$target" == "rt" ]]; then
+  build_patched "$RT_IMAGE" engine/Dockerfile.rt "$RT_PATCHES" "$@"
 fi
 if [[ "$target" == "show" ]]; then
-  have=$(docker image inspect -f '{{index .Config.Labels "zeroad.patches"}}' "$SHOW_IMAGE" 2>/dev/null || true)
-  if [[ "$have" == "$SHOW_PATCHES" && "${REBUILD:-}" != 1 ]]; then
-    echo "$SHOW_IMAGE already carries zeroad.patches=\"$have\"; not rebuilding (REBUILD=1 forces)"
-  else
-    docker build -t "$SHOW_IMAGE" -f engine/Dockerfile.show patches/ "$@"
-  fi
+  build_patched "$SHOW_IMAGE" engine/Dockerfile.show "$SHOW_PATCHES" "$@"
 fi
