@@ -79,8 +79,9 @@ class ReplayHandle(Protocol):
 
     def exited(self) -> bool: ...
 
-    async def first_frame(self, timeout_s: float) -> bool:
-        """Wait until the replay's first frame is up; False if it is not within `timeout_s`."""
+    async def first_frame(self, timeout_s: float) -> float | None:
+        """Wait until the replay's first frame is up: the `time.monotonic()` at which it was first seen, or None if it
+        is not up within `timeout_s` or the engine exits first."""
         ...
 
     async def stop(self) -> None: ...
@@ -104,13 +105,13 @@ class ReplayProcess:
         except OSError:
             return False
 
-    async def first_frame(self, timeout_s: float) -> bool:
+    async def first_frame(self, timeout_s: float) -> float | None:
         deadline = time.monotonic() + timeout_s
         while not self._logged():
             if self.exited() or time.monotonic() >= deadline:
-                return False
+                return None
             await asyncio.sleep(FIRST_FRAME_POLL_S)
-        return True
+        return time.monotonic()
 
     async def stop(self) -> None:
         await stop_process(self._proc)
@@ -132,23 +133,24 @@ async def start_replay_process(commands: Path, display: str, binary: str | None 
 
 
 class ReplayClock(Protocol):
-    """The game time the replay on screen has reached. `start()` is called when its first frame is up (after
-    `ReplayHandle.first_frame`, not when its window is placed)."""
+    """The game time the replay on screen has reached. `start()` is called when its first frame is up, with the time
+    `ReplayHandle.first_frame` saw it (not when its window is placed, nor when the session got round to it)."""
 
-    def start(self) -> None: ...
+    def start(self, at: float | None = None) -> None: ...
 
     def game_ms(self) -> int: ...
 
 
 class WallReplayClock:
-    """Wall time since `start()`, at 1x; 0 before it."""
+    """Wall time since `start()`, at 1x; 0 before it. `start(at=...)` counts from that time on the clock's own time
+    base (`time.monotonic` by default, as `first_frame` reports) instead of from now."""
 
     def __init__(self, now: Callable[[], float] = time.monotonic) -> None:
         self._now = now
         self._began: float | None = None
 
-    def start(self) -> None:
-        self._began = self._now()
+    def start(self, at: float | None = None) -> None:
+        self._began = self._now() if at is None else at
 
     def game_ms(self) -> int:
         return 0 if self._began is None else max(0, int((self._now() - self._began) * 1000))

@@ -252,13 +252,21 @@ class _ReplayRunner(_Runner):
             timeline = ReplayTimeline(played.results)
             screen.replay = _OnScreen(timeline, clock)
             process = await self._until_stop(self.deps.start_replay(played.commands))
-            await self._until_stop(self._show())
-            first = await self._until_stop(process.first_frame(FIRST_FRAME_TIMEOUT_S))
-            if not first:
+            # The engine loads its map while the broadcast starts (a first game's window, Chrome and ffmpeg take
+            # seconds), so the watch for its first frame runs meanwhile and the clock counts from when it was seen.
+            watch = asyncio.ensure_future(process.first_frame(FIRST_FRAME_TIMEOUT_S))
+            try:
+                await self._until_stop(self._show())
+                first = await self._until_stop(watch)
+            finally:
+                if not watch.done():
+                    watch.cancel()
+                    await asyncio.gather(watch, return_exceptions=True)
+            if first is None:
                 log.warning("no first frame of the replay of %s within %g s", row.game_id, FIRST_FRAME_TIMEOUT_S)
-            clock.start()
+            clock.start(at=first)
             screen.phase = "playing"
-            slack_ms = 0 if first else int(REPLAY_TAIL_S * 1000)
+            slack_ms = 0 if first is not None else int(REPLAY_TAIL_S * 1000)
             return await self._until_stop(self._until_over(process, clock, timeline.end_ms, slack_ms))
         except _Stopped:
             raise

@@ -124,6 +124,8 @@ def test_the_wall_clock_counts_from_the_first_frame() -> None:
     clock.start()
     now[0] = 142.5
     assert clock.game_ms() == 12_500
+    clock.start(at=140.0)  # the first frame was seen before the session got round to starting the clock
+    assert clock.game_ms() == 2_500
 
 
 def test_header_says_replay_and_time_played() -> None:
@@ -182,8 +184,8 @@ class FakeReplay:
     def exited(self) -> bool:
         return self.exits
 
-    async def first_frame(self, timeout_s: float) -> bool:
-        return True
+    async def first_frame(self, timeout_s: float) -> float | None:
+        return 0.0
 
     async def stop(self) -> None:
         self.log.append(self.commands.parent.name)
@@ -193,10 +195,10 @@ class HeldClock:
     """Starts at 0 and, once started, advances 5 s a read unless `hold()` says the screen has to wait."""
 
     def __init__(self, hold: Any) -> None:
-        self.hold, self.ms, self.started = hold, 0, False
+        self.hold, self.ms, self.started, self.at = hold, 0, False, None
 
-    def start(self) -> None:
-        self.started = True
+    def start(self, at: float | None = None) -> None:
+        self.started, self.at = True, at
 
     def game_ms(self) -> int:
         if self.started and not self.hold():
@@ -427,41 +429,66 @@ def test_a_failing_ledger_write_in_replay_mode_propagates_as_in_live_mode(rig: R
         rig.run(deps=replace(rig.deps(), record_spend=boom))
 
 
-def test_the_clock_starts_at_the_first_frame_not_at_the_window(rig: Rig) -> None:
+def test_the_clock_starts_when_the_first_frame_was_seen_even_if_the_broadcast_starts_later(rig: Rig) -> None:
     events: list[str] = []
+    clocks: list[HeldClock] = []
 
     class Broadcast(FakeBroadcast):
         async def start(self, url: str) -> None:
+            for _ in range(5):  # the window, Chrome and ffmpeg take seconds; the engine's map loads meanwhile
+                await asyncio.sleep(0.01)
             events.append("window")
 
-        async def attach_game(self) -> None:
-            events.append("window")
-
-    class Late(FakeReplay):
-        async def first_frame(self, timeout_s: float) -> bool:
-            await asyncio.sleep(0.05)  # the map is still loading after the window is placed
+    class Early(FakeReplay):
+        async def first_frame(self, timeout_s: float) -> float | None:
             events.append("first_frame")
-            return True
+            return 101.0  # seen long before the broadcast was up
 
-    class Clock(HeldClock):
-        def start(self) -> None:
-            events.append("clock")
-            super().start()
+    def make_clock() -> HeldClock:
+        clocks.append(HeldClock(lambda: False))
+        return clocks[-1]
 
     base = rig.deps()
 
-    async def start_replay(commands: Path) -> Late:
-        return Late(commands, rig.stopped)
+    async def start_replay(commands: Path) -> Early:
+        return Early(commands, rig.stopped)
 
-    deps = replace(base, start_replay=start_replay, replay_clock=lambda: Clock(lambda: False))
+    deps = replace(base, start_replay=start_replay, replay_clock=make_clock)
     rig.run(deps=deps, broadcast=Broadcast(), max_games=1)
-    assert events[:3] == ["window", "first_frame", "clock"]
+    assert events[:2] == ["first_frame", "window"]  # the watch runs while the broadcast starts
+    assert clocks[0].at == 101.0
+
+
+def test_the_first_frame_watch_is_cancelled_when_the_broadcast_fails_to_start(rig: Rig) -> None:
+    cancelled: list[bool] = []
+
+    class Broadcast(FakeBroadcast):
+        async def start(self, url: str) -> None:
+            await asyncio.sleep(0.01)
+            raise OSError("no display")
+
+    class Waiting(FakeReplay):
+        async def first_frame(self, timeout_s: float) -> float | None:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return None
+
+    base = rig.deps()
+
+    async def start_replay(commands: Path) -> Waiting:
+        return Waiting(commands, rig.stopped)
+
+    rig.run(deps=replace(base, start_replay=start_replay), broadcast=Broadcast(), max_games=1)
+    assert cancelled
 
 
 def test_a_missing_first_frame_starts_the_clock_anyway_with_slack(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     class Never(FakeReplay):
-        async def first_frame(self, timeout_s: float) -> bool:
-            return False
+        async def first_frame(self, timeout_s: float) -> float | None:
+            return None
 
     reads: list[int] = []
 
