@@ -44,12 +44,35 @@ def test_the_patched_frame_loop_runs_one_turn_per_step_and_replies_after_it(tmp_
     assert 'g_CmdLineArgs.Has("rl-paced")' in cpp
     update = cpp.split("void Interface::PacedUpdate")[1].split("\n}\n")[0]
     assert "GetSimulation2()->Interpolate(" in update, "the idle frame must keep interpolating"
-    assert "Update(" not in update.replace("Interpolate(", ""), "the frame loop must not feed sim time"
+    no_clock = update.replace("Interpolate(", "").replace("GetTimeManager().Update(", "")
+    assert "Update(" not in no_clock, "the frame loop must not feed sim time (only the renderer's clock moves)"
     step = cpp.split("case GameMessageType::Commands")[1].split("case GameMessageType::Evaluate")[0]
-    assert "g_Game->Update(deltaRealTime / 1000.0, false)" in step
+    assert "GetTurnManager()->Update(deltaSimTime, maxTurns)" in step.split("else if (m_Paced)")[1]
     assert step.index("else if (m_Paced)") < step.index("g_Game->Update(deltaRealTime);")
     main = (tree / "source/main.cpp").read_text()
     assert main.index("rlInterface->PacedUpdate(") < main.index("rlInterface->AdvancesInRealTime()")
+
+
+@needs_patch
+def test_the_paced_step_runs_the_turn_without_advancing_the_renderer_clock(tmp_path):
+    tree = _paced_tree(tmp_path)
+    assert _patch(tree, PACED).returncode == 0
+    cpp = (tree / "source/rlinterface/RLInterface.cpp").read_text()
+    paced = cpp.split("else if (m_Paced)")[1].split("else if (!m_RealTime)")[0]
+    assert "GetTurnManager()->Update(" in paced
+    assert '"SimulationUpdate"' in paced and "MakeDirty()" in paced
+    assert "g_Game->Update(" not in paced and "GetTimeManager()" not in paced
+
+
+@needs_patch
+def test_paced_update_advances_the_renderer_clock_with_the_blend(tmp_path):
+    tree = _paced_tree(tmp_path)
+    assert _patch(tree, PACED).returncode == 0
+    cpp = (tree / "source/rlinterface/RLInterface.cpp").read_text()
+    update = cpp.split("void Interface::PacedUpdate")[1].split("\n}\n")[0]
+    assert "CRenderer::IsInitialised()" in update
+    clock = update.split("GetTimeManager().Update(")[1]
+    assert "m_PacedBlend - " in clock.split(";")[0]
 
 
 def test_the_show_image_builds_all_three_patches_in_order_and_says_so_in_its_label():

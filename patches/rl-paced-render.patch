@@ -15,7 +15,25 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  		g_Game->GetView()->Update(float(realTimeSinceLastFrame));
 --- a/source/rlinterface/RLInterface.cpp
 +++ b/source/rlinterface/RLInterface.cpp
-@@ -42,6 +42,7 @@
+@@ -21,6 +21,8 @@
+ 
+ #include "rlinterface/RLInterface.h"
+ 
++#include "graphics/GameView.h"
++#include "graphics/LOSTexture.h"
+ #include "gui/GUIManager.h"
+ #include "lib/debug.h"
+ #include "lib/types.h"
+@@ -31,6 +33,8 @@
+ #include "ps/GameSetup/CmdLineArgs.h"
+ #include "ps/GameSetup/GameSetup.h"
+ #include "ps/Loader.h"
++#include "renderer/Renderer.h"
++#include "renderer/TimeManager.h"
+ #include "scriptinterface/JSON.h"
+ #include "scriptinterface/Object.h"
+ #include "scriptinterface/ScriptInterface.h"
+@@ -42,6 +46,7 @@
  #include "simulation2/system/LocalTurnManager.h"
  #include "simulation2/system/TurnManager.h"
  
@@ -23,7 +41,7 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  #include <cstdlib>
  #include <cstring>
  #include <js/RootingAPI.h>
-@@ -62,6 +63,7 @@
+@@ -62,6 +67,7 @@
  		nullptr
  	};
  	m_RealTime = g_CmdLineArgs.Has("rl-realtime");
@@ -31,7 +49,7 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  	m_Context = mg_start(MgCallback, this, options);
  	if (!m_Context)
  		throw SetupError{};
-@@ -342,6 +344,16 @@
+@@ -342,6 +348,22 @@
  	return false;
  }
  
@@ -40,15 +58,21 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
 +	// No sim time is fed here: only a /step runs a turn. The view blends from the previous turn's state to the
 +	// newest one over one turn length of real time, then holds at the end of the last turn.
 +	const bool blending = m_PacedBlend < 1.f;
++	const float blendBefore = m_PacedBlend;
 +	m_PacedBlend = std::min(1.f, m_PacedBlend + static_cast<float>(realFrameLength * 1000.0 / DEFAULT_TURN_LENGTH));
 +	g_Game->GetSimulation2()->Interpolate(blending ? static_cast<float>(realFrameLength) : 0.f, m_PacedBlend,
 +		static_cast<float>(realFrameLength));
++	// The shaders' sim_time (the leaf sway) is the renderer's clock: it moves with the blend, so a step advances it
++	// by one turn in total, smoothly, and not at all while the view holds.
++	if (CRenderer::IsInitialised())
++		g_Renderer.GetTimeManager().Update(
++			(m_PacedBlend - blendBefore) * DEFAULT_TURN_LENGTH / 1000.0 * g_Game->GetSimRate());
 +}
 +
  void Interface::TryApplyMessage()
  {
  	const bool isGameStarted = g_Game && g_Game->IsGameStarted();
-@@ -378,6 +390,7 @@
+@@ -378,6 +400,7 @@
  			if (isGameStarted)
  				EndGame();
  			m_Stepped = false;
@@ -56,30 +80,42 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  
  			g_Game = new CGame(m_ScenarioConfig.saveReplay);
  			ScriptInterface& scriptInterface = g_Game->GetSimulation2()->GetScriptInterface();
-@@ -438,6 +451,13 @@
- 				const double deltaSimTime = deltaRealTime * g_Game->GetSimRate();
+@@ -439,6 +462,24 @@
  				const size_t maxTurns = static_cast<size_t>(g_Game->GetSimRate());
  				g_Game->GetTurnManager()->Update(deltaSimTime, maxTurns);
-+			}
+ 			}
 +			else if (m_Paced)
 +			{
 +				// Exactly one turn, as in training (a feed of a full turn always runs one), without the
 +				// interpolation: PacedUpdate blends the view from this turn's start to its end on the frame loop.
-+				g_Game->Update(deltaRealTime / 1000.0, false);
++				// CGame::Update would also step the renderer's clock by the whole turn at once; PacedUpdate moves
++				// it with the blend instead, so the turn is run here without that.
++				if (!g_Game->m_Paused)
++				{
++					const double deltaSimTime = deltaRealTime / 1000.0 * g_Game->GetSimRate();
++					const size_t maxTurns = static_cast<size_t>(g_Game->GetSimRate());
++					if (g_Game->GetTurnManager()->Update(deltaSimTime, maxTurns))
++					{
++						g_GUI->SendEventToAll("SimulationUpdate");
++						g_Game->GetView()->GetLOSTexture().MakeDirty();
++					}
++				}
 +				m_PacedBlend = 0.f;
- 			}
++			}
  			else if (!m_RealTime)
  				g_Game->Update(deltaRealTime);
+ 			m_Stepped = true;
 --- a/source/rlinterface/RLInterface.h
 +++ b/source/rlinterface/RLInterface.h
-@@ -119,6 +119,14 @@
+@@ -119,6 +119,15 @@
  	 */
  	bool AdvancesInRealTime() const { return m_RealTime && m_Stepped; }
  
 +	/**
 +	 * With -rl-paced in visual mode every /step runs exactly one 200 ms turn at once and the frame loop only
 +	 * renders: sim time does not move between steps, and the view holds at the end of the last turn.
-+	 * The visual frame calls PacedUpdate in place of g_Game->Update when IsPaced().
++	 * The visual frame calls PacedUpdate in place of g_Game->Update when IsPaced(). PacedUpdate also advances the
++	 * renderer's clock (the shaders' sim_time) by the share of the turn it blends, so animation runs smoothly.
 +	 */
 +	bool IsPaced() const { return m_Paced; }
 +	void PacedUpdate(double realFrameLength);
@@ -87,7 +123,7 @@ SPDX-License-Identifier: GPL-2.0-or-later (a patch to 0 A.D.; see COPYING)
  private:
  	static void* MgCallback(mg_event event, struct mg_connection *conn, const struct mg_request_info *request_info);
  	static std::string GetRequestContent(struct mg_connection *conn);
-@@ -195,6 +203,8 @@
+@@ -195,6 +204,8 @@
  	mg_context* m_Context;
  	bool m_RealTime{false};
  	bool m_Stepped{false};
