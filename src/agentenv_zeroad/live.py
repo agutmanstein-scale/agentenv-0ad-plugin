@@ -358,9 +358,19 @@ class BroadcastSettings:
         )
 
 
-def window_focus_check_command() -> list[str]:
-    """Prints the class of the window that holds the X input focus."""
-    return ["xdotool", "getwindowfocus", "getwindowclassname"]
+# Only commands the box's xdotool (3.20160805.1, Ubuntu 24.04) has: the later `getwindowclassname` is not among them.
+def game_windows_command(window_class: str = GAME_WINDOW_CLASS) -> list[str]:
+    """Prints the ids of the game's windows; exits 1 when there are none."""
+    return ["xdotool", "search", "--class", window_class]
+
+
+def focused_window_command() -> list[str]:
+    """Prints the id of the window that holds the X input focus."""
+    return ["xdotool", "getwindowfocus"]
+
+
+def window_name_command(window: str) -> list[str]:
+    return ["xdotool", "getwindowname", window]
 
 
 class Broadcast:
@@ -467,55 +477,79 @@ class Broadcast:
 
     async def _keep_focus(self) -> None:
         """Keep the X focus on the game: 0.28 stops updating the camera while its window lacks it, and a Chrome that
-        maps its window late takes it (no window manager runs)."""
+        maps its window late takes it (no window manager runs). Between games there is no game window; nothing is
+        done then."""
         assert self.display is not None
         env = {**os.environ, "DISPLAY": self.display}
-        lost = False
-        announced = False
+        lost = absent = announced = False
         while True:
             await asyncio.sleep(self.focus_check_s)
             try:
                 if shutil.which("xdotool") is None:
                     return
-                focused = await self._focused_class(env)
-                if focused is not None and focused.strip().lower() == GAME_WINDOW_CLASS:
+                code, out = await self._capture(game_windows_command(), env)
+                game = set(out.split()) if code == 0 else set()
+                if not game:
+                    if not absent:
+                        log.info("no game window to focus")
+                    lost, absent, announced = False, True, False
+                    continue
+                absent = False
+                _, out = await self._capture(focused_window_command(), env)
+                focused = out.strip()
+                if focused in game:
                     if lost or not announced:
                         log.info("the game's window has the X focus")
                     lost, announced = False, True
                     continue
-                await self._xdotool(window_focus_command(), env, "focus the game's window")
+                refocused = await self._xdotool(window_focus_command(), env, "focus the game's window", quiet=True)
                 if not lost:
+                    thief = await self._window_name(focused, env)
                     log.warning(
-                        "the game's window had lost the X focus to %s; focused it again",
-                        (focused or "").strip() or "nothing",
+                        "the game's window had lost the X focus to %s; %s",
+                        thief,
+                        "focused it again" if refocused else "could not focus it again",
                     )
                 lost = True
             except Exception:
                 log.warning("the focus check failed", exc_info=True)
 
-    async def _focused_class(self, env: dict[str, str]) -> str | None:
-        """The focused window's class, or None when xdotool fails or finds none."""
-        proc = await asyncio.create_subprocess_exec(
-            *window_focus_check_command(), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
+    async def _window_name(self, window: str, env: dict[str, str]) -> str:
+        if not window:
+            return "nothing"
+        code, out = await self._capture(window_name_command(window), env)
+        return out.strip() or window if code == 0 else window
+
+    async def _capture(self, cmd: list[str], env: dict[str, str]) -> tuple[int | None, str]:
+        """Run an xdotool command: its exit code (None on a timeout) and its output."""
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), 5)
         except TimeoutError:
-            proc.kill()
-            return None
-        return out.decode(errors="replace") if proc.returncode == 0 else None
+            return None, ""
+        finally:
+            await _reap(proc)
+        return proc.returncode, out.decode(errors="replace")
 
-    async def _xdotool(self, cmd: list[str], env: dict[str, str], what: str, *, sync: bool = False) -> None:
+    async def _xdotool(
+        self, cmd: list[str], env: dict[str, str], what: str, *, sync: bool = False, quiet: bool = False
+    ) -> bool:
+        """Run an xdotool command; whether it succeeded. A failure is logged unless `quiet`."""
         if shutil.which("xdotool") is None:
             log.warning("no xdotool: could not %s", what)
-            return
+            return False
         proc = await asyncio.create_subprocess_exec(*cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            if await asyncio.wait_for(proc.wait(), 20 if sync else 5):
-                log.warning("could not %s", what)
+            failed = await asyncio.wait_for(proc.wait(), 20 if sync else 5)
         except TimeoutError:
-            proc.kill()
-            log.warning("could not %s: the game's window was not found", what)
+            if not quiet:
+                log.warning("could not %s: the game's window was not found", what)
+            return False
+        finally:
+            await _reap(proc)
+        if failed and not quiet:
+            log.warning("could not %s", what)
+        return not failed
 
     async def _relay(self, proc: asyncio.subprocess.Process) -> None:
         """ffmpeg's messages into broadcast.log, with the RTMP URL redacted."""
@@ -578,6 +612,14 @@ class Broadcast:
         """The engine's own log, copied out at the end (the director's cuts and frame rate are in it)."""
         path = self.out_dir / "engine-log.html"
         return path if path.is_file() else None
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """Kill a child that is still running (a timeout, a cancel) and wait for it, so none is left behind."""
+    if proc.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
 
 
 async def _wait_or_kill(proc: asyncio.subprocess.Process, timeout: float) -> None:
